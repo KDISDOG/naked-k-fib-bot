@@ -1,0 +1,7 @@
+.env
+bot_state.db
+bot.log
+server_err.txt
+server_out.txt
+__pycache__/
+*.pyc
