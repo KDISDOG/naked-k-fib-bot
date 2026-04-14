@@ -11,27 +11,29 @@ description: |
     即使使用者只問部分功能（如「幫我建 Dashboard」或「只要選幣模組」），也請載入此 Skill。
 ---
 
-# 裸K + Fib 幣安合約機器人 Skill (v2)
+# 裸K + Fib 幣安合約機器人 Skill (v4)
 
 ## 架構概覽
 
 ```
-Binance Futures API
+Binance Futures API + CoinGecko（BTC Dominance）
         │
-    Scheduler (掃幣 / 訊號檢查 / 倉位同步)
+    Scheduler (掃幣 / 訊號檢查 / 倉位同步 + 追蹤止盈)
         │
-  ┌─────┴──────────────────────────────┐
+  ┌─────┴──────────────────────────────────────────┐
+         MarketContext（共享：BTC Dom / 週線 / 相關性）
+  ┌─────┴──────────────────────────────────────────┐
 Coin         Signal        Risk
 Screener     Engine      Manager
-(v2 選幣)  (Fractal+Fib) (含手續費)
-  └─────┬──────────────────────────────┘
+(v3 動態)  (Fractal+Fib)  (含相關性控管)
+  └─────┬──────────────────────────────────────────┘
         │
-  Order Executor (分批止盈 / breakeven stop)
+  Order Executor (分批止盈 / breakeven / 追蹤止盈)
         │
   ┌─────┴─────────┐
 Position    State     Dashboard
 Syncer    Manager    (FastAPI)
-(NEW)    (v2 DB)
+(含追蹤) (v3 DB)    (含總權益)
 ```
 
 ## 快速決策樹
@@ -43,6 +45,7 @@ Syncer    Manager    (FastAPI)
 ├── 「風控怎麼設」      → 參考 scripts/risk_manager.py
 ├── 「建 Dashboard」    → 參考 dashboard/server.py
 ├── 「完整機器人」      → python scripts/bot_main.py
+├── 「回測策略」        → python scripts/backtest.py
 └── 「部署上線」        → 參考 references/deployment.md
 ```
 
@@ -77,9 +80,9 @@ MAX_POSITIONS=5               # 最大同時持倉數
 RESCAN_MIN=15                 # 選幣掃描間隔（分鐘）
 SIGNAL_CHECK_MIN=5            # 訊號檢查間隔（分鐘）
 SYNC_SEC=30                   # 倉位同步間隔（秒）
-COOLDOWN_BARS=6               # 止損後冷卻 K 棒數
+COOLDOWN_BARS=6               # 止損後冷卻 K 棒數（15m 下 = 90 分鐘）
 MIN_SIGNAL_SCORE=3            # 最低訊號強度
-# MAX_LEVERAGE 固定 2x（程式內硬定，不從 .env 讀取）
+MAX_LEVERAGE=3                # 最大槓桿倍率
 ```
 
 ---
@@ -143,10 +146,19 @@ TA-Lib / pandas-ta 回傳值：+100 = 看漲，-100 = 看跌。
 
 **3.6 — 入場條件（全部缺一不可）**
 
-1. 價格在 Fib 關鍵位 ± 0.5%
-2. 日線趨勢和 Swing 結構方向一致
+1. 價格在 Fib 關鍵位 ± 0.5%（`FIB_TOLERANCE=0.005`）
+2. 日線趨勢和 Swing 結構方向一致（Swing 從**日線**找，不受入場 timeframe 影響）
 3. 已收盤的 K 棒出現確認形態（方向正確）
 4. 當根成交量 ≥ 20 日均量的 1.3 倍
+
+**3.7 — 入場 Timeframe（目前設定）**
+
+- **進場 K 棒**：`15m`（訊號更頻繁，盈虧機會更多）
+- **Swing 結構**：`1d`（日線 Fractal，確保大結構方向正確）
+- **趨勢確認**：日線 EMA20/EMA50
+- K 棒收盤等待：對齊到下一個 15 分鐘整點 + 10 秒 buffer
+
+> 若要改回 1h 或 4h，修改 `bot_main.py` 的 `timeframe="15m"` 即可，其餘邏輯不變。
 
 ---
 
@@ -253,14 +265,86 @@ python scripts/bot_main.py --skip-wait
 
 ## 腳本索引
 
-| 腳本                         | 用途                                     |
-| ---------------------------- | ---------------------------------------- |
-| `scripts/bot_main.py`        | 主機器人（Scheduler + 整合所有模組）     |
-| `scripts/coin_screener.py`   | v2 選幣：Fib回測+K棒品質+流動性+趨勢結構 |
-| `scripts/signal_engine.py`   | v2 訊號：Fractal Swing + Fib TP/SL       |
-| `scripts/risk_manager.py`    | v2 風控：含手續費 + 分批止盈 + net R:R   |
-| `scripts/order_executor.py`  | v2 下單：分批TP + breakeven stop         |
-| `scripts/position_syncer.py` | 倉位同步：偵測平倉 + 觸發 breakeven      |
-| `scripts/state_manager.py`   | v2 DB：防重複 + 冷卻期 + 手續費欄位      |
-| `scripts/init_db.py`         | 初始化資料庫 Schema                      |
-| `dashboard/server.py`        | FastAPI Dashboard 伺服器                 |
+| 腳本                         | 用途                                              |
+| ---------------------------- | ------------------------------------------------- |
+| `scripts/bot_main.py`        | 主機器人（Scheduler + 整合所有模組）              |
+| `scripts/coin_screener.py`   | v2 選幣：Fib回測+K棒品質+流動性+趨勢結構          |
+| `scripts/signal_engine.py`   | v2 訊號：Fractal Swing + Fib TP/SL                |
+| `scripts/risk_manager.py`    | v2 風控：含手續費 + 分批止盈 + net R:R            |
+| `scripts/order_executor.py`  | v2 下單：分批TP + breakeven stop                  |
+| `scripts/position_syncer.py` | 倉位同步：偵測平倉 + 觸發 breakeven               |
+| `scripts/state_manager.py`   | v2 DB：防重複 + 冷卻期 + 手續費欄位               |
+| `scripts/init_db.py`         | 初始化資料庫 Schema                               |
+| `scripts/backtest.py`        | 回測：Walk-forward 歷史模擬，輸出勝率/期望值/回撤 |
+| `scripts/test_open_order.py` | 測試下單：直接呼叫 OrderExecutor 下一張測試單     |
+| `dashboard/server.py`        | FastAPI Dashboard 伺服器                          |
+
+---
+
+## Step 9：回測（Backtest）
+
+**設計理念**：使用與真實 bot 完全相同的訊號邏輯，Walk-forward 逐根 K 棒重放歷史，模擬開倉、止損、止盈。
+
+**回測參數**（自動從 `.env` 讀取，與真實 bot 一致）：
+
+| `.env` 參數        | 對應回測設定      |
+| ------------------ | ----------------- |
+| `RISK_PER_TRADE`   | 每單風險比例      |
+| `MAX_NOTIONAL_PCT` | 單筆保證金上限    |
+| `MAX_LEVERAGE`     | 槓桿倍率          |
+| `MIN_SIGNAL_SCORE` | 最低訊號強度      |
+| `COOLDOWN_BARS`    | 止損後冷卻 K 棒數 |
+
+**執行方式**：
+
+```bash
+# 預設：BTCUSDT，15m，最近 6 個月（對應真實 bot 設定）
+c:/python312/python.exe scripts/backtest.py --tf 15m
+
+# 指定幣種、時間框架、月數
+c:/python312/python.exe scripts/backtest.py --symbol ETHUSDT --tf 15m --months 3
+
+# 對比不同 timeframe
+c:/python312/python.exe scripts/backtest.py --tf 1h --months 6
+c:/python312/python.exe scripts/backtest.py --tf 4h --months 6
+
+# 自訂起始資金與訊號強度門檻
+c:/python312/python.exe scripts/backtest.py --balance 500 --score 4
+```
+
+**輸出統計**：
+
+- 交易總數、TP2全達數、止損數、超時數
+- 勝率、期望值（期望每單損益）
+- 平均獲利 / 平均虧損
+- 總淨損益、手續費合計
+- 最終資金與報酬率
+- 最大連虧單數、最大回撤百分比
+- 月度損益分佈（文字 bar chart）
+- 最近 10 筆模擬交易明細
+
+**回測可調參數（CLI flags，用於調整訊號靈敏度）**：
+
+> 注意：`--tf 15m` 時歷史 K 棒數量多，建議 `--months 3` 起跳，`--months 6` 以內。
+
+| 參數                | 預設值 | 說明                              |
+| ------------------- | ------ | --------------------------------- |
+| `--fib-tol`         | 0.008  | Fib 容忍度（真實 bot 是 0.005）   |
+| `--vol-mult`        | 1.1    | 成交量門檻倍率（真實 bot 是 1.3） |
+| `--skip-vol-rise`   | False  | 跳過成交量放大要求                |
+| `--no-skip-bad-fib` | —      | 不跳過 0.236/0.786 差 R:R Fib 位  |
+
+```bash
+# 接近真實 bot 的嚴格模式
+c:/python312/python.exe scripts/backtest.py --tf 15m --fib-tol 0.005 --vol-mult 1.3
+
+# 寬鬆模式（找更多訊號）
+c:/python312/python.exe scripts/backtest.py --tf 15m --skip-vol-rise
+```
+
+**回測限制（務必了解）**：
+
+1. 未模擬滑價（實際成交價可能稍差）
+2. 市價單以收盤價計入場（實際以下一根開盤附近成交）
+3. 不考慮持倉期間的資金費率
+4. 歷史好不代表未來好，正期望值只是必要條件非充分條件

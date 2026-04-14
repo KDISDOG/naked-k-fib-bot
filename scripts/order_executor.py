@@ -93,6 +93,9 @@ class OrderExecutor:
         tp2:       float,
         leverage:  int = 2,
         meta:      dict = None,
+        use_trailing: bool = False,
+        trailing_atr: float = 0.0,
+        btc_corr:    float = 0.0,
     ) -> Optional[dict]:
         """
         開合約倉位並設置：
@@ -132,8 +135,19 @@ class OrderExecutor:
                 type     = ORDER_TYPE_MARKET,
                 quantity = qty,
             )
-            fill_price = float(order.get("avgPrice", entry))
             order_id   = str(order.get("orderId", ""))
+            # avgPrice 在建立當下可能回傳 "0"，需另外查詢實際成交價
+            fill_price = float(order.get("avgPrice") or 0)
+            if fill_price <= 0 and order_id:
+                try:
+                    filled = self.client.futures_get_order(
+                        symbol=symbol, orderId=order_id
+                    )
+                    fill_price = float(filled.get("avgPrice") or 0)
+                except Exception as e:
+                    log.warning(f"查詢成交價失敗: {e}")
+            if fill_price <= 0:
+                fill_price = entry  # 最終 fallback
             log.info(
                 f"[{symbol}] 開倉成功：{direction} qty={qty} @ {fill_price}"
             )
@@ -191,6 +205,9 @@ class OrderExecutor:
                 sl_order_id  = sl_order_id,
                 tp1_order_id = tp1_order_id,
                 tp2_order_id = tp2_order_id,
+                use_trailing = use_trailing,
+                trailing_atr = trailing_atr,
+                btc_corr     = btc_corr,
             )
 
             log.info(
@@ -268,6 +285,61 @@ class OrderExecutor:
 
         except Exception as e:
             log.error(f"[{symbol}] 移動止損失敗: {e}")
+            return False
+
+    # ── 追蹤止盈 ─────────────────────────────────────────────────
+    def move_trailing_sl(self, symbol: str, trade_id: int,
+                         new_sl: float, direction: str) -> bool:
+        """
+        把止損推進到 new_sl（追蹤止盈用）
+        只在新止損比現有止損「更保本」時才會執行
+        """
+        try:
+            trade = self.db.get_trade_by_id(trade_id)
+            if not trade:
+                return False
+
+            current_sl = trade.get("sl")
+            # 安全檢查：新止損必須朝入場價推進（不能後退）
+            if current_sl is not None:
+                if direction == "LONG" and new_sl <= current_sl:
+                    return False
+                if direction == "SHORT" and new_sl >= current_sl:
+                    return False
+
+            close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
+            new_sl = self._round_price(symbol, new_sl)
+
+            # 取消舊止損
+            old_sl_id = trade.get("sl_order_id")
+            if old_sl_id:
+                try:
+                    self.client.futures_cancel_order(
+                        symbol=symbol, orderId=int(old_sl_id)
+                    )
+                except Exception as e:
+                    log.warning(f"取消舊止損失敗（可能已觸發）: {e}")
+
+            remaining = trade["qty"] - trade["qty_closed"]
+            remaining = self._round_qty(symbol, remaining)
+            if remaining <= 0:
+                return True
+
+            new_sl_order = self.client.futures_create_order(
+                symbol     = symbol,
+                side       = close_side,
+                type       = FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice  = new_sl,
+                quantity   = remaining,
+                reduceOnly = True,
+            )
+            new_sl_id = str(new_sl_order.get("orderId", ""))
+            self.db.update_sl(trade_id, new_sl=new_sl, sl_order_id=new_sl_id)
+
+            log.info(f"[{symbol}] 追蹤止盈推進：SL={new_sl}")
+            return True
+        except Exception as e:
+            log.error(f"[{symbol}] 追蹤止盈失敗: {e}")
             return False
 
     # ── 緊急操作 ─────────────────────────────────────────────────

@@ -110,7 +110,61 @@ class PositionSyncer:
                         direction   = direction,
                     )
 
-            # ── 情況 3: 倉位不變 → 什麼都不做 ────────────────────
+            # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
+            if trade.get("use_trailing"):
+                self._update_trailing(trade)
+
+    # ── 追蹤止盈邏輯 ─────────────────────────────────────────────
+    def _update_trailing(self, trade: dict):
+        """
+        追蹤止盈：
+          1. 取當前價格
+          2. 更新 LONG 最高價 / SHORT 最低價
+          3. 若已達 1R 獲利 → 把止損推進到「最新極值 - 1.5×ATR」（LONG）
+             或「最新極值 + 1.5×ATR」（SHORT）
+        """
+        symbol = trade["symbol"]
+        trade_id = trade["id"]
+        direction = trade["direction"]
+        entry = trade["entry"]
+        sl = trade["sl"]
+        atr = trade.get("trailing_atr") or 0
+        if not atr or atr <= 0:
+            return
+
+        try:
+            ticker = self.client.futures_symbol_ticker(symbol=symbol)
+            price = float(ticker["price"])
+        except Exception:
+            return
+
+        # 更新高/低點
+        self.db.update_trailing_price(trade_id, price)
+
+        # 檢查是否已達 1R 獲利
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return
+        profit = (price - entry) if direction == "LONG" else (entry - price)
+        if profit < risk:   # 未達 1R，暫不啟動追蹤
+            return
+
+        # 從 DB 重讀最新極值（剛剛 update_trailing_price 可能有更新）
+        latest = self.db.get_trade_by_id(trade_id)
+        if not latest:
+            return
+
+        if direction == "LONG":
+            peak = latest.get("highest_price") or price
+            new_sl = peak - 1.5 * atr
+            # 止損只能往上推，不能低於入場價
+            if new_sl > entry and (sl is None or new_sl > sl):
+                self.executor.move_trailing_sl(symbol, trade_id, new_sl, direction)
+        else:
+            trough = latest.get("lowest_price") or price
+            new_sl = trough + 1.5 * atr
+            if new_sl < entry and (sl is None or new_sl < sl):
+                self.executor.move_trailing_sl(symbol, trade_id, new_sl, direction)
 
     # ── 輔助方法 ─────────────────────────────────────────────────
 

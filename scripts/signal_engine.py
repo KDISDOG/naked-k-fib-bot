@@ -36,6 +36,9 @@ class Signal:
     timeframe: str
     swing_high: float
     swing_low:  float
+    use_trailing: bool = False   # ADX > 35 → 啟用追蹤止盈
+    trailing_atr: float = 0.0    # 追蹤止盈用的 ATR 值
+    btc_corr:    float = 0.0     # 進場時與 BTC 的相關性
 
 
 # ── 常數 ─────────────────────────────────────────────────────────
@@ -67,8 +70,9 @@ def _normalize_fib_key(key: str) -> str:
 
 
 class SignalEngine:
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, market_ctx=None):
         self.client = client
+        self.market_ctx = market_ctx  # 可選：傳入 MarketContext 啟用大盤濾網 + 相關性
 
     # ── K 線取得 ─────────────────────────────────────────────────
 
@@ -302,12 +306,97 @@ class SignalEngine:
     def _volume_confirmed(self, df: pd.DataFrame,
                           period=20, ratio=1.3) -> bool:
         """
-        成交量確認（從 1.5x 放寬到 1.3x）
-        因為 Fib 位的反應有時候不需要爆量，只需要量能高於均值
+        基礎成交量確認：當根 ≥ 20日均量 × ratio
         """
         avg_vol = df["volume"].tail(period + 1).iloc[:-1].mean()
         last_vol = df["volume"].iloc[-1]
         return last_vol >= avg_vol * ratio
+
+    def _volume_rising(self, df: pd.DataFrame) -> bool:
+        """成交量進場確認：當根 > 前一根"""
+        if len(df) < 2:
+            return False
+        return df["volume"].iloc[-1] > df["volume"].iloc[-2]
+
+    def _volume_ratio_score(self, df: pd.DataFrame,
+                            period=20) -> int:
+        """
+        Fib-volume qualifier：
+          當根成交量 / 20日均量
+          ≥ 1.5x → +1
+          < 0.7x → -1
+          其他   →  0
+        """
+        avg_vol = df["volume"].tail(period + 1).iloc[:-1].mean()
+        if avg_vol <= 0:
+            return 0
+        r = df["volume"].iloc[-1] / avg_vol
+        if r >= 1.5:
+            return 1
+        if r < 0.7:
+            return -1
+        return 0
+
+    def _volume_exhaustion_long(self, df: pd.DataFrame) -> bool:
+        """
+        做多情境下的 volume exhaustion：
+          最近 3 根連續下跌（close < open）且成交量遞減
+          → 拋售動能衰竭，可能即將反彈
+        """
+        if len(df) < 4:
+            return False
+        last3 = df.tail(3)
+        down = all(last3["close"].iloc[i] < last3["open"].iloc[i] for i in range(3))
+        declining = (
+            last3["volume"].iloc[0] > last3["volume"].iloc[1] >
+            last3["volume"].iloc[2]
+        )
+        return down and declining
+
+    def _volume_exhaustion_short(self, df: pd.DataFrame) -> bool:
+        """做空鏡像：最近 3 根連漲 + 量遞減 → 拉升動能衰竭"""
+        if len(df) < 4:
+            return False
+        last3 = df.tail(3)
+        up = all(last3["close"].iloc[i] > last3["open"].iloc[i] for i in range(3))
+        declining = (
+            last3["volume"].iloc[0] > last3["volume"].iloc[1] >
+            last3["volume"].iloc[2]
+        )
+        return up and declining
+
+    def _is_fib_fresh(self, df: pd.DataFrame, fib_price: float,
+                     lookback: int = 20, max_touches: int = 1) -> bool:
+        """
+        Fib 新鮮度：最近 lookback 根內 Fib 位被觸碰的次數 ≤ max_touches
+        （碰太多次代表已被消化，反應機率下降）
+        """
+        if len(df) < lookback + 1:
+            return True
+        recent = df.tail(lookback + 1).iloc[:-1]  # 不含當前這根
+        tolerance = fib_price * 0.003
+        touches = recent[
+            (recent["low"] <= fib_price + tolerance) &
+            (recent["high"] >= fib_price - tolerance)
+        ]
+        return len(touches) <= max_touches
+
+    def _swing_structure_broken(self, df: pd.DataFrame,
+                                direction: str,
+                                swing_high: float,
+                                swing_low: float) -> bool:
+        """
+        Swing 結構破壞預警：
+          LONG：價格已跌破上次 swing low → 趨勢結構已失，拒絕做多
+          SHORT：價格已漲破上次 swing high → 拒絕做空
+        """
+        last_close = df["close"].iloc[-1]
+        last_low = df["low"].iloc[-1]
+        last_high = df["high"].iloc[-1]
+        if direction == "LONG":
+            return last_close < swing_low or last_low < swing_low
+        else:
+            return last_close > swing_high or last_high > swing_high
 
     # ── K 棒收盤確認 ─────────────────────────────────────────────
 
@@ -406,6 +495,19 @@ class SignalEngine:
             )
             return None
 
+        # Step 4.1: Swing 結構破壞預警
+        if self._swing_structure_broken(df_analysis, direction, swing_h, swing_l):
+            log.debug(
+                f"{symbol} Swing 結構已破壞（{direction} 觸發保護），跳過"
+            )
+            return None
+
+        # Step 4.2: Fib 新鮮度檢查（近 20 根觸碰 ≤ 1 次）
+        fib_price = fib_levels.get(fib_hit)
+        if fib_price and not self._is_fib_fresh(df_analysis, fib_price):
+            log.debug(f"{symbol} Fib {fib_hit} 近期觸碰過多，已失去新鮮度")
+            return None
+
         # Step 5: 裸K 形態確認（用已收盤的 K 棒）
         pattern_result = self._detect_pattern(df_analysis, direction)
         if not pattern_result:
@@ -413,9 +515,12 @@ class SignalEngine:
             return None
         pattern_name, pattern_strength = pattern_result
 
-        # Step 6: 成交量確認
+        # Step 6: 成交量確認（基礎 1.3x 均量 + 當根 > 前一根）
         if not self._volume_confirmed(df_analysis, period=20, ratio=1.3):
             log.debug(f"{symbol} 成交量未達 1.3x 均量，跳過")
+            return None
+        if not self._volume_rising(df_analysis):
+            log.debug(f"{symbol} 當根成交量未超越前一根，跳過")
             return None
 
         # Step 7: 基於 Fib 結構計算 TP/SL
@@ -431,10 +536,61 @@ class SignalEngine:
                 log.debug(f"{symbol} SHORT TP/SL 不合理，跳過")
                 return None
 
+        # ADX（用於追蹤止盈判斷 + 趨勢強度加分）
+        adx_df = ta.adx(
+            df_analysis["high"], df_analysis["low"], df_analysis["close"],
+            length=14
+        )
+        adx_val = float(adx_df["ADX_14"].iloc[-1]) if adx_df is not None else 0
+        use_trailing = adx_val > 35
+
+        # ATR（追蹤止盈用）
+        atr_series = ta.atr(
+            df_analysis["high"], df_analysis["low"], df_analysis["close"],
+            length=14
+        )
+        atr_val = float(atr_series.iloc[-1]) if atr_series is not None else 0.0
+
+        # Fib-volume qualifier（±1 分）
+        vol_score = self._volume_ratio_score(df_analysis, period=20)
+
+        # Volume exhaustion 加分（方向對應）
+        exhaustion_bonus = 0
+        if direction == "LONG" and self._volume_exhaustion_long(df_analysis):
+            exhaustion_bonus = 1
+            log.info(f"{symbol} LONG 偵測到拋售動能衰竭，+1")
+        elif direction == "SHORT" and self._volume_exhaustion_short(df_analysis):
+            exhaustion_bonus = 1
+            log.info(f"{symbol} SHORT 偵測到拉升動能衰竭，+1")
+
+        # BTC 週線空頭背景 → 山寨幣做多扣 2 分；空頭做空不扣
+        btc_weekly_penalty = 0
+        if self.market_ctx and symbol != "BTCUSDT":
+            bullish = self.market_ctx.btc_weekly_bullish()
+            if bullish is False and direction == "LONG":
+                btc_weekly_penalty = -2
+                log.info(f"{symbol} BTC 週線空頭 + 做多 → -2")
+            elif bullish is True and direction == "SHORT":
+                btc_weekly_penalty = -1
+                log.info(f"{symbol} BTC 週線多頭 + 做空 → -1")
+
+        # BTC 相關性（進場時記錄）
+        btc_corr = 0.0
+        if self.market_ctx:
+            c = self.market_ctx.btc_correlation(symbol)
+            if c is not None:
+                btc_corr = c
+
         # 計算訊號強度
-        score = min(5, pattern_strength
-                    + (1 if float(fib_hit) == 0.618 else 0)
-                    + (1 if swing_trend == ("up" if direction == "LONG" else "down") else 0))
+        score = (
+            pattern_strength
+            + (1 if float(fib_hit) == 0.618 else 0)
+            + (1 if swing_trend == ("up" if direction == "LONG" else "down") else 0)
+            + vol_score
+            + exhaustion_bonus
+            + btc_weekly_penalty
+        )
+        score = max(0, min(5, score))
 
         log.info(
             f">>> [{symbol}] {direction} @ {price:.4f}  "
@@ -456,4 +612,7 @@ class SignalEngine:
             timeframe  = timeframe,
             swing_high = swing_h,
             swing_low  = swing_l,
+            use_trailing = use_trailing,
+            trailing_atr = atr_val,
+            btc_corr     = btc_corr,
         )

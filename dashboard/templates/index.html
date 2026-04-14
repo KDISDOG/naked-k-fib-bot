@@ -315,6 +315,16 @@
         </div>
       </div>
       <div class="kpi">
+        <div class="kpi-label">合約總權益（含未實現）</div>
+        <div id="kpi-total-equity" class="kpi-value {% if balance.total_equity >= 0 %}neu{% else %}neg{% endif %}">
+          {% if balance.total_equity >= 0 %}{{ balance.total_equity }} USDT{% else %}無法連線{% endif %}
+        </div>
+        <div id="kpi-unrealized" style="font-size:11px;margin-top:4px"
+          class="{% if balance.unrealized > 0 %}pnl-pos{% elif balance.unrealized < 0 %}pnl-neg{% endif %}">
+          未實現 {% if balance.unrealized > 0 %}+{% endif %}{{ balance.unrealized }} USDT
+        </div>
+      </div>
+      <div class="kpi">
         <div class="kpi-label">淨 P&L（扣費）</div>
         <div id="kpi-net-pnl"
           class="kpi-value {% if stats.net_pnl > 0 %}pos{% elif stats.net_pnl < 0 %}neg{% else %}neu{% endif %}">
@@ -333,7 +343,7 @@
             <input type="number" name="risk_pct" value="{{ risk_pct }}" step="0.005" min="0.005" max="0.1">
           </div>
           <div style="display:flex;align-items:flex-end;padding-bottom:6px;font-size:12px;color:#718096">
-            槓桿：固定 2x
+            槓桿：固定 3x
           </div>
           <button type="button" class="btn btn-primary" onclick="saveConfig()">儲存參數</button>
           <button type="button" class="btn btn-danger" onclick="emergencyStop()">緊急全平</button>
@@ -357,6 +367,7 @@
               <th style="color:#68d391">TP1</th>
               <th style="color:#4fd1c5">TP2</th>
               <th style="color:#fc8181">止損</th>
+              <th>保證金</th>
               <th>未實現損益</th>
               <th>R:R</th>
               <th>操作</th>
@@ -465,6 +476,24 @@
           walletEl.textContent = '無法連線';
           walletEl.className = 'kpi-value neg';
         }
+        const teEl = document.getElementById('kpi-total-equity');
+        const unEl = document.getElementById('kpi-unrealized');
+        if (teEl) {
+          if (b.total_equity >= 0) {
+            teEl.textContent = b.total_equity + ' USDT';
+            teEl.className = 'kpi-value neu';
+          } else {
+            teEl.textContent = '無法連線';
+            teEl.className = 'kpi-value neg';
+          }
+        }
+        if (unEl && b.unrealized != null) {
+          const sign = b.unrealized > 0 ? '+' : '';
+          unEl.textContent = `未實現 ${sign}${b.unrealized} USDT`;
+          unEl.className = b.unrealized > 0 ? 'pnl-pos' :
+            b.unrealized < 0 ? 'pnl-neg' : '';
+          unEl.style = 'font-size:11px;margin-top:4px';
+        }
       } catch (e) { console.warn('KPI 刷新失敗', e); }
     }
 
@@ -491,6 +520,7 @@
             <td style="color:#68d391">${fmtPrice(p.tp1)}</td>
             <td style="color:#4fd1c5">${fmtPrice(p.tp2)}</td>
             <td style="color:#fc8181">${fmtPrice(p.sl)}</td>
+            <td style="color:#a0aec0">${p.margin != null ? p.margin.toFixed(2) + ' U' : '—'}</td>
             <td>${fmtUsdt(p.unrealized_pnl)}</td>
             <td>${p.rr != null ? p.rr.toFixed(2) : '—'}</td>
             <td><button class="btn btn-danger" style="font-size:11px;padding:4px 8px"

@@ -25,8 +25,9 @@ log = logging.getLogger("screener")
 
 
 class CoinScreener:
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, market_ctx=None):
         self.client = client
+        self.market_ctx = market_ctx  # 可選：傳入 MarketContext 啟用 BTC Dominance 濾網
 
     # ── 取得 K 線 ────────────────────────────────────────────────
 
@@ -45,43 +46,78 @@ class CoinScreener:
 
     # ── 1. 流動性品質（3 分）─────────────────────────────────────
 
-    def _score_liquidity(self, df: pd.DataFrame, symbol: str) -> tuple[int, dict]:
+    def _score_liquidity(self, df: pd.DataFrame, symbol: str,
+                         swing_trend: str = "") -> tuple[int, dict]:
         """
         用 qav（quote asset volume = 真正的 USDT 成交量）
-        + funding rate 判斷流動性品質
+        + funding rate（方向感知）判斷流動性品質
+
+        Funding 方向感知邏輯：
+          - funding > 0.05%（多方擠壓）：若 swing 向下（做空）→ 加分；向上（做多）→ 扣分
+          - funding < -0.05%（空方擠壓）：若 swing 向上（做多）→ 加分；向下（做空）→ 扣分
+          - |funding| < 0.05%：中性，加分
         """
         score = 0
         # 24h USDT 成交量（用 qav，不是 volume * close）
         vol_24h = df["qav"].tail(24).sum()
 
         # 流動性分級
-        if vol_24h >= 200_000_000:      # 2 億以上：頂級流動性
+        if vol_24h >= 200_000_000:
             score += 2
-        elif vol_24h >= 50_000_000:     # 5000 萬以上：足夠
+        elif vol_24h >= 50_000_000:
             score += 1
 
-        # Funding Rate（中性 = 好）
+        # Funding Rate（方向感知）
+        fr_raw = 0.0
         try:
             funding = self.client.futures_funding_rate(
                 symbol=symbol, limit=1
             )
-            fr = abs(float(funding[-1]["fundingRate"])) if funding else 0
+            fr_raw = float(funding[-1]["fundingRate"]) if funding else 0.0
         except Exception:
-            fr = 0
+            pass
 
-        if fr < 0.0005:       # |funding| < 0.05%：中性
+        if abs(fr_raw) < 0.0005:          # 中性
             score += 1
-        # funding > 0.1%：極端，不加分（偏多或偏空嚴重）
+        elif fr_raw > 0.0005 and swing_trend == "down":
+            score += 1                     # 多方擠壓 + 做空 → 有利
+        elif fr_raw < -0.0005 and swing_trend == "up":
+            score += 1                     # 空方擠壓 + 做多 → 有利
+        elif abs(fr_raw) > 0.001:
+            score -= 1                     # 極端且方向不利 → 扣分
 
         details = {
             "vol_24h_m": round(vol_24h / 1_000_000, 1),
-            "funding_rate": round(fr * 100, 4),
+            "funding_rate": round(fr_raw * 100, 4),
         }
         return score, details
 
     # ── 2. 趨勢結構品質（3 分）──────────────────────────────────
 
-    def _score_trend_structure(self, df: pd.DataFrame) -> tuple[int, dict]:
+    def _detect_swing_trend(self, df: pd.DataFrame) -> str:
+        """
+        用最近 60 根 K 棒的 swing 判斷當前趨勢方向
+        回傳 "up" / "down" / ""
+        """
+        recent = df.tail(60).reset_index(drop=True)
+        swings = self._find_all_swings(recent, left=3, right=3)
+        if len(swings) < 2:
+            return ""
+        last_high = None
+        last_low = None
+        for s in reversed(swings):
+            if s["type"] == "high" and last_high is None:
+                last_high = s
+            if s["type"] == "low" and last_low is None:
+                last_low = s
+            if last_high and last_low:
+                break
+        if not last_high or not last_low:
+            return ""
+        return "up" if last_low["idx"] < last_high["idx"] else "down"
+
+    def _score_trend_structure(self, df: pd.DataFrame,
+                               swing_trend: str = "") -> tuple[int, dict]:
         """
         好的裸K+Fib 幣需要有清晰的 swing 結構（趨勢 + 回撤）
         而不是純橫盤或亂跳的幣
@@ -105,17 +141,25 @@ class CoinScreener:
         if 3 <= swing_count <= 8:    # 有結構但不過度震盪
             score += 1
 
-        # ATR 波動率在甜蜜區（1.2%–4%）
+        # ATR 波動率動態上限：做空可到 8%，做多只給 4%（做空反向波動利潤大）
         atr = ta.atr(high, low, close, length=14)
         atr_pct = (atr.iloc[-1] / close.iloc[-1]) * 100 if not atr.empty else 0
 
-        if 1.2 <= atr_pct <= 4.0:   # 甜蜜區：有足夠利潤空間但不會亂跳
+        if swing_trend == "down":
+            upper_cap = 8.0
+        elif swing_trend == "up":
+            upper_cap = 4.0
+        else:
+            upper_cap = 4.0   # 方向不明時採保守上限
+        if 1.2 <= atr_pct <= upper_cap:
             score += 1
 
         details = {
             "adx": round(adx_val, 1),
             "swing_count": swing_count,
             "atr_pct": round(atr_pct, 2),
+            "atr_cap": upper_cap,
+            "swing_trend": swing_trend,
         }
         return score, details
 
@@ -183,8 +227,9 @@ class CoinScreener:
         fib_reactions = 0
         total_tests = 0
 
-        # 找所有 swing high/low pairs（用滾動窗口）
-        swings = self._find_all_swings(df, left=5, right=5)
+        # Rolling Fib：只看最近 60 根 K 棒（避免用過遠的歷史 swing）
+        df_recent = df.tail(60).reset_index(drop=True)
+        swings = self._find_all_swings(df_recent, left=3, right=3)
         if len(swings) < 4:
             return 0, {"fib_reactions": 0, "fib_tests": 0, "fib_rate": 0}
 
@@ -215,7 +260,7 @@ class CoinScreener:
 
             # 檢查 swing 之後的 K 棒是否在 Fib 位反應
             start_idx = max(s1["idx"], s2["idx"]) + 1
-            future = df.iloc[start_idx:start_idx + 20]
+            future = df_recent.iloc[start_idx:start_idx + 15]
             for _, fib_price in fib_levels.items():
                 total_tests += 1
                 tolerance = fib_price * 0.008   # ±0.8% 容忍
@@ -287,17 +332,29 @@ class CoinScreener:
         if vol_24h < 10_000_000:
             return 0, {}
 
-        s1, d1 = self._score_liquidity(df, symbol)
-        s2, d2 = self._score_trend_structure(df)
+        # 先決定當前 swing 方向（供流動性/ATR 評分使用）
+        swing_trend = self._detect_swing_trend(df)
+
+        s1, d1 = self._score_liquidity(df, symbol, swing_trend=swing_trend)
+        s2, d2 = self._score_trend_structure(df, swing_trend=swing_trend)
         s3, d3 = self._score_candle_quality(df)
         s4, d4 = self._score_fib_respect(df)
 
         total = s1 + s2 + s3 + s4
+
+        # BTC Dominance > 55% → 山寨幣扣 2 分（BTCUSDT 本身不扣）
+        btc_dom_penalty = 0
+        if self.market_ctx and symbol != "BTCUSDT":
+            if self.market_ctx.is_high_btc_dominance(threshold=55.0):
+                btc_dom_penalty = -2
+                total += btc_dom_penalty
+
         details = {
             "liquidity_score": s1,
             "trend_score": s2,
             "candle_score": s3,
             "fib_score": s4,
+            "btc_dom_penalty": btc_dom_penalty,
             **d1, **d2, **d3, **d4
         }
         return total, details

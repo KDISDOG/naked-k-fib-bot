@@ -21,13 +21,54 @@ MAKER_FEE_RATE = 0.0002   # 0.02%
 
 
 class RiskManager:
-    def __init__(self, client: Client, db):
+    def __init__(self, client: Client, db, market_ctx=None):
         self.client       = client
         self.db           = db
+        self.market_ctx   = market_ctx
         self.leverage     = int(os.getenv("MAX_LEVERAGE", 2))
         self.risk_pct     = float(os.getenv("RISK_PER_TRADE", 0.03))
         self.max_loss_pct = float(os.getenv("MAX_DAILY_LOSS", 0.08))
         self.max_notional_pct = float(os.getenv("MAX_NOTIONAL_PCT", 0.20))
+        # 同方向高相關倉位上限（預設 3，剩餘 2 格保留給低相關幣種）
+        self.max_same_direction_high_corr = int(
+            os.getenv("MAX_SAME_DIR_HIGH_CORR", 3)
+        )
+        self.high_corr_threshold = float(
+            os.getenv("HIGH_CORR_THRESHOLD", 0.8)
+        )
+
+    # ── 相關性控管 ───────────────────────────────────────────────
+    def can_open_direction(self, symbol: str, direction: str) -> bool:
+        """
+        BTC 相關性控管：
+          - 若此 symbol 與 BTC 高相關（|corr| > threshold）
+          - 且同方向已有 >= max_same_direction_high_corr 個高相關倉位
+          - 則拒絕開倉（保留倉位給低相關幣種分散風險）
+        """
+        if not self.market_ctx:
+            return True
+        if symbol == "BTCUSDT":
+            return True
+        if not self.market_ctx.is_high_correlation(
+            symbol, threshold=self.high_corr_threshold
+        ):
+            return True
+
+        # 統計同方向、已是高相關的未平倉數
+        same_dir_trades = self.db.get_open_trades_by_direction(direction)
+        high_corr_count = 0
+        for t in same_dir_trades:
+            corr = t.get("btc_corr")
+            if corr is not None and abs(corr) >= self.high_corr_threshold:
+                high_corr_count += 1
+
+        if high_corr_count >= self.max_same_direction_high_corr:
+            log.warning(
+                f"[{symbol}] 同方向({direction})高相關倉位已達上限 "
+                f"{high_corr_count}/{self.max_same_direction_high_corr}，拒絕開倉"
+            )
+            return False
+        return True
 
     # ── 餘額查詢 ─────────────────────────────────────────────────
 

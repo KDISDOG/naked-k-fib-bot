@@ -33,6 +33,7 @@ from risk_manager import RiskManager
 from order_executor import OrderExecutor
 from state_manager import StateManager
 from position_syncer import PositionSyncer
+from market_context import MarketContext
 
 # ── 設定 ───────────────────────────────────────────────────────
 load_dotenv()
@@ -64,12 +65,13 @@ client = Client(
     os.getenv("BINANCE_SECRET"),
     testnet=BINANCE_TESTNET
 )
-db       = StateManager()
-screener = CoinScreener(client)
-signal_e = SignalEngine(client)
-risk     = RiskManager(client, db)
-executor = OrderExecutor(client, db)
-syncer   = PositionSyncer(client, db, executor)
+db          = StateManager()
+market_ctx  = MarketContext(client)
+screener    = CoinScreener(client, market_ctx=market_ctx)
+signal_e    = SignalEngine(client, market_ctx=market_ctx)
+risk        = RiskManager(client, db, market_ctx=market_ctx)
+executor    = OrderExecutor(client, db)
+syncer      = PositionSyncer(client, db, executor)
 
 candidate_symbols: list[str] = []
 bot_paused = False
@@ -115,8 +117,8 @@ def check_signals():
             log.debug(f"[{symbol}] 冷卻期中，跳過")
             continue
 
-        # 訊號檢查
-        sig = signal_e.check(symbol, timeframe="1h")
+        # 訊號檢查：15m K 棒
+        sig = signal_e.check(symbol, timeframe="15m")
         if not sig:
             continue
 
@@ -129,6 +131,10 @@ def check_signals():
             f"[{symbol}] 訊號確認：{sig.pattern} @ Fib {sig.fib_level} "
             f"方向={sig.direction} 強度={sig.score}"
         )
+
+        # 相關性控管：高相關 + 同方向倉位滿 → 拒絕
+        if not risk.can_open_direction(symbol, sig.direction):
+            continue
 
         # 風控計算
         pos = risk.calc_position(
@@ -158,7 +164,10 @@ def check_signals():
                 "pattern":   sig.pattern,
                 "score":     sig.score,
                 "timeframe": sig.timeframe,
-            }
+            },
+            use_trailing = sig.use_trailing,
+            trailing_atr = sig.trailing_atr,
+            btc_corr     = sig.btc_corr,
         )
         if order:
             open_count += 1
@@ -182,18 +191,20 @@ def sync_positions():
 # ── K 棒收盤對齊 ────────────────────────────────────────────────
 def wait_for_candle_close():
     """
-    等待到下一個整點（1h K 棒收盤）之後才開始第一次訊號檢查
+    等待到下一個 15m K 棒收盤之後才開始第一次訊號檢查
     避免在 K 棒進行中判斷形態
     """
     now = datetime.utcnow()
-    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    # 下一個 15 分鐘整點
+    minutes_to_next = 15 - (now.minute % 15)
+    next_15m = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_next)
     # 加 10 秒 buffer 確保 K 棒資料已更新
-    wait_until = next_hour + timedelta(seconds=10)
+    wait_until = next_15m + timedelta(seconds=10)
     wait_sec = (wait_until - now).total_seconds()
 
-    if wait_sec > 0 and wait_sec < 3600:
+    if wait_sec > 0 and wait_sec < 900:
         log.info(
-            f"等待 K 棒收盤：{wait_sec:.0f} 秒後"
+            f"等待 15m K 棒收盤：{wait_sec:.0f} 秒後"
             f"（{wait_until.strftime('%H:%M:%S')} UTC）"
         )
         # 分段 sleep 以便響應 shutdown

@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from sqlalchemy import (
     create_engine, Column, Integer, Float,
-    String, DateTime, Boolean, func
+    String, DateTime, Boolean, func, text, inspect
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -43,21 +43,54 @@ class Trade(Base):
     sl_order_id  = Column(String, nullable=True)
     tp1_order_id = Column(String, nullable=True)
     tp2_order_id = Column(String, nullable=True)
+    # v3 新增：追蹤止盈 + 相關性紀錄
+    use_trailing = Column(Boolean, default=False)      # 是否使用追蹤止盈
+    trailing_atr = Column(Float, nullable=True)        # 追蹤用的 ATR 值
+    highest_price = Column(Float, nullable=True)       # LONG 進場後最高點
+    lowest_price  = Column(Float, nullable=True)       # SHORT 進場後最低點
+    btc_corr     = Column(Float, nullable=True)        # 進場時與 BTC 的相關性
 
 
 class StateManager:
     def __init__(self, db_path: str = "bot_state.db"):
         engine = create_engine(f"sqlite:///{db_path}", echo=False)
         Base.metadata.create_all(engine)
+        self.engine = engine
         self.Session = sessionmaker(bind=engine)
+        self._migrate()
         log.info(f"資料庫初始化完成：{db_path}")
+
+    # ── 非破壞性 SQLite 遷移 ─────────────────────────────────────
+    def _migrate(self):
+        """對舊 DB 新增欄位（不遺失既有資料）"""
+        needed = {
+            "use_trailing":  "BOOLEAN DEFAULT 0",
+            "trailing_atr":  "FLOAT",
+            "highest_price": "FLOAT",
+            "lowest_price":  "FLOAT",
+            "btc_corr":      "FLOAT",
+        }
+        try:
+            insp = inspect(self.engine)
+            existing = {c["name"] for c in insp.get_columns("trades")}
+            with self.engine.begin() as conn:
+                for col, decl in needed.items():
+                    if col not in existing:
+                        conn.execute(text(
+                            f"ALTER TABLE trades ADD COLUMN {col} {decl}"
+                        ))
+                        log.info(f"[DB] 遷移新增欄位：trades.{col}")
+        except Exception as e:
+            log.warning(f"[DB] 遷移失敗（可能無需遷移）：{e}")
 
     # ── 寫入 ─────────────────────────────────────────────────────
 
     def save_trade(self, symbol, direction, entry, sl, tp1, tp2, qty,
                    fib_level="", pattern="", score=0, timeframe="1h",
                    order_id=None, sl_order_id=None,
-                   tp1_order_id=None, tp2_order_id=None) -> Trade:
+                   tp1_order_id=None, tp2_order_id=None,
+                   use_trailing=False, trailing_atr=None,
+                   btc_corr=None) -> Trade:
         with self.Session() as session:
             trade = Trade(
                 symbol=symbol, direction=direction,
@@ -66,6 +99,10 @@ class StateManager:
                 signal_score=score, timeframe=timeframe,
                 order_id=order_id, sl_order_id=sl_order_id,
                 tp1_order_id=tp1_order_id, tp2_order_id=tp2_order_id,
+                use_trailing=use_trailing, trailing_atr=trailing_atr,
+                btc_corr=btc_corr,
+                highest_price=entry if direction == "LONG" else None,
+                lowest_price=entry if direction == "SHORT" else None,
             )
             session.add(trade)
             session.commit()
@@ -129,6 +166,34 @@ class StateManager:
                 trade.sl_order_id = sl_order_id
             session.commit()
             log.info(f"[DB] #{trade_id} 止損已移至保本：{new_sl}")
+
+    def update_trailing_price(self, trade_id: int,
+                              current_price: float):
+        """更新 LONG 最高價 / SHORT 最低價（追蹤止盈用）"""
+        with self.Session() as session:
+            trade = session.get(Trade, trade_id)
+            if not trade or not trade.use_trailing:
+                return
+            if trade.direction == "LONG":
+                if trade.highest_price is None or current_price > trade.highest_price:
+                    trade.highest_price = current_price
+                    session.commit()
+            else:
+                if trade.lowest_price is None or current_price < trade.lowest_price:
+                    trade.lowest_price = current_price
+                    session.commit()
+
+    def update_sl(self, trade_id: int, new_sl: float,
+                  sl_order_id: str = None):
+        """單純更新止損價（用於追蹤止盈推進）"""
+        with self.Session() as session:
+            trade = session.get(Trade, trade_id)
+            if not trade:
+                return
+            trade.sl = new_sl
+            if sl_order_id:
+                trade.sl_order_id = sl_order_id
+            session.commit()
 
     def update_order_ids(self, trade_id: int, **kwargs):
         """更新訂單 ID（sl_order_id, tp1_order_id, tp2_order_id）"""
@@ -284,4 +349,20 @@ class StateManager:
             "sl_order_id":  t.sl_order_id,
             "tp1_order_id": t.tp1_order_id,
             "tp2_order_id": t.tp2_order_id,
+            "use_trailing": t.use_trailing,
+            "trailing_atr": t.trailing_atr,
+            "highest_price": t.highest_price,
+            "lowest_price": t.lowest_price,
+            "btc_corr":     t.btc_corr,
         }
+
+    def get_open_trades_by_direction(self, direction: str) -> list[dict]:
+        """取得指定方向的未平倉交易"""
+        with self.Session() as session:
+            trades = (
+                session.query(Trade)
+                .filter(Trade.status.in_(["open", "partial"]),
+                        Trade.direction == direction)
+                .all()
+            )
+            return [self._trade_to_dict(t) for t in trades]

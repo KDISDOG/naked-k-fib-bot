@@ -34,18 +34,33 @@ db       = StateManager()
 executor = OrderExecutor(client, db)
 
 def _get_account_balance() -> dict:
-    """安全取得帳戶餘額，連線失敗回傳 -1"""
+    """安全取得帳戶餘額 + 全帳戶權益，連線失敗回傳 -1"""
     try:
         account = client.futures_account()
+        wallet = -1
+        available = -1
+        unrealized = 0.0
         for asset in account["assets"]:
             if asset["asset"] == "USDT":
-                return {
-                    "wallet":    round(float(asset["walletBalance"]), 2),
-                    "available": round(float(asset["availableBalance"]), 2),
-                }
+                wallet    = round(float(asset["walletBalance"]), 2)
+                available = round(float(asset["availableBalance"]), 2)
+                unrealized = round(float(asset.get("unrealizedProfit", 0)), 2)
+                break
+        # 合約帳戶總權益（含所有資產 + 未實現損益）
+        total_equity = round(
+            float(account.get("totalMarginBalance")
+                  or account.get("totalWalletBalance", 0)),
+            2
+        )
+        return {
+            "wallet":       wallet,
+            "available":    available,
+            "unrealized":   unrealized,
+            "total_equity": total_equity,
+        }
     except Exception as e:
         log.warning(f"取得餘額失敗: {e}")
-    return {"wallet": -1, "available": -1}
+    return {"wallet": -1, "available": -1, "unrealized": 0, "total_equity": -1}
 
 # ── 頁面 ──────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
@@ -133,8 +148,11 @@ async def api_open_positions():
                 risk = abs(t["entry"] - t["sl"]) * remaining_qty
                 rr = round(unrealized_pnl / risk, 2) if risk > 0 else 0
 
+        leverage = int(os.getenv("MAX_LEVERAGE", 2))
+        margin = round((t["qty"] or 0) * (t["entry"] or 0) / leverage, 2)
         result.append({**t, "current_price": current_price,
-                       "unrealized_pnl": unrealized_pnl, "rr": rr})
+                       "unrealized_pnl": unrealized_pnl, "rr": rr,
+                       "margin": margin})
     return result
 
 @app.post("/api/close_position/{trade_id}")
