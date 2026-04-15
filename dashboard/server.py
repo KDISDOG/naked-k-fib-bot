@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from state_manager import StateManager
 from order_executor import OrderExecutor
+from market_context import MarketContext
 from binance.client import Client
 
 load_dotenv()
@@ -30,8 +31,9 @@ client = Client(
     os.getenv("BINANCE_SECRET"),
     testnet=os.getenv("BINANCE_TESTNET", "true") == "true"
 )
-db       = StateManager()
-executor = OrderExecutor(client, db)
+db         = StateManager()
+executor   = OrderExecutor(client, db)
+market_ctx = MarketContext(client)
 
 def _get_account_balance() -> dict:
     """安全取得帳戶餘額 + 全帳戶權益，連線失敗回傳 -1"""
@@ -148,7 +150,7 @@ async def api_open_positions():
                 risk = abs(t["entry"] - t["sl"]) * remaining_qty
                 rr = round(unrealized_pnl / risk, 2) if risk > 0 else 0
 
-        leverage = int(os.getenv("MAX_LEVERAGE", 2))
+        leverage = int(os.getenv("MAX_LEVERAGE", 3))
         margin = round((t["qty"] or 0) * (t["entry"] or 0) / leverage, 2)
         result.append({**t, "current_price": current_price,
                        "unrealized_pnl": unrealized_pnl, "rr": rr,
@@ -212,6 +214,99 @@ async def update_config(
         new_lines.append(f"RISK_PER_TRADE={risk_pct}")
     env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     return {"status": "ok", "message": "參數已更新，下次啟動生效"}
+
+# ── v5 多策略 API ─────────────────────────────────────────────────
+
+@app.get("/api/stats/strategy/{strategy_name}")
+async def api_strategy_stats(strategy_name: str):
+    """取得特定策略的統計數據"""
+    return db.get_stats_by_strategy(strategy_name)
+
+@app.get("/api/stats/all_strategies")
+async def api_all_strategy_stats():
+    """一次取得所有策略的統計"""
+    return {
+        "naked_k_fib":    db.get_stats_by_strategy("naked_k_fib"),
+        "mean_reversion": db.get_stats_by_strategy("mean_reversion"),
+        "combined":       db.get_stats(),
+    }
+
+@app.post("/api/switch_strategy")
+async def switch_strategy(strategy: str = Form(...)):
+    """
+    熱切換 ACTIVE_STRATEGY（寫入 .env）。
+    已開倉的單不受影響，走完原策略邏輯。
+    有效值：naked_k_fib / mean_reversion / all
+    """
+    valid = {"naked_k_fib", "mean_reversion", "all"}
+    if strategy not in valid:
+        return JSONResponse(
+            {"status": "error", "message": f"無效策略：{strategy}"},
+            status_code=400,
+        )
+    import re
+    env_path = Path(".env")
+    text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    if re.search(r"^ACTIVE_STRATEGY\s*=", text, re.MULTILINE):
+        text = re.sub(
+            r"^ACTIVE_STRATEGY\s*=.*$",
+            f"ACTIVE_STRATEGY={strategy}",
+            text, flags=re.MULTILINE
+        )
+    else:
+        text += f"\nACTIVE_STRATEGY={strategy}\n"
+    env_path.write_text(text, encoding="utf-8")
+    return {"status": "ok", "message": f"策略已切換為 {strategy}，下次排程生效"}
+
+@app.get("/api/market_status")
+async def api_market_status():
+    """回傳當前市場狀態（BTC 主導率 / BTC 週線方向 / BTC 1h ADX）"""
+    import pandas as pd
+    import pandas_ta as ta
+    status = {
+        "btc_dominance":     None,
+        "btc_dom_high":      None,
+        "btc_weekly_bull":   None,
+        "btc_1h_adx":        None,
+        "market_regime":     "unknown",
+    }
+    try:
+        dom = market_ctx.btc_dominance()
+        status["btc_dominance"] = round(dom, 2) if dom else None
+        status["btc_dom_high"]  = market_ctx.is_high_btc_dominance(55.0)
+    except Exception:
+        pass
+    try:
+        status["btc_weekly_bull"] = market_ctx.btc_weekly_bullish()
+    except Exception:
+        pass
+    try:
+        raw = client.futures_klines(symbol="BTCUSDT", interval="1h", limit=100)
+        df = pd.DataFrame(raw, columns=[
+            "t","o","h","l","c","v","ct","qav","n","tbv","tbqv","i"
+        ])
+        for col in ("h","l","c"):
+            df[col] = df[col].astype(float)
+        adx = ta.adx(df["h"], df["l"], df["c"], length=14)
+        adx_val = float(adx["ADX_14"].iloc[-1])
+        status["btc_1h_adx"] = round(adx_val, 1)
+        if adx_val < 20:
+            status["market_regime"] = "range"     # 適合 MR
+        elif adx_val <= 45:
+            status["market_regime"] = "trend"     # 適合 NKF
+        else:
+            status["market_regime"] = "overheat"  # 兩者都謹慎
+    except Exception:
+        pass
+    return status
+
+@app.get("/api/active_strategy")
+async def api_active_strategy():
+    """回傳目前設定的 ACTIVE_STRATEGY"""
+    load_dotenv(override=True)
+    return {"active_strategy": os.getenv("ACTIVE_STRATEGY", "all")}
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -91,11 +91,12 @@ class OrderExecutor:
         sl:        float,
         tp1:       float,
         tp2:       float,
-        leverage:  int = 2,
+        leverage:  int = 3,
         meta:      dict = None,
         use_trailing: bool = False,
         trailing_atr: float = 0.0,
         btc_corr:    float = 0.0,
+        strategy:    str = "naked_k_fib",
     ) -> Optional[dict]:
         """
         開合約倉位並設置：
@@ -208,6 +209,7 @@ class OrderExecutor:
                 use_trailing = use_trailing,
                 trailing_atr = trailing_atr,
                 btc_corr     = btc_corr,
+                strategy     = strategy,
             )
 
             log.info(
@@ -388,3 +390,50 @@ class OrderExecutor:
             log.warning(f"緊急平倉完成：共平 {closed} 個倉位")
         except Exception as e:
             log.error(f"緊急平倉失敗: {e}")
+
+    def close_position_market(self, symbol: str, trade_id: int):
+        """
+        對特定 symbol 執行市價平倉（均值回歸超時用）。
+        平倉後更新資料庫狀態。
+        """
+        try:
+            pos_info = self.client.futures_position_information(symbol=symbol)
+            if not pos_info:
+                return
+            qty = float(pos_info[0]["positionAmt"])
+            if qty == 0:
+                return
+
+            side = SIDE_SELL if qty > 0 else SIDE_BUY
+            abs_qty = self._round_qty(symbol, abs(qty))
+
+            order = self.client.futures_create_order(
+                symbol     = symbol,
+                side       = side,
+                type       = ORDER_TYPE_MARKET,
+                quantity   = abs_qty,
+                reduceOnly = True,
+            )
+            exit_price = float(order.get("avgPrice") or 0)
+            if exit_price <= 0:
+                try:
+                    filled = self.client.futures_get_order(
+                        symbol=symbol, orderId=order.get("orderId")
+                    )
+                    exit_price = float(filled.get("avgPrice") or 0)
+                except Exception:
+                    pass
+
+            # 撤銷剩餘掛單
+            try:
+                self.client.futures_cancel_all_open_orders(symbol=symbol)
+            except Exception:
+                pass
+
+            self.db.close_trade(trade_id, exit_price=exit_price or 0)
+            log.warning(
+                f"[{symbol}] 市價平倉（超時）：qty={abs_qty} @ {exit_price}"
+            )
+        except Exception as e:
+            log.error(f"[{symbol}] 市價平倉失敗: {e}")
+

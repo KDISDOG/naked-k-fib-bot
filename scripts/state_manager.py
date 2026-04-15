@@ -49,6 +49,9 @@ class Trade(Base):
     highest_price = Column(Float, nullable=True)       # LONG 進場後最高點
     lowest_price  = Column(Float, nullable=True)       # SHORT 進場後最低點
     btc_corr     = Column(Float, nullable=True)        # 進場時與 BTC 的相關性
+    # v5 新增：多策略支援
+    strategy     = Column(String, default="naked_k_fib", index=True)  # 策略標識
+    timeout_bars = Column(Integer, default=0)          # 已持倉 K 棒數（超時平倉用）
 
 
 class StateManager:
@@ -69,6 +72,9 @@ class StateManager:
             "highest_price": "FLOAT",
             "lowest_price":  "FLOAT",
             "btc_corr":      "FLOAT",
+            # v5
+            "strategy":      "TEXT DEFAULT 'naked_k_fib'",
+            "timeout_bars":  "INTEGER DEFAULT 0",
         }
         try:
             insp = inspect(self.engine)
@@ -90,7 +96,8 @@ class StateManager:
                    order_id=None, sl_order_id=None,
                    tp1_order_id=None, tp2_order_id=None,
                    use_trailing=False, trailing_atr=None,
-                   btc_corr=None) -> Trade:
+                   btc_corr=None,
+                   strategy="naked_k_fib") -> Trade:
         with self.Session() as session:
             trade = Trade(
                 symbol=symbol, direction=direction,
@@ -101,6 +108,7 @@ class StateManager:
                 tp1_order_id=tp1_order_id, tp2_order_id=tp2_order_id,
                 use_trailing=use_trailing, trailing_atr=trailing_atr,
                 btc_corr=btc_corr,
+                strategy=strategy,
                 highest_price=entry if direction == "LONG" else None,
                 lowest_price=entry if direction == "SHORT" else None,
             )
@@ -222,26 +230,25 @@ class StateManager:
             return count > 0
 
     def in_cooldown(self, symbol: str, cooldown_bars: int = 6,
-                    bar_minutes: int = 60) -> bool:
+                    bar_minutes: int = 15,
+                    strategy: str = None) -> bool:
         """
-        檢查某幣種是否在冷卻期內
-        （上次止損出場後 cooldown_bars 根 K 棒內不開新倉）
+        檢查某幣種是否在冷卻期內（per-strategy）：
+          上次同策略止損出場後 cooldown_bars 根 K 棒內不開新倉。
+          不同策略間不互相阻擋，避免一邊虧了另一邊也被封鎖。
         """
         cooldown_delta = timedelta(minutes=cooldown_bars * bar_minutes)
         cutoff = datetime.utcnow() - cooldown_delta
         with self.Session() as session:
-            last_loss = (
-                session.query(Trade)
-                .filter(
-                    Trade.symbol == symbol,
-                    Trade.status == "closed",
-                    Trade.net_pnl < 0,
-                    Trade.closed_at >= cutoff
-                )
-                .order_by(Trade.closed_at.desc())
-                .first()
+            q = session.query(Trade).filter(
+                Trade.symbol == symbol,
+                Trade.status == "closed",
+                Trade.net_pnl < 0,
+                Trade.closed_at >= cutoff,
             )
-            return last_loss is not None
+            if strategy:
+                q = q.filter(Trade.strategy == strategy)
+            return q.order_by(Trade.closed_at.desc()).first() is not None
 
     def count_open_positions(self) -> int:
         with self.Session() as session:
@@ -354,6 +361,8 @@ class StateManager:
             "highest_price": t.highest_price,
             "lowest_price": t.lowest_price,
             "btc_corr":     t.btc_corr,
+            "strategy":     getattr(t, "strategy", "naked_k_fib"),
+            "timeout_bars": getattr(t, "timeout_bars", 0),
         }
 
     def get_open_trades_by_direction(self, direction: str) -> list[dict]:
@@ -366,3 +375,70 @@ class StateManager:
                 .all()
             )
             return [self._trade_to_dict(t) for t in trades]
+
+    # ── v5 多策略新增 ─────────────────────────────────────────────
+
+    def get_open_by_strategy(self, strategy_name: str) -> list[dict]:
+        """查詢特定策略的所有未平倉交易"""
+        with self.Session() as session:
+            trades = (
+                session.query(Trade)
+                .filter(
+                    Trade.status.in_(["open", "partial"]),
+                    Trade.strategy == strategy_name,
+                )
+                .all()
+            )
+            return [self._trade_to_dict(t) for t in trades]
+
+    def count_positions_by_strategy(self, strategy_name: str) -> int:
+        """計算特定策略的持倉數"""
+        with self.Session() as session:
+            return (
+                session.query(Trade)
+                .filter(
+                    Trade.status.in_(["open", "partial"]),
+                    Trade.strategy == strategy_name,
+                )
+                .count()
+            )
+
+    def increment_timeout_bars(self, trade_id: int) -> int:
+        """持倉 K 棒數 +1，回傳新的 timeout_bars 值（均值回歸超時用）"""
+        with self.Session() as session:
+            trade = session.get(Trade, trade_id)
+            if not trade:
+                return 0
+            current = trade.timeout_bars or 0
+            trade.timeout_bars = current + 1
+            session.commit()
+            return trade.timeout_bars
+
+    def get_stats_by_strategy(self, strategy_name: str) -> dict:
+        """取得特定策略的統計數據"""
+        with self.Session() as session:
+            closed = (
+                session.query(Trade)
+                .filter(Trade.status == "closed",
+                        Trade.strategy == strategy_name)
+                .all()
+            )
+            if not closed:
+                return {
+                    "strategy": strategy_name,
+                    "total": 0, "wins": 0, "losses": 0,
+                    "win_rate": 0, "total_pnl": 0, "net_pnl": 0,
+                }
+            wins    = [t for t in closed if t.net_pnl > 0]
+            net_pnl = sum(t.net_pnl for t in closed)
+            return {
+                "strategy": strategy_name,
+                "total":    len(closed),
+                "wins":     len(wins),
+                "losses":   len(closed) - len(wins),
+                "win_rate": round(len(wins) / len(closed) * 100, 1),
+                "total_pnl": round(sum(t.pnl for t in closed), 2),
+                "net_pnl":   round(net_pnl, 2),
+                "avg_pnl":   round(net_pnl / len(closed), 2),
+            }
+

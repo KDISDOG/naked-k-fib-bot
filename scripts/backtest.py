@@ -17,7 +17,7 @@ import sys
 import math
 import argparse
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -32,6 +32,7 @@ from signal_engine import (
     SignalEngine, KEY_FIB_LEVELS, FIB_TOLERANCE,
     FIB_LONG_MAP, FIB_SHORT_MAP, _normalize_fib_key
 )
+from config import Config
 
 load_dotenv()
 
@@ -92,13 +93,14 @@ class BtTrade:
     net_pnl:    float = 0.0
     close_time: datetime = None
     tp1_hit:    bool = False
+    strategy:   str  = "naked_k_fib"
 
 
 # ── K 線下載（幣安期貨）──────────────────────────────────────────
 def fetch_klines(client: Client, symbol: str, interval: str,
                  months: int) -> pd.DataFrame:
     """下載最近 N 個月的期貨 K 線"""
-    start = datetime.utcnow() - timedelta(days=30 * months)
+    start = datetime.now(timezone.utc) - timedelta(days=30 * months)
     start_ms = int(start.timestamp() * 1000)
     all_klines = []
     limit = 1500
@@ -242,6 +244,170 @@ class BacktestSignalEngine(SignalEngine):
             swing_high = swing_h,
             swing_low  = swing_l,
         )
+
+
+# ── MR 回測引擎 ──────────────────────────────────────────────────
+class BacktestMREngine:
+    """
+    均值回歸策略回測引擎：直接在本地 DataFrame slice 上跑訊號邏輯，
+    複用 MeanReversionStrategy 的數學邏輯，不需要真實 Binance client。
+    """
+
+    def check_on_bar(self, df: pd.DataFrame) -> Optional[object]:
+        """
+        df: 截至當根（已收盤）的本地 K 線資料
+        Returns: namedtuple-like 物件，欄位對齊 BtTrade 需要 (entry, sl, tp1, tp2, score)
+        或 None
+        """
+        if len(df) < 50:
+            return None
+
+        try:
+            rsi = ta.rsi(df["close"], length=Config.MR_RSI_PERIOD)
+            bb  = ta.bbands(df["close"], length=Config.MR_BB_PERIOD,
+                            std=Config.MR_BB_STD)
+            adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+            atr_s  = ta.atr(df["high"], df["low"], df["close"], length=14)
+        except Exception:
+            return None
+
+        if rsi is None or bb is None or adx_df is None or atr_s is None:
+            return None
+
+        # 自動偵測 pandas_ta bbands 欄位名稱（不同版本格式不同）
+        col_u = next((c for c in bb.columns if c.startswith("BBU_")), None)
+        col_l = next((c for c in bb.columns if c.startswith("BBL_")), None)
+        col_m = next((c for c in bb.columns if c.startswith("BBM_")), None)
+        if not col_u or not col_l or not col_m:
+            return None
+
+        if rsi.isna().iloc[-1] or bb[col_u].isna().iloc[-1]:
+            return None
+
+        rsi_val  = float(rsi.iloc[-1])
+        adx_val  = float(adx_df["ADX_14"].iloc[-1])
+        bb_upper = float(bb[col_u].iloc[-1])
+        bb_lower = float(bb[col_l].iloc[-1])
+        bb_mid   = float(bb[col_m].iloc[-1])
+        price    = float(df["close"].iloc[-1])
+        atr_val  = float(atr_s.iloc[-1])
+
+        # ADX 過濾（MR 只在非趨勢盤運作）
+        if adx_val >= 25:
+            return None
+
+        # 成交量相對均量
+        avg_vol  = float(df["volume"].tail(21).iloc[:-1].mean())
+        last_vol = float(df["volume"].iloc[-1])
+        vol_ok   = last_vol <= avg_vol * Config.MR_VOL_MULT
+
+        # BB 容差：允許最多 0.5% 超出 BB 軌道（增加入場機會）
+        bb_tol = bb_lower * 0.005
+        side = None
+        has_reversal = False
+        if rsi_val <= Config.MR_RSI_OVERSOLD and price <= bb_lower + bb_tol:
+            side = "LONG"
+            has_reversal = self._has_reversal(df, "LONG")
+        elif rsi_val >= Config.MR_RSI_OVERBOUGHT and price >= bb_upper - bb_tol:
+            side = "SHORT"
+            has_reversal = self._has_reversal(df, "SHORT")
+
+        if side is None:
+            return None
+
+        # ── 評分 ─────────────────────────────────────────────────
+        score = 1
+        if has_reversal:
+            score += 1  # 反轉K棒形態加分
+        if vol_ok:
+            score += 1  # 縮量確認加分
+        if (side == "LONG" and rsi_val <= 15) or \
+           (side == "SHORT" and rsi_val >= 85):
+            score += 1
+        bb_width = bb_upper - bb_lower
+        if side == "LONG" and price < bb_lower - bb_width * 0.1:
+            score += 1
+        elif side == "SHORT" and price > bb_upper + bb_width * 0.1:
+            score += 1
+        try:
+            stoch = ta.stochrsi(df["close"])
+            if stoch is not None and len(stoch.columns) >= 2:
+                k_s = float(stoch.iloc[-1, 0])
+                d_s = float(stoch.iloc[-1, 1])
+                if side == "LONG" and k_s > d_s and k_s < 20:
+                    score += 1
+                elif side == "SHORT" and k_s < d_s and k_s > 80:
+                    score += 1
+        except Exception:
+            pass
+        try:
+            macd = ta.macd(df["close"])
+            if macd is not None and macd.shape[1] >= 3:
+                hist = macd.iloc[:, 2]
+                if side == "LONG" and \
+                        float(hist.iloc[-1]) > float(hist.iloc[-2]) and \
+                        float(df["close"].iloc[-1]) < float(df["close"].iloc[-2]):
+                    score += 1
+                elif side == "SHORT" and \
+                        float(hist.iloc[-1]) < float(hist.iloc[-2]) and \
+                        float(df["close"].iloc[-1]) > float(df["close"].iloc[-2]):
+                    score += 1
+        except Exception:
+            pass
+        score = min(score, 5)
+
+        # ── TP/SL ────────────────────────────────────────────────
+        sl_dist = min(Config.MR_SL_PCT * price, atr_val * 1.0)
+        sl_dist = max(sl_dist, price * 0.005)
+        sl_dist = min(sl_dist, price * 0.03)
+
+        if side == "LONG":
+            tp1 = bb_mid if bb_mid > price else price * 1.010
+            tp2 = bb_upper if bb_upper > tp1 else tp1 * 1.015
+            sl  = price - sl_dist
+        else:
+            tp1 = bb_mid if bb_mid < price else price * 0.990
+            tp2 = bb_lower if bb_lower < tp1 else tp1 * 0.985
+            sl  = price + sl_dist
+
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            direction  = side,
+            entry      = price,
+            sl         = sl,
+            tp1        = tp1,
+            tp2        = tp2,
+            score      = score,
+            fib_level  = "—",
+            pattern    = "MR_REVERSAL",
+            timeframe  = Config.MR_TIMEFRAME,
+        )
+
+    def _has_reversal(self, df: pd.DataFrame, side: str) -> bool:
+        """簡化版反轉 K 棒偵測（與 MeanReversionStrategy._has_reversal_candle 相同邏輯）"""
+        c    = df.iloc[-1]
+        body = abs(float(c["close"]) - float(c["open"]))
+        upper_shadow = float(c["high"]) - max(float(c["close"]), float(c["open"]))
+        lower_shadow = min(float(c["close"]), float(c["open"])) - float(c["low"])
+        if side == "LONG":
+            if body > 0 and lower_shadow >= body * 2:
+                return True
+            if float(c["close"]) > float(c["open"]):
+                prev3 = df.iloc[-4:-1]
+                if len(prev3) == 3 and all(
+                    prev3["close"].iloc[i] < prev3["open"].iloc[i] for i in range(3)
+                ):
+                    return True
+        else:
+            if body > 0 and upper_shadow >= body * 2:
+                return True
+            if float(c["close"]) < float(c["open"]):
+                prev3 = df.iloc[-4:-1]
+                if len(prev3) == 3 and all(
+                    prev3["close"].iloc[i] > prev3["open"].iloc[i] for i in range(3)
+                ):
+                    return True
+        return False
 
 
 # ── 倉位計算（脫離 client，使用模擬餘額）───────────────────────────
@@ -406,12 +572,212 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
     return trade
 
 
+# ── MR 主回測邏輯 ───────────────────────────────────────────────
+def run_backtest_mr(client: Client, symbol: str, months: int,
+                    debug: bool = False, adx_max: float = 25.0) -> list:
+    """
+    均值回歸策略回測：使用 MR_TIMEFRAME K 線逐根回放。
+    指標在完整 DataFrame 上一次性計算（矢量化，O(n) 代替原 O(n²)）。
+    超時平倉：MR_TIMEOUT_BARS 根後強制平倉。
+    """
+    tf = Config.MR_TIMEFRAME
+    print(f"\n[{symbol} MR {tf}] 回測開始")
+
+    df_tf = fetch_klines(client, symbol, tf, months)
+    if len(df_tf) < 100:
+        print(f"  資料不足（{len(df_tf)} 根），跳過")
+        return []
+
+    # ── 一次性預計算所有指標（大幅提速）─────────────────────────────
+    print(f"  預計算指標...", end="", flush=True)
+    rsi_s    = ta.rsi(df_tf["close"], length=Config.MR_RSI_PERIOD)
+    bb_full  = ta.bbands(df_tf["close"], length=Config.MR_BB_PERIOD,
+                         std=Config.MR_BB_STD)
+    adx_full = ta.adx(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    atr_full = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    stoch_full = ta.stochrsi(df_tf["close"])
+    macd_full  = ta.macd(df_tf["close"])
+    avg_vol_s  = df_tf["volume"].rolling(21).mean().shift(1)  # 前20根均量（不含當棒）
+
+    col_u = next((c for c in bb_full.columns if c.startswith("BBU_")), None) if bb_full is not None else None
+    col_l = next((c for c in bb_full.columns if c.startswith("BBL_")), None) if bb_full is not None else None
+    col_m = next((c for c in bb_full.columns if c.startswith("BBM_")), None) if bb_full is not None else None
+    if not col_u or not col_l or not col_m:
+        print(f"\n  [ERROR] BB columns not detected")
+        return []
+    print(" 完成")
+
+    warmup         = 60
+    engine         = BacktestMREngine()
+    trades         = []
+    balance        = INITIAL_BALANCE
+    cooldown_until = -1
+    timeout_bars   = int(os.getenv("MR_TIMEOUT_BARS", "24"))
+    min_score      = Config.MR_MIN_SCORE
+
+    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 1):
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+
+        # ── 讀取預計算指標值 ──────────────────────────────────────
+        rsi_val  = rsi_s.iloc[i]
+        adx_val  = adx_full["ADX_14"].iloc[i] if adx_full is not None else float("nan")
+        bb_upper = bb_full[col_u].iloc[i]
+        bb_lower = bb_full[col_l].iloc[i]
+        bb_mid   = bb_full[col_m].iloc[i]
+        atr_val  = atr_full.iloc[i] if atr_full is not None else float("nan")
+        price    = float(df_tf["close"].iloc[i])
+        avg_vol_i = avg_vol_s.iloc[i]
+
+        if pd.isna(rsi_val) or pd.isna(adx_val) or pd.isna(bb_upper) or \
+                pd.isna(atr_val) or pd.isna(avg_vol_i):
+            dbg["no_sig"] += 1
+            continue
+
+        rsi_val  = float(rsi_val)
+        adx_val  = float(adx_val)
+        bb_upper = float(bb_upper)
+        bb_lower = float(bb_lower)
+        bb_mid   = float(bb_mid)
+        atr_val  = float(atr_val)
+
+        # ADX 過濾
+        if adx_val >= adx_max:
+            dbg["no_sig"] += 1
+            continue
+
+        last_vol  = float(df_tf["volume"].iloc[i])
+        vol_ok    = last_vol <= float(avg_vol_i) * Config.MR_VOL_MULT
+        bb_tol    = bb_lower * 0.005
+
+        side = None
+        has_reversal = False
+        if rsi_val <= Config.MR_RSI_OVERSOLD and price <= bb_lower + bb_tol:
+            side = "LONG"
+            has_reversal = engine._has_reversal(df_tf.iloc[max(0, i - 3):i + 1], "LONG")
+        elif rsi_val >= Config.MR_RSI_OVERBOUGHT and price >= bb_upper - bb_tol:
+            side = "SHORT"
+            has_reversal = engine._has_reversal(df_tf.iloc[max(0, i - 3):i + 1], "SHORT")
+
+        if side is None:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 評分 ─────────────────────────────────────────────────
+        score = 1
+        if has_reversal:
+            score += 1
+        if vol_ok:
+            score += 1
+        if (side == "LONG" and rsi_val <= 15) or (side == "SHORT" and rsi_val >= 85):
+            score += 1
+        bb_width = bb_upper - bb_lower
+        if side == "LONG" and price < bb_lower - bb_width * 0.1:
+            score += 1
+        elif side == "SHORT" and price > bb_upper + bb_width * 0.1:
+            score += 1
+        try:
+            if stoch_full is not None and not stoch_full.iloc[i].isna().any():
+                k_s = float(stoch_full.iloc[i, 0])
+                d_s = float(stoch_full.iloc[i, 1])
+                if side == "LONG" and k_s > d_s and k_s < 20:
+                    score += 1
+                elif side == "SHORT" and k_s < d_s and k_s > 80:
+                    score += 1
+        except Exception:
+            pass
+        try:
+            if macd_full is not None and macd_full.shape[1] >= 3:
+                hist = macd_full.iloc[:, 2]
+                if not pd.isna(hist.iloc[i]) and not pd.isna(hist.iloc[i - 1]):
+                    if side == "LONG" and float(hist.iloc[i]) > float(hist.iloc[i - 1]) \
+                            and price < float(df_tf["close"].iloc[i - 1]):
+                        score += 1
+                    elif side == "SHORT" and float(hist.iloc[i]) < float(hist.iloc[i - 1]) \
+                            and price > float(df_tf["close"].iloc[i - 1]):
+                        score += 1
+        except Exception:
+            pass
+        score = min(score, 5)
+
+        if score < min_score:
+            dbg["low_score"] += 1
+            continue
+
+        # ── TP/SL ────────────────────────────────────────────────
+        sl_dist = min(Config.MR_SL_PCT * price, atr_val * 1.0)
+        sl_dist = max(sl_dist, price * 0.005)
+        sl_dist = min(sl_dist, price * 0.03)
+        if side == "LONG":
+            tp1 = bb_mid if bb_mid > price else price * 1.010
+            tp2 = bb_upper if bb_upper > tp1 else tp1 * 1.015
+            sl  = price - sl_dist
+        else:
+            tp1 = bb_mid if bb_mid < price else price * 0.990
+            tp2 = bb_lower if bb_lower < tp1 else tp1 * 0.985
+            sl  = price + sl_dist
+
+        dbg["signals"] += 1
+        pos = calc_position(balance, price, sl, tp1, tp2)
+        if not pos:
+            dbg["bad_pos"] += 1
+            continue
+
+        trade = BtTrade(
+            symbol    = symbol,
+            direction = side,
+            entry     = price,
+            sl        = sl,
+            tp1       = tp1,
+            tp2       = tp2,
+            qty       = pos["qty"],
+            qty_tp1   = pos["qty_tp1"],
+            qty_tp2   = pos["qty_tp2"],
+            fib_level = "—",
+            pattern   = "MR_REVERSAL",
+            score     = score,
+            timeframe = tf,
+            open_bar  = i,
+            open_time = df_tf["time"].iloc[i],
+            strategy  = "mean_reversion",
+        )
+
+        df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
+        trade = simulate_trade(trade, df_future, max_bars=timeout_bars)
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        balance += trade.net_pnl
+        trades.append(trade)
+
+        if "SL" in trade.result:
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+
+    print(f" 找到 {len(trades)} 筆訊號")
+    if debug or len(trades) == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"]
+        print(f"\n  ── MR 診斷（為何沒有入場？）──")
+        print(f"  總掃描根數：{scanned}")
+        print(f"  ├─ 沒通過訊號過濾：{dbg['no_sig']} 根  （ADX/RSI/BB）")
+        print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根  （需要 vol_ok 或 reversal 其中一個）")
+        print(f"  ├─ 倉位計算失敗   ：{dbg['bad_pos']} 根  （R:R < 1.2 或 SL% 範圍外）")
+        print(f"  └─ 通過全部過濾   ：{dbg['signals']} 根")
+    return trades
+
+
 # ── 輸出統計 ──────────────────────────────────────────────────────
 def print_stats(trades: list, timeframe: str, symbol: str,
-                initial_balance: float):
+                initial_balance: float, label: str = ""):
     closed = [t for t in trades if t.result not in ("", "OPEN")]
+    tag = f" [{label}]" if label else ""
     if not closed:
-        print(f"\n[{symbol} {timeframe}] 無已結算交易")
+        print(f"\n[{symbol} {timeframe}{tag}] 無已結算交易")
         return
 
     wins   = [t for t in closed if t.net_pnl > 0]
@@ -450,11 +816,29 @@ def print_stats(trades: list, timeframe: str, symbol: str,
     final_balance = initial_balance + total_net
 
     print(f"\n{'=' * 60}")
-    print(f"  回測結果：{symbol} {timeframe}")
+    print(f"  回測結果：{symbol} {timeframe}{tag}")
     print(f"{'=' * 60}")
+
+    # ── 退出方式細分 ─────────────────────────────────────────────
+    timeout_wins   = [t for t in timeout if t.net_pnl > 0]
+    timeout_losses = [t for t in timeout if t.net_pnl <= 0]
+    tp1_only       = [t for t in closed if t.result == "TP1+SL"]
+    tp1_pct = len(tp1_only) / len(closed) * 100 if closed else 0
+    timeout_pct = len(timeout) / len(closed) * 100 if closed else 0
+    timeout_net = sum(t.net_pnl for t in timeout)
+
     print(f"  交易總數：{len(closed)}  "
-          f"（TP2全達：{len(tp2_hits)}  止損：{len(sl_hits)}  超時：{len(timeout)}）")
+          f"（TP2全達：{len(tp2_hits)}  TP1出場：{len(tp1_only)}  止損：{len(sl_hits)}  超時：{len(timeout)}）")
     print(f"  勝率：    {win_rate:.1f}%  ({len(wins)} 勝 / {len(losses)} 敗)")
+    print(f"  退出方式：TP2={len(tp2_hits)/len(closed)*100:.0f}%  "
+          f"TP1SL={tp1_pct:.0f}%  "
+          f"止損={len(sl_hits)/len(closed)*100:.0f}%  "
+          f"超時={timeout_pct:.0f}%  "
+          f"({'⚠ 超時佔比過高，建議調大 --max-bars 或確認用正式API' if timeout_pct >= 40 else 'OK'})")
+    if timeout:
+        to_avg = timeout_net / len(timeout)
+        print(f"  超時明細：{len(timeout_wins)} 超時盈利 / {len(timeout_losses)} 超時虧損 "
+              f"  超時平均：{to_avg:+.4f} USDT/單  超時合計：{timeout_net:+.4f} USDT")
     print(f"  期望值：  {expectancy:+.4f} USDT/單")
     print(f"  平均獲利：{avg_win:+.4f} USDT")
     print(f"  平均虧損：{avg_loss:+.4f} USDT")
@@ -492,7 +876,7 @@ def print_stats(trades: list, timeframe: str, symbol: str,
 
 # ── 主回測邏輯 ───────────────────────────────────────────────────
 def run_backtest(client: Client, symbol: str, timeframe: str,
-                 months: int) -> list:
+                 months: int, max_bars: int = 48) -> list:
 
     print(f"\n[{symbol} {timeframe}] 回測開始")
 
@@ -569,7 +953,7 @@ def run_backtest(client: Client, symbol: str, timeframe: str,
 
         # 用後續 K 棒模擬結果
         df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
-        trade = simulate_trade(trade, df_future)
+        trade = simulate_trade(trade, df_future, max_bars=max_bars)
 
         if trade.result in ("", "OPEN"):
             continue
@@ -585,6 +969,152 @@ def run_backtest(client: Client, symbol: str, timeframe: str,
     return trades
 
 
+# ── MR 指標快照（診斷用）─────────────────────────────────────────
+def _print_mr_indicator_snapshot(client: Client, symbol: str, months: int, adx_max: float = 25.0):
+    """
+    下載最近一段資料，印出最後 20 根 K 棒的實際 RSI/ADX 值，
+    幫助確認入場條件設定是否合理。
+    """
+    tf = Config.MR_TIMEFRAME
+    df = fetch_klines(client, symbol, tf, 1)  # 只需要最近 1 個月夠計算指標
+    if len(df) < 60:
+        print("  [診斷] 資料不足，無法計算指標")
+        return
+
+    rsi   = ta.rsi(df["close"], length=Config.MR_RSI_PERIOD)
+    bb    = ta.bbands(df["close"], length=Config.MR_BB_PERIOD, std=Config.MR_BB_STD)
+    adx_df2 = ta.adx(df["high"], df["low"], df["close"], length=14)
+    # 自動偵測欄位名稱
+    col_u = next((c for c in bb.columns if c.startswith("BBU_")), None) if bb is not None else None
+    col_l = next((c for c in bb.columns if c.startswith("BBL_")), None) if bb is not None else None
+    avg_vol = df["volume"].rolling(20).mean()
+
+    print(f"\n  ── {symbol} {tf} 最後 20 根指標快照 ──")
+    print(f"  {'時間':<18} {'RSI':>6} {'ADX':>6} {'BB%':>7} {'Vol%':>7} {'Price':>12}  入場方向")
+    print(f"  {'-'*72}")
+    for idx in df.index[-20:]:
+        t   = df.loc[idx, "time"].strftime("%m/%d %H:%M") if hasattr(df.loc[idx, "time"], "strftime") else str(df.loc[idx, "time"])[:16]
+        r   = float(rsi.iloc[idx]) if rsi is not None and not pd.isna(rsi.iloc[idx]) else 0
+        a   = float(adx_df2["ADX_14"].iloc[idx]) if adx_df2 is not None and not pd.isna(adx_df2["ADX_14"].iloc[idx]) else 0
+        pr  = float(df.loc[idx, "close"])
+        bbu = float(bb[col_u].iloc[idx]) if bb is not None and col_u and col_u in bb.columns else 0
+        bbl = float(bb[col_l].iloc[idx]) if bb is not None and col_l and col_l in bb.columns else 0
+        bbm = (bbu + bbl) / 2 if bbu else 0
+        bw  = (bbu - bbl) / bbm * 100 if bbm else 0
+        av  = float(avg_vol.iloc[idx]) if not pd.isna(avg_vol.iloc[idx]) else 0
+        vr  = float(df.loc[idx, "volume"]) / av * 100 if av > 0 else 0
+
+        direction = ""
+        if r <= Config.MR_RSI_OVERSOLD and pr <= bbl and a < adx_max:
+            direction = "▲LONG 候選"
+        elif r >= Config.MR_RSI_OVERBOUGHT and pr >= bbu and a < adx_max:
+            direction = "▼SHORT 候選"
+        elif a >= adx_max:
+            direction = "ADX太高"
+        elif r > Config.MR_RSI_OVERSOLD and r < Config.MR_RSI_OVERBOUGHT:
+            direction = f"RSI={r:.0f} 中性"
+
+        print(f"  {t:<18} {r:>6.1f} {a:>6.1f} {bw:>6.1f}% {vr:>6.0f}%  {pr:>12.2f}  {direction}")
+
+    # 分布統計
+    valid_rsi = rsi.dropna()
+    valid_adx = adx_df2["ADX_14"].dropna()
+    print(f"\n  ── 統計分布（全部歷史資料）──")
+    print(f"  RSI：min={valid_rsi.min():.1f}  max={valid_rsi.max():.1f}  "
+          f"中位數={valid_rsi.median():.1f}")
+    print(f"  RSI ≤ {Config.MR_RSI_OVERSOLD:.0f} 出現次數：{(valid_rsi <= Config.MR_RSI_OVERSOLD).sum()} 根  "
+          f"（{(valid_rsi <= Config.MR_RSI_OVERSOLD).mean()*100:.1f}%）")
+    print(f"  RSI ≥ {Config.MR_RSI_OVERBOUGHT:.0f} 出現次數：{(valid_rsi >= Config.MR_RSI_OVERBOUGHT).sum()} 根  "
+          f"（{(valid_rsi >= Config.MR_RSI_OVERBOUGHT).mean()*100:.1f}%）")
+    print(f"  ADX：min={valid_adx.min():.1f}  max={valid_adx.max():.1f}  "
+          f"中位數={valid_adx.median():.1f}")
+    print(f"  ADX < {adx_max:.0f} 出現次數：{(valid_adx < adx_max).sum()} 根  "
+          f"（{(valid_adx < adx_max).mean()*100:.1f}%）")
+    ovs_and_low_adx = ((valid_rsi <= Config.MR_RSI_OVERSOLD) & (valid_adx < adx_max)).sum()
+    ovb_and_low_adx = ((valid_rsi >= Config.MR_RSI_OVERBOUGHT) & (valid_adx < adx_max)).sum()
+    print(f"\n  RSI≤{Config.MR_RSI_OVERSOLD:.0f} + ADX<{adx_max:.0f} 同時成立：{ovs_and_low_adx} 根  "
+          f"（這些才是 MR 候選入場機會）")
+    print(f"  RSI≥{Config.MR_RSI_OVERBOUGHT:.0f} + ADX<{adx_max:.0f} 同時成立：{ovb_and_low_adx} 根\n")
+
+
+# ── MR 多幣掃描 ──────────────────────────────────────────────────
+_MR_SCAN_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT",
+    "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "LTCUSDT", "UNIUSDT", "ATOMUSDT", "NEARUSDT", "MATICUSDT",
+    "TRXUSDT", "SHIBUSDT", "XLMUSDT",  "OPUSDT",  "ARBUSDT",
+]
+
+
+def _run_mr_scan(client: Client, months: int, adx_max: float,
+                 balance: float) -> None:
+    """批量測試多幣種，找出目前最適合均值回歸的幣種。"""
+    print(f"\n{'='*60}")
+    print(f"  MR 幣種掃描模式（{len(_MR_SCAN_SYMBOLS)} 幣）")
+    print(f"  ADX 上限：{adx_max:.0f}  回測期間：{months} 個月  資料來源：正式 API ✓")
+    print(f"{'='*60}\n")
+
+    results = []
+    for sym in _MR_SCAN_SYMBOLS:
+        print(f"  測試 {sym:<12}", end="", flush=True)
+        try:
+            trades = run_backtest_mr(client, sym, months, debug=False,
+                                     adx_max=adx_max)
+        except Exception as e:
+            print(f"  錯誤：{e}")
+            results.append({"symbol": sym, "trades": 0, "win_rate": 0.0,
+                            "pnl": 0.0, "pct": 0.0, "maxdd": 0.0})
+            continue
+
+        closed = [t for t in trades if t.result not in ("", "OPEN")]
+        if not closed:
+            print(f"  → 0 筆交易（無入場條件）")
+            results.append({"symbol": sym, "trades": 0, "win_rate": 0.0,
+                            "pnl": 0.0, "pct": 0.0, "maxdd": 0.0})
+            continue
+
+        wins      = [t for t in closed if t.net_pnl > 0]
+        total_pnl = sum(t.net_pnl for t in closed)
+        win_rate  = len(wins) / len(closed) * 100
+        pct       = total_pnl / balance * 100
+        bal = balance; peak = bal; mdd = 0.0
+        for t in closed:
+            bal += t.net_pnl
+            peak = max(peak, bal)
+            mdd  = max(mdd, (peak - bal) / peak * 100)
+
+        flag = "  ★" if win_rate >= 40 and total_pnl > 0 else ""
+        print(f"  → {len(closed):>3} 單  勝率 {win_rate:>5.1f}%  "
+              f"PnL {total_pnl:>+8.1f} USDT ({pct:>+6.1f}%){flag}")
+        results.append({"symbol": sym, "trades": len(closed),
+                        "win_rate": win_rate, "pnl": total_pnl,
+                        "pct": pct, "maxdd": mdd})
+
+    # 排名表
+    print(f"\n{'='*60}")
+    print(f"  幣種排名（依總損益由高到低）")
+    print(f"{'='*60}")
+    print(f"  {'':2} {'Coin':<12} {'Trades':>7} {'WinRate':>8} "
+          f"{'PnL(U)':>10} {'Return%':>8} {'MaxDD%':>8}")
+    print(f"  {'-'*58}")
+    ranked = sorted(results, key=lambda x: x["pnl"], reverse=True)
+    for rank, r in enumerate(ranked, 1):
+        if r["trades"] == 0:
+            print(f"  {rank:>2} {r['symbol']:<12} {'—':>7} {'—':>8} {'—':>10} {'—':>8} {'—':>8}")
+            continue
+        star = "★" if r["win_rate"] >= 40 and r["pnl"] > 0 else " "
+        print(f"  {rank:>2} {r['symbol']:<12} {r['trades']:>7} "
+              f"{r['win_rate']:>7.1f}% {r['pnl']:>+10.1f} "
+              f"{r['pct']:>+7.1f}% {r['maxdd']:>7.1f}%  {star}")
+
+    best = [r for r in ranked if r["win_rate"] >= 40 and r["pnl"] > 0]
+    if best:
+        print(f"\n  ★ 推薦幣種：{', '.join(r['symbol'] for r in best)}")
+    else:
+        print(f"\n  ⚠ 目前所有幣種均不適合 MR（市場趨勢性過強或參數需調整）")
+        print(f"    建議：換更嚴格 ADX：--adx-max 18  或等待市場橫盤")
+
+
 # ── 主程式 ───────────────────────────────────────────────────────
 def main():
     global INITIAL_BALANCE, MIN_SCORE, BT_FIB_TOL, BT_VOL_MULT, BT_SKIP_VOL_RISE, BT_SKIP_BAD_FIB
@@ -598,6 +1128,19 @@ def main():
     parser.add_argument("--vol-mult",       type=float, default=BT_VOL_MULT,       help=f"成交量倍率門檻 (預設{BT_VOL_MULT}，真實bot=1.3)")
     parser.add_argument("--skip-vol-rise",  action="store_true", default=BT_SKIP_VOL_RISE,  help="不要求當根成交量>前根")
     parser.add_argument("--no-skip-bad-fib",action="store_true",                   help="包含低R:R的0.236/0.786位")
+    parser.add_argument("--strategy",       default="naked_k_fib",
+                        choices=["naked_k_fib", "mean_reversion", "all"],
+                        help="回測策略：naked_k_fib / mean_reversion / all")
+    parser.add_argument("--max-bars",       type=int,   default=48,
+                        help="NKF 最大持倉根數（超時平倉，預設 48）")
+    parser.add_argument("--testnet",        action="store_true",
+                        help="強制使用 Testnet API 抓 K 線（預設使用正式 API 抓歷史資料）")
+    parser.add_argument("--debug-indicators", action="store_true",
+                        help="印出近 20 根實際 RSI/ADX 數據，被哪個條件擋掉")
+    parser.add_argument("--adx-max",         type=float, default=25.0,
+                        help="MR ADX 上限（預設 25，試試 20 更嚴格選幣）")
+    parser.add_argument("--scan",            action="store_true",
+                        help="批量掃描多幣種，找出最適合 MR 的幣種")
     args = parser.parse_args()
 
     timeframes = args.tf or DEFAULT_TF
@@ -609,32 +1152,73 @@ def main():
     BT_SKIP_VOL_RISE  = args.skip_vol_rise
     BT_SKIP_BAD_FIB   = not args.no_skip_bad_fib
 
-    testnet = os.getenv("BINANCE_TESTNET", "true") == "true"
+    # ── 重要：回測抓歷史 K 線預設用正式 API ──────────────────────
+    # Testnet 歷史資料只有幾週且不準確，會導致大量 TIMEOUT 而非真實 TP/SL
+    # 正式 API 的 klines 是公開資料，不需要真實 API Key 也能查詢
+    # 只有下單才需要正式 Key，回測全程不下單，所以這樣使用是安全的
+    use_testnet = args.testnet  # 預設 False（用正式 API 抓 K 線）
+    if use_testnet:
+        print("⚠ 警告：使用 Testnet 抓歷史 K 線。Testnet 資料不足且不準確，")
+        print("  建議移除 --testnet 改用正式 API（回測全程不下單，安全無風險）。")
     client = Client(
-        os.getenv("BINANCE_API_KEY"),
-        os.getenv("BINANCE_SECRET"),
-        testnet=testnet,
+        os.getenv("BINANCE_API_KEY", ""),
+        os.getenv("BINANCE_SECRET", ""),
+        testnet=use_testnet,
     )
 
-    print(f"\n{'=' * 60}")
-    print(f"  裸K + Fib 策略回測")
-    print(f"  幣種：{args.symbol}  時間框架：{timeframes}")
+    run_nkf = args.strategy in ("naked_k_fib", "all")
+    run_mr  = args.strategy in ("mean_reversion", "all")
+
+    # ── 掃描模式（優先）──────────────────────────────────────────
+    if args.scan:
+        _run_mr_scan(client, months=args.months, adx_max=args.adx_max,
+                     balance=args.balance)
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  多策略回測")
+    print(f"  幣種：{args.symbol}  策略：{args.strategy}  資料來源：{'Testnet ⚠' if use_testnet else '正式 API ✓'}")
+    if run_nkf:
+        print(f"  [NKF] 時間框架：{timeframes}  超時：{args.max_bars} 根")
+    if run_mr:
+        print(f"  [MR]  時間框架：{Config.MR_TIMEFRAME}  超時：{os.getenv('MR_TIMEOUT_BARS', '24')} 根")
     print(f"  回測期間：最近 {args.months} 個月")
-    print(f"  起始資金：{args.balance} USDT  最低訊號強度：{args.score}")
-    print(f"  槓桿：{LEVERAGE}x  每單風險：{RISK_PER_TRADE*100:.1f}%")
-    print(f"  Fib 容忍度：±{BT_FIB_TOL*100:.1f}%  成交量門檻：{BT_VOL_MULT}x")
-    print(f"  跳過量增要求：{BT_SKIP_VOL_RISE}  跳過低R:R Fib：{BT_SKIP_BAD_FIB}")
-    print(f"{'=' * 60}")
+    print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每單風險：{RISK_PER_TRADE*100:.1f}%")
+    if run_nkf:
+        print(f"  [NKF] Fib 容忍度：±{BT_FIB_TOL*100:.1f}%  成交量門檻：{BT_VOL_MULT}x")
+    print(f"{'='*60}")
 
-    all_trades = []
-    for tf in timeframes:
-        trades = run_backtest(client, args.symbol, tf, args.months)
-        print_stats(trades, tf, args.symbol, args.balance)
-        all_trades.extend(trades)
+    all_nkf = []
+    all_mr  = []
 
-    # 如果測了多個時間框架，印合併統計
-    if len(timeframes) > 1 and all_trades:
-        print_stats(all_trades, "+".join(timeframes), args.symbol, args.balance)
+    # ── NKF 回測 ──────────────────────────────────────────────────
+    if run_nkf:
+        for tf in timeframes:
+            trades = run_backtest(client, args.symbol, tf, args.months,
+                                  max_bars=args.max_bars)
+            print_stats(trades, tf, args.symbol, args.balance, label="NKF")
+            all_nkf.extend(trades)
+        if len(timeframes) > 1 and all_nkf:
+            print_stats(all_nkf, "+".join(timeframes), args.symbol,
+                        args.balance, label="NKF 合併")
+
+    # ── MR 回測 ───────────────────────────────────────────────────
+    if run_mr:
+        if args.debug_indicators:
+            _print_mr_indicator_snapshot(client, args.symbol, args.months,
+                                         adx_max=args.adx_max)
+        trades_mr = run_backtest_mr(client, args.symbol, args.months,
+                                    debug=args.debug_indicators,
+                                    adx_max=args.adx_max)
+        print_stats(trades_mr, Config.MR_TIMEFRAME, args.symbol,
+                    args.balance, label="MR")
+        all_mr.extend(trades_mr)
+
+    # ── 合併統計（only when running all）─────────────────────────
+    if args.strategy == "all" and (all_nkf or all_mr):
+        combined = all_nkf + all_mr
+        combined.sort(key=lambda t: t.open_time or datetime.min)
+        print_stats(combined, "ALL", args.symbol, args.balance, label="NKF+MR 合併")
 
 
 if __name__ == "__main__":

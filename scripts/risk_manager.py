@@ -8,10 +8,15 @@ Risk Manager v2 — 倉位計算、手續費、分批止盈、breakeven stop
   4. 護欄：考慮手續費後的真實風險
 """
 import os
+import sys
 import logging
 from datetime import date
+from pathlib import Path
 from typing import Optional
 from binance.client import Client
+
+sys.path.insert(0, str(Path(__file__).parent))
+from config import Config
 
 log = logging.getLogger("risk")
 
@@ -25,13 +30,13 @@ class RiskManager:
         self.client       = client
         self.db           = db
         self.market_ctx   = market_ctx
-        self.leverage     = int(os.getenv("MAX_LEVERAGE", 2))
-        self.risk_pct     = float(os.getenv("RISK_PER_TRADE", 0.03))
-        self.max_loss_pct = float(os.getenv("MAX_DAILY_LOSS", 0.08))
-        self.max_notional_pct = float(os.getenv("MAX_NOTIONAL_PCT", 0.20))
-        # 同方向高相關倉位上限（預設 3，剩餘 2 格保留給低相關幣種）
+        self.leverage     = Config.MAX_LEVERAGE          # 固定 3x
+        self.risk_pct     = Config.RISK_PER_TRADE
+        self.max_loss_pct = Config.MAX_DAILY_LOSS
+        self.max_notional_pct = Config.MAX_NOTIONAL_PCT
+        # 同方向高相關倉位上限（預設 2，小資金更嚴格）
         self.max_same_direction_high_corr = int(
-            os.getenv("MAX_SAME_DIR_HIGH_CORR", 3)
+            os.getenv("MAX_SAME_DIR_HIGH_CORR", 2)
         )
         self.high_corr_threshold = float(
             os.getenv("HIGH_CORR_THRESHOLD", 0.8)
@@ -133,6 +138,7 @@ class RiskManager:
         stop_loss: float,
         tp1:       float,
         tp2:       float,
+        min_rr:    float = 1.2,
     ) -> Optional[dict]:
         """
         計算倉位大小（考慮手續費）
@@ -215,10 +221,10 @@ class RiskManager:
         net_reward = raw_reward - fee_if_tp
         net_rr = net_reward / net_risk if net_risk > 0 else 0
 
-        # 護欄：考慮手續費後 R:R < 1.2 就不值得做
-        if net_rr < 1.2:
+        # 護欄：考慮手續費後 R:R < min_rr 就不值得做（per-strategy）
+        if net_rr < min_rr:
             log.warning(
-                f"考慮手續費後 R:R={net_rr:.2f} < 1.2，不划算，略過"
+                f"考慮手續費後 R:R={net_rr:.2f} < {min_rr}，不划算，略過"
             )
             return None
 

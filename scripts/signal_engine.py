@@ -9,6 +9,7 @@ Signal Engine v2 — 裸K + Fibonacci 訊號偵測引擎
   5. Engulfing 方向修正：檢查回傳值正負
   6. 分批止盈目標：TP1（近 Fib）+ TP2（遠 Fib）
 """
+import os
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
@@ -73,6 +74,13 @@ class SignalEngine:
     def __init__(self, client: Client, market_ctx=None):
         self.client = client
         self.market_ctx = market_ctx  # 可選：傳入 MarketContext 啟用大盤濾網 + 相關性
+        # 入場門檻（統一由 Config 取得）
+        from config import Config
+        self.fib_tolerance      = Config.NKF_FIB_TOL
+        self.vol_ratio          = Config.NKF_VOL_RATIO
+        self.require_vol_rising = Config.NKF_VOL_RISING
+        self.fib_max_touches    = Config.NKF_FIB_MAX_TOUCHES
+        self.fractal_lr         = Config.NKF_FRACTAL_LR
 
     # ── K 線取得 ─────────────────────────────────────────────────
 
@@ -94,11 +102,15 @@ class SignalEngine:
     # ── Swing Point 辨識（Fractal 方法）───────────────────────────
 
     def _find_swing_fractal(self, df: pd.DataFrame,
-                            left=5, right=5) -> list[dict]:
+                            left=None, right=None) -> list[dict]:
         """
         用 fractal 方式找 swing point：
         一個 swing high = 左邊 left 根和右邊 right 根都比它低
         """
+        if left is None:
+            left = self.fractal_lr
+        if right is None:
+            right = self.fractal_lr
         swings = []
         for i in range(left, len(df) - right):
             # Swing High
@@ -128,7 +140,7 @@ class SignalEngine:
         回傳 (swing_high_price, swing_low_price, trend_direction)
         trend_direction: "up"（low→high，回撤做多）/ "down"（high→low，回撤做空）
         """
-        swings = self._find_swing_fractal(df, left=5, right=5)
+        swings = self._find_swing_fractal(df)
         if len(swings) < 2:
             return None
 
@@ -169,7 +181,7 @@ class SignalEngine:
         for level, fib_price in fib_levels.items():
             if fib_price == 0:
                 continue
-            if abs(price - fib_price) / fib_price <= FIB_TOLERANCE:
+            if abs(price - fib_price) / fib_price <= self.fib_tolerance:
                 return level
         return None
 
@@ -304,10 +316,12 @@ class SignalEngine:
     # ── 成交量確認 ───────────────────────────────────────────────
 
     def _volume_confirmed(self, df: pd.DataFrame,
-                          period=20, ratio=1.3) -> bool:
+                          period=20, ratio=None) -> bool:
         """
         基礎成交量確認：當根 ≥ 20日均量 × ratio
         """
+        if ratio is None:
+            ratio = self.vol_ratio
         avg_vol = df["volume"].tail(period + 1).iloc[:-1].mean()
         last_vol = df["volume"].iloc[-1]
         return last_vol >= avg_vol * ratio
@@ -516,10 +530,10 @@ class SignalEngine:
         pattern_name, pattern_strength = pattern_result
 
         # Step 6: 成交量確認（基礎 1.3x 均量 + 當根 > 前一根）
-        if not self._volume_confirmed(df_analysis, period=20, ratio=1.3):
-            log.debug(f"{symbol} 成交量未達 1.3x 均量，跳過")
+        if not self._volume_confirmed(df_analysis, period=20):
+            log.debug(f"{symbol} 成交量未達 {self.vol_ratio}x 均量，跳過")
             return None
-        if not self._volume_rising(df_analysis):
+        if self.require_vol_rising and not self._volume_rising(df_analysis):
             log.debug(f"{symbol} 當根成交量未超越前一根，跳過")
             return None
 

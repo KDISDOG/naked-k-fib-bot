@@ -248,8 +248,68 @@
       background: #9b2c2c
     }
 
+    .strategy-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 5px;
+      border-radius: 3px;
+      letter-spacing: 0.5px
+    }
+
+    .strategy-nkf {
+      background: #1a2e3a;
+      color: #4fd1c5
+    }
+
+    .strategy-mr {
+      background: #2d1a3a;
+      color: #b794f4
+    }
+
+    .strategy-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px
+    }
+
+    .strategy-card {
+      background: #1a1d2e;
+      border: 1px solid #2d3748;
+      border-radius: 10px;
+      padding: 16px
+    }
+
+    .strategy-card h4 {
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 12px;
+      color: #a0aec0
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      font-size: 12px
+    }
+
+    .stat-label {
+      color: #718096
+    }
+
+    .stat-val {
+      color: #e2e8f0;
+      font-weight: 500
+    }
+
     @media(max-width:768px) {
       .row {
+        grid-template-columns: 1fr
+      }
+
+      .strategy-grid {
         grid-template-columns: 1fr
       }
     }
@@ -333,6 +393,28 @@
       </div>
     </div>
 
+    <!-- 策略分項統計 -->
+    <div class="strategy-grid">
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-nkf">NKF</span>&nbsp; 裸K + Fib 統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="nkf-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="nkf-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="nkf-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="nkf-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="nkf-avg-pnl" class="stat-val">—</span></div>
+      </div>
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-mr">MR</span>&nbsp; 均值回歸統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="mr-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="mr-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="mr-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="mr-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="mr-avg-pnl" class="stat-val">—</span></div>
+      </div>
+    </div>
+
     <!-- 風控參數 + 緊急操作 -->
     <div class="controls">
       <h3>風控參數調整</h3>
@@ -349,6 +431,24 @@
           <button type="button" class="btn btn-danger" onclick="emergencyStop()">緊急全平</button>
         </div>
       </form>
+
+      <!-- 策略切換 -->
+      <div style="margin-top:14px;padding-top:14px;border-top:1px solid #2d3748">
+        <div style="font-size:13px;font-weight:500;color:#a0aec0;margin-bottom:10px">策略切換</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>目前策略</label>
+            <select id="strategy-select"
+              style="background:#0f1117;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px">
+              <option value="all">全部策略</option>
+              <option value="naked_k_fib">裸K + Fib</option>
+              <option value="mean_reversion">均值回歸 (MR)</option>
+            </select>
+          </div>
+          <button type="button" class="btn btn-primary" onclick="switchStrategy()">套用</button>
+          <span id="strategy-status" style="font-size:12px;color:#718096;align-self:center"></span>
+        </div>
+      </div>
     </div>
 
     <!-- 當前持倉 -->
@@ -362,6 +462,7 @@
             <tr>
               <th>幣種</th>
               <th>方向</th>
+              <th>策略</th>
               <th>開單價</th>
               <th>即時價</th>
               <th style="color:#68d391">TP1</th>
@@ -375,7 +476,7 @@
           </thead>
           <tbody id="open-pos-body">
             <tr>
-              <td colspan="10" style="text-align:center;color:#4a5568;padding:20px">載入中...</td>
+              <td colspan="11" style="text-align:center;color:#4a5568;padding:20px">載入中...</td>
             </tr>
           </tbody>
         </table>
@@ -398,6 +499,7 @@
               <tr>
                 <th>幣種</th>
                 <th>方向</th>
+                <th>策略</th>
                 <th>Fib</th>
                 <th>形態</th>
                 <th>P&L</th>
@@ -410,6 +512,9 @@
               <tr>
                 <td>{{ t.symbol }}</td>
                 <td class="{% if t.direction=='LONG' %}dir-long{% else %}dir-short{% endif %}">{{ t.direction }}</td>
+                <td><span
+                    class="strategy-badge {% if t.strategy == 'mean_reversion' %}strategy-mr{% else %}strategy-nkf{% endif %}">{{
+                    'MR' if t.strategy == 'mean_reversion' else 'NKF' }}</span></td>
                 <td>{{ t.fib_level }}</td>
                 <td style="font-size:11px">{{ t.pattern }}</td>
                 <td class="{% if t.net_pnl > 0 %}pnl-pos{% elif t.net_pnl < 0 %}pnl-neg{% endif %}">
@@ -422,7 +527,7 @@
               {% endfor %}
               {% if not trades %}
               <tr>
-                <td colspan="7" style="text-align:center;padding:20px;color:#4a5568">尚無交易紀錄</td>
+                <td colspan="8" style="text-align:center;padding:20px;color:#4a5568">尚無交易紀錄</td>
               </tr>
               {% endif %}
             </tbody>
@@ -437,6 +542,10 @@
     let pnlChart = null;
 
     // ── 工具函數 ──────────────────────────────────────────────
+    function fmtStrategy(s) {
+      if (s === 'mean_reversion') return '<span class="strategy-badge strategy-mr">MR</span>';
+      return '<span class="strategy-badge strategy-nkf">NKF</span>';
+    }
     function fmtUsdt(v) {
       if (v == null) return '—';
       const cls = v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
@@ -506,7 +615,7 @@
         const timeEl = document.getElementById('pos-update-time');
         if (timeEl) timeEl.textContent = `（${new Date().toLocaleTimeString('zh-TW')} 更新）`;
         if (!positions || positions.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#4a5568;padding:20px">目前無開倉</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#4a5568;padding:20px">目前無開倉</td></tr>';
           if (header) header.childNodes[0].textContent = '當前持倉（0）';
           return;
         }
@@ -515,6 +624,7 @@
           <tr>
             <td><strong>${p.symbol}</strong></td>
             <td>${fmtDir(p.direction)}</td>
+            <td>${fmtStrategy(p.strategy)}</td>
             <td>${fmtPrice(p.entry)}</td>
             <td>${fmtPrice(p.current_price)}</td>
             <td style="color:#68d391">${fmtPrice(p.tp1)}</td>
@@ -587,13 +697,66 @@
       refreshKpis();
     }
 
+    // ── 策略統計 ─────────────────────────────────────────────
+    async function refreshStrategyStats() {
+      try {
+        const data = await fetch('/api/stats/all_strategies').then(r => r.json());
+        function fillStats(prefix, s) {
+          if (!s) return;
+          const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+          set(`${prefix}-total`, s.total ?? '—');
+          set(`${prefix}-win-rate`, s.win_rate != null ? s.win_rate + '%' : '—');
+          ['pnl', 'net-pnl', 'avg-pnl'].forEach(key => {
+            const field = key === 'pnl' ? 'total_pnl' : key === 'net-pnl' ? 'net_pnl' : 'avg_pnl';
+            const el = document.getElementById(`${prefix}-${key}`);
+            if (el && s[field] != null) {
+              const sign = s[field] > 0 ? '+' : '';
+              el.textContent = `${sign}${Number(s[field]).toFixed(2)} USDT`;
+              el.className = 'stat-val ' + (s[field] > 0 ? 'pnl-pos' : s[field] < 0 ? 'pnl-neg' : '');
+            }
+          });
+        }
+        fillStats('nkf', data.naked_k_fib);
+        fillStats('mr', data.mean_reversion);
+      } catch (e) { console.warn('策略統計刷新失敗', e); }
+    }
+
+    async function loadActiveStrategy() {
+      try {
+        const data = await fetch('/api/active_strategy').then(r => r.json());
+        const sel = document.getElementById('strategy-select');
+        if (sel && data.active_strategy) sel.value = data.active_strategy;
+      } catch (e) { }
+    }
+
+    async function switchStrategy() {
+      const sel = document.getElementById('strategy-select');
+      if (!sel) return;
+      const statusEl = document.getElementById('strategy-status');
+      try {
+        const fd = new FormData();
+        fd.append('strategy', sel.value);
+        const res = await fetch('/api/switch_strategy', { method: 'POST', body: fd });
+        const json = await res.json();
+        if (statusEl) {
+          statusEl.textContent = json.message;
+          statusEl.style.color = json.status === 'ok' ? '#68d391' : '#fc8181';
+        }
+      } catch (e) {
+        if (statusEl) { statusEl.textContent = '切換失敗'; statusEl.style.color = '#fc8181'; }
+      }
+    }
+
     // ── 啟動 ─────────────────────────────────────────────────
     loadChart();
     refreshKpis();
     refreshOpenPositions();
-    setInterval(refreshKpis, 30_000);  // KPI 每 30 秒
-    setInterval(refreshOpenPositions, 15_000);  // 持倉每 15 秒
-    setInterval(loadChart, 300_000);  // 圖表每 5 分鐘
+    refreshStrategyStats();
+    loadActiveStrategy();
+    setInterval(refreshKpis, 30_000);
+    setInterval(refreshOpenPositions, 15_000);
+    setInterval(loadChart, 300_000);
+    setInterval(refreshStrategyStats, 60_000);
   </script>
 </body>
 

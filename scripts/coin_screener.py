@@ -15,6 +15,7 @@ Coin Screener v2 — 為裸K + Fibonacci 策略量身設計的選幣模組
   - Fib 歷史回測：價格在 Fib 位有反應             3 分
 """
 import argparse
+import os
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
@@ -28,6 +29,14 @@ class CoinScreener:
     def __init__(self, client: Client, market_ctx=None):
         self.client = client
         self.market_ctx = market_ctx  # 可選：傳入 MarketContext 啟用 BTC Dominance 濾網
+        # 選幣門檻（統一由 Config 取得）
+        from config import Config
+        self.screen_min_score  = Config.SCREEN_MIN_SCORE
+        self.screen_min_vol_m  = Config.SCREEN_MIN_VOL_M
+        self.adx_min           = Config.SCREEN_ADX_MIN
+        self.adx_max           = Config.SCREEN_ADX_MAX
+        self.atr_max_long      = Config.SCREEN_ATR_MAX_LONG
+        self.atr_max_short     = Config.SCREEN_ATR_MAX_SHORT
 
     # ── 取得 K 線 ────────────────────────────────────────────────
 
@@ -131,9 +140,9 @@ class CoinScreener:
         adx_df = ta.adx(high, low, close, length=14)
         adx_val = adx_df["ADX_14"].iloc[-1] if adx_df is not None else 0
 
-        if 20 <= adx_val <= 45:   # 適中趨勢：Fib 回撤最有效
+        if self.adx_min <= adx_val <= self.adx_max:   # 適中趨勢：Fib 回撤最有效
             score += 1
-        elif 15 <= adx_val < 20:  # 偏弱但可接受
+        elif (self.adx_min - 5) <= adx_val < self.adx_min:  # 偏弱但可接受
             score += 0  # 不加分但也不扣分
 
         # Swing 結構清晰度：計算局部高低點的數量
@@ -146,11 +155,11 @@ class CoinScreener:
         atr_pct = (atr.iloc[-1] / close.iloc[-1]) * 100 if not atr.empty else 0
 
         if swing_trend == "down":
-            upper_cap = 8.0
+            upper_cap = self.atr_max_short
         elif swing_trend == "up":
-            upper_cap = 4.0
+            upper_cap = self.atr_max_long
         else:
-            upper_cap = 4.0   # 方向不明時採保守上限
+            upper_cap = self.atr_max_long   # 方向不明時採保守上限
         if 1.2 <= atr_pct <= upper_cap:
             score += 1
 
@@ -327,9 +336,9 @@ class CoinScreener:
         if len(df) < 100:
             return 0, {}
 
-        # 硬門檻：24h USDT 成交量 < 1000 萬直接跳過
+        # 硬門檻：24h USDT 成交量不足直接跳過
         vol_24h = df["qav"].tail(24).sum()
-        if vol_24h < 10_000_000:
+        if vol_24h < self.screen_min_vol_m * 1_000_000:
             return 0, {}
 
         # 先決定當前 swing 方向（供流動性/ATR 評分使用）
@@ -361,7 +370,9 @@ class CoinScreener:
 
     # ── 掃描入口 ─────────────────────────────────────────────────
 
-    def scan(self, top: int = 20, min_score: int = 8) -> list[str]:
+    def scan(self, top: int = 20, min_score: int | None = None) -> list[str]:
+        if min_score is None:
+            min_score = self.screen_min_score
         """掃描全市場，回傳評分最高的幣種清單"""
         log.info("開始全市場掃描（裸K+Fib 專用選幣）...")
 
