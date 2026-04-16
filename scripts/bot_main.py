@@ -38,6 +38,7 @@ from position_syncer import PositionSyncer
 from market_context import MarketContext
 from strategies.naked_k_fib import NakedKFibStrategy
 from strategies.mean_reversion import MeanReversionStrategy
+from notifier import notify
 
 # ── 設定 ───────────────────────────────────────────────────────
 load_dotenv()
@@ -135,7 +136,7 @@ def check_mr_timeout():
               "1h": 60, "2h": 120, "4h": 240}
     tf_min = tf_map.get(Config.MR_TIMEFRAME, 15)
     timeout_sec = Config.MR_TIMEOUT_BARS * tf_min * 60
-    now = datetime.utcnow()
+    now = datetime.now()
 
     mr_trades = db.get_open_by_strategy("mean_reversion")
     for t in mr_trades:
@@ -155,7 +156,8 @@ def check_mr_timeout():
                 f"{Config.MR_TIMEFRAME} K 棒）"
             )
             try:
-                executor.close_position_market(t["symbol"], t["id"])
+                executor.close_position_market(t["symbol"], t["id"],
+                                              close_reason="TIMEOUT")
             except Exception as e:
                 log.error(f"[{t['symbol']}] MR 超時平倉失敗: {e}")
 
@@ -165,6 +167,16 @@ def check_signals():
     global bot_paused
     if bot_paused:
         log.warning("機器人已暫停，跳過訊號檢查")
+        return
+
+    # 每日虧損檢查
+    if risk.daily_loss_exceeded():
+        bot_paused = True
+        today_pnl = db.get_today_pnl()
+        total_bal = risk._get_total_balance()
+        loss_pct = abs(min(today_pnl, 0)) / total_bal if total_bal > 0 else 0
+        notify.daily_loss_paused(today_pnl, loss_pct)
+        log.error("每日虧損上限觸發，機器人已暫停")
         return
 
     open_count = db.count_open_positions()
@@ -218,10 +230,9 @@ def check_signals():
                 f"{sig.pattern} 方向={sig.side} 強度={sig.score}"
             )
 
-            # 相關性控管（NKF 才需要）
-            if strategy.name == "naked_k_fib":
-                if not risk.can_open_direction(symbol, sig.side):
-                    continue
+            # 相關性控管（兩策略都需要，避免同向累積曝險）
+            if not risk.can_open_direction(symbol, sig.side):
+                continue
 
             # per-strategy 的 R:R 門檻
             min_rr = (
@@ -283,9 +294,26 @@ def sync_positions():
         log.error(f"倉位同步失敗: {e}")
 
 
+# ── 每日總結 ────────────────────────────────────────────────────
+def send_daily_summary():
+    """每日總結通知（每天 23:55 執行）"""
+    try:
+        today_pnl = db.get_today_pnl()
+        stats = db.get_stats()
+        open_count = db.count_open_positions()
+        notify.daily_summary(
+            today_pnl=today_pnl,
+            total_pnl=stats.get("net_pnl", 0),
+            win_rate=stats.get("win_rate", 0),
+            open_count=open_count,
+        )
+    except Exception as e:
+        log.error(f"每日總結發送失敗: {e}")
+
+
 # ── K 棒收盤對齊 ────────────────────────────────────────────────
 def wait_for_candle_close():
-    now = datetime.utcnow()
+    now = datetime.now()
     minutes_to_next = 15 - (now.minute % 15)
     next_15m = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_next)
     wait_until = next_15m + timedelta(seconds=10)
@@ -293,7 +321,7 @@ def wait_for_candle_close():
     if wait_sec > 0 and wait_sec < 900:
         log.info(
             f"等待 15m K 棒收盤：{wait_sec:.0f} 秒後"
-            f"（{wait_until.strftime('%H:%M:%S')} UTC）"
+            f"（{wait_until.strftime('%H:%M:%S')}）"
         )
         while wait_sec > 0 and not shutdown_event.is_set():
             time.sleep(min(wait_sec, 10))
@@ -334,9 +362,10 @@ def setup_schedule():
     schedule.every(Config.RESCAN_MIN).minutes.do(scan_coins)
     schedule.every(Config.SIGNAL_CHECK_MIN).minutes.do(check_signals)
     schedule.every(Config.SYNC_SEC).seconds.do(sync_positions)
+    schedule.every().day.at("23:55").do(send_daily_summary)
     log.info(
         f"排程設定：掃幣={Config.RESCAN_MIN}分 訊號={Config.SIGNAL_CHECK_MIN}分 "
-        f"同步={Config.SYNC_SEC}秒"
+        f"同步={Config.SYNC_SEC}秒 每日總結=23:55"
     )
 
 
@@ -380,6 +409,7 @@ def main():
     if not args.no_dashboard:
         start_dashboard(args.port)
 
+    notify.bot_started()
     setup_schedule()
     scan_coins()
 
@@ -394,6 +424,7 @@ def main():
         schedule.run_pending()
         time.sleep(1)
 
+    notify.bot_stopped()
     log.warning("機器人安全關閉")
 
 

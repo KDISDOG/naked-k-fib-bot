@@ -12,6 +12,8 @@ import math
 from typing import Optional
 from binance.client import Client
 from binance.enums import *
+from api_retry import retry_api
+from notifier import notify
 
 log = logging.getLogger("executor")
 
@@ -30,7 +32,7 @@ class OrderExecutor:
             return self._symbol_info_cache[symbol]
 
         try:
-            info = self.client.futures_exchange_info()
+            info = retry_api(self.client.futures_exchange_info)
             for s in info["symbols"]:
                 if s["symbol"] == symbol:
                     # 找數量精度和價格精度
@@ -114,7 +116,8 @@ class OrderExecutor:
 
         try:
             # 1. 設定槓桿
-            self.client.futures_change_leverage(
+            retry_api(
+                self.client.futures_change_leverage,
                 symbol=symbol, leverage=leverage
             )
 
@@ -130,14 +133,15 @@ class OrderExecutor:
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
 
             # 3. 市價開倉
-            order = self.client.futures_create_order(
+            order = retry_api(
+                self.client.futures_create_order,
                 symbol   = symbol,
                 side     = side,
                 type     = ORDER_TYPE_MARKET,
                 quantity = qty,
             )
             order_id   = str(order.get("orderId", ""))
-            # avgPrice 在建立當下可能回傳 "0"，需另外查詢實際成交價
+            # avgPrice 在建立當下可能回傳 "0"（Testnet 常見），多層 fallback
             fill_price = float(order.get("avgPrice") or 0)
             if fill_price <= 0 and order_id:
                 try:
@@ -147,49 +151,101 @@ class OrderExecutor:
                     fill_price = float(filled.get("avgPrice") or 0)
                 except Exception as e:
                     log.warning(f"查詢成交價失敗: {e}")
+            # 第三層：從成交紀錄取實際成交均價
+            if fill_price <= 0:
+                try:
+                    recent = self.client.futures_account_trades(
+                        symbol=symbol, limit=20
+                    )
+                    # 篩出本次開倉方向的成交
+                    my_side = "BUY" if direction == "LONG" else "SELL"
+                    fills = [t for t in recent if t.get("side") == my_side]
+                    if fills:
+                        # 用最近幾筆的加權平均價
+                        total_qty = sum(float(f["qty"]) for f in fills[-20:])
+                        total_val = sum(float(f["price"]) * float(f["qty"])
+                                        for f in fills[-20:])
+                        if total_qty > 0:
+                            fill_price = total_val / total_qty
+                except Exception as e:
+                    log.warning(f"查詢成交紀錄失敗: {e}")
             if fill_price <= 0:
                 fill_price = entry  # 最終 fallback
+                log.warning(
+                    f"[{symbol}] 無法取得實際成交價，使用訊號價 {entry}"
+                )
             log.info(
                 f"[{symbol}] 開倉成功：{direction} qty={qty} @ {fill_price}"
             )
 
-            # 4. 止損單（全倉 closePosition）
-            sl_order = self.client.futures_create_order(
-                symbol        = symbol,
-                side          = close_side,
-                type          = FUTURE_ORDER_TYPE_STOP_MARKET,
-                stopPrice     = sl,
-                closePosition = True,
-            )
-            sl_order_id = str(sl_order.get("orderId", ""))
+            # 4. 止損單（全倉 closePosition）— 失敗則緊急平倉
+            sl_order_id = ""
+            try:
+                sl_order = retry_api(
+                    self.client.futures_create_order,
+                    symbol        = symbol,
+                    side          = close_side,
+                    type          = FUTURE_ORDER_TYPE_STOP_MARKET,
+                    stopPrice     = sl,
+                    closePosition = True,
+                )
+                sl_order_id = str(sl_order.get("orderId", ""))
+            except Exception as e:
+                log.error(f"[{symbol}] SL 掛單失敗，緊急平倉: {e}")
+                notify.sl_placement_failed(symbol, direction)
+                # 緊急平倉保護資金
+                try:
+                    retry_api(
+                        self.client.futures_create_order,
+                        symbol     = symbol,
+                        side       = close_side,
+                        type       = ORDER_TYPE_MARKET,
+                        quantity   = qty,
+                        reduceOnly = True,
+                    )
+                except Exception as e2:
+                    log.error(f"[{symbol}] 緊急平倉也失敗: {e2}")
+                    notify.error("緊急平倉失敗", f"{symbol}: {e2}")
+                return None
 
             # 5. TP1 止盈（部分平倉）
             tp1_order_id = ""
             if qty_tp1 > 0:
-                tp1_order = self.client.futures_create_order(
-                    symbol     = symbol,
-                    side       = close_side,
-                    type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                    stopPrice  = tp1,
-                    quantity   = qty_tp1,
-                    reduceOnly = True,
-                )
-                tp1_order_id = str(tp1_order.get("orderId", ""))
+                try:
+                    tp1_order = retry_api(
+                        self.client.futures_create_order,
+                        symbol     = symbol,
+                        side       = close_side,
+                        type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                        stopPrice  = tp1,
+                        quantity   = qty_tp1,
+                        reduceOnly = True,
+                    )
+                    tp1_order_id = str(tp1_order.get("orderId", ""))
+                except Exception as e:
+                    log.warning(f"[{symbol}] TP1 掛單失敗: {e}")
 
             # 6. TP2 止盈（剩餘平倉）
             tp2_order_id = ""
             if qty_tp2 > 0:
-                tp2_order = self.client.futures_create_order(
-                    symbol     = symbol,
-                    side       = close_side,
-                    type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                    stopPrice  = tp2,
-                    quantity   = qty_tp2,
-                    reduceOnly = True,
-                )
-                tp2_order_id = str(tp2_order.get("orderId", ""))
+                try:
+                    tp2_order = retry_api(
+                        self.client.futures_create_order,
+                        symbol     = symbol,
+                        side       = close_side,
+                        type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                        stopPrice  = tp2,
+                        quantity   = qty_tp2,
+                        reduceOnly = True,
+                    )
+                    tp2_order_id = str(tp2_order.get("orderId", ""))
+                except Exception as e:
+                    log.warning(f"[{symbol}] TP2 掛單失敗: {e}")
 
-            # 7. 寫入資料庫
+            # 7. 計算保證金（實際成交價 × 數量 / 槓桿）
+            margin = round(fill_price * qty / leverage, 2)
+
+            # 8. 寫入資料庫
             self.db.save_trade(
                 symbol       = symbol,
                 direction    = direction,
@@ -210,11 +266,15 @@ class OrderExecutor:
                 trailing_atr = trailing_atr,
                 btc_corr     = btc_corr,
                 strategy     = strategy,
+                margin       = margin,
             )
 
             log.info(
                 f"[{symbol}] 掛單完成：SL={sl} TP1={tp1}(qty={qty_tp1}) "
                 f"TP2={tp2}(qty={qty_tp2})"
+            )
+            notify.trade_opened(
+                symbol, direction, qty, fill_price, sl, tp1, strategy
             )
             return order
 
@@ -391,10 +451,12 @@ class OrderExecutor:
         except Exception as e:
             log.error(f"緊急平倉失敗: {e}")
 
-    def close_position_market(self, symbol: str, trade_id: int):
+    def close_position_market(self, symbol: str, trade_id: int,
+                              close_reason: str = "MANUAL"):
         """
-        對特定 symbol 執行市價平倉（均值回歸超時用）。
+        對特定 symbol 執行市價平倉。
         平倉後更新資料庫狀態。
+        close_reason: TIMEOUT / MANUAL / etc.
         """
         try:
             pos_info = self.client.futures_position_information(symbol=symbol)
@@ -424,15 +486,36 @@ class OrderExecutor:
                 except Exception:
                     pass
 
+            # 第三層 fallback：查最近成交紀錄
+            if exit_price <= 0:
+                try:
+                    recent = self.client.futures_account_trades(
+                        symbol=symbol, limit=5
+                    )
+                    if recent:
+                        exit_price = float(recent[-1]["price"])
+                except Exception:
+                    pass
+
+            # 最終 fallback：用 DB 中的入場價（PnL ≈ 0 好過天文數字）
+            if exit_price <= 0:
+                trade_rec = self.db.get_trade_by_id(trade_id)
+                if trade_rec and trade_rec.get("entry"):
+                    exit_price = trade_rec["entry"]
+                    log.warning(
+                        f"[{symbol}] 無法取得平倉價，fallback 至入場價 {exit_price}"
+                    )
+
             # 撤銷剩餘掛單
             try:
                 self.client.futures_cancel_all_open_orders(symbol=symbol)
             except Exception:
                 pass
 
-            self.db.close_trade(trade_id, exit_price=exit_price or 0)
+            self.db.close_trade(trade_id, exit_price=exit_price or 0,
+                                close_reason=close_reason)
             log.warning(
-                f"[{symbol}] 市價平倉（超時）：qty={abs_qty} @ {exit_price}"
+                f"[{symbol}] 市價平倉（{close_reason}）：qty={abs_qty} @ {exit_price}"
             )
         except Exception as e:
             log.error(f"[{symbol}] 市價平倉失敗: {e}")

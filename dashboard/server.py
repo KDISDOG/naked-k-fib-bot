@@ -78,7 +78,7 @@ async def index(request: Request):
         "trades":    trades,
         "today_pnl": round(today_pnl, 2),
         "balance":   balance,
-        "now":       datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "now":       datetime.now().strftime("%Y-%m-%d %H:%M"),
         "testnet":   os.getenv("BINANCE_TESTNET", "true"),
         "risk_pct":  risk_pct,
     })
@@ -189,7 +189,7 @@ async def api_close_position(trade_id: int):
 
         remaining_qty = (trade["qty"] or 0) - (trade["qty_closed"] or 0)
         fee = round(exit_price * remaining_qty * 0.0004, 4)
-        db.close_trade(trade_id, exit_price, fee=fee)
+        db.close_trade(trade_id, exit_price, fee=fee, close_reason="MANUAL")
         return {"status": "ok", "message": f"{symbol} 已手動平倉"}
     except Exception as e:
         log.error(f"手動平倉失敗 #{trade_id}: {e}")

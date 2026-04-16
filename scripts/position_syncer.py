@@ -19,6 +19,8 @@ import logging
 from typing import Optional
 from binance.client import Client
 from risk_manager import RiskManager
+from api_retry import retry_api
+from notifier import notify
 
 log = logging.getLogger("syncer")
 
@@ -35,11 +37,12 @@ class PositionSyncer:
         if not open_trades:
             return
 
-        # 取得幣安所有倉位
+        # 取得幣安所有倉位（帶重試）
         try:
-            positions = self.client.futures_position_information()
+            positions = retry_api(self.client.futures_position_information)
         except Exception as e:
             log.error(f"取得幣安倉位失敗: {e}")
+            notify.error("倉位同步失敗", f"無法取得幣安倉位: {e}")
             return
 
         # 建立 symbol → positionAmt 映射
@@ -72,12 +75,25 @@ class PositionSyncer:
                 log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
                 exit_price = self._get_last_trade_price(symbol)
                 fee = self._get_recent_fee(symbol, qty)
+
+                # 判斷平倉原因
+                reason = self._detect_close_reason(trade, exit_price or entry)
+
                 self.db.close_trade(
-                    trade_id   = trade_id,
-                    exit_price = exit_price or entry,
-                    fee        = fee,
-                    partial    = False,
+                    trade_id     = trade_id,
+                    exit_price   = exit_price or entry,
+                    fee          = fee,
+                    partial      = False,
+                    close_reason = reason,
                 )
+                # 計算淨盈虧通知
+                _ep = exit_price or entry
+                if direction == "LONG":
+                    _raw_pnl = (_ep - entry) * qty
+                else:
+                    _raw_pnl = (entry - _ep) * qty
+                _net = _raw_pnl - fee
+                notify.trade_closed(symbol, direction, _net, reason)
                 continue
 
             # ── 情況 2: 部分平倉（TP1 觸發）──────────────────────
@@ -94,11 +110,12 @@ class PositionSyncer:
                 fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
 
                 self.db.close_trade(
-                    trade_id   = trade_id,
-                    exit_price = exit_price or entry,
-                    fee        = fee,
-                    partial    = True,
-                    closed_qty = qty_diff,
+                    trade_id     = trade_id,
+                    exit_price   = exit_price or entry,
+                    fee          = fee,
+                    partial      = True,
+                    closed_qty   = qty_diff,
+                    close_reason = "TP1",
                 )
 
                 # 觸發 Breakeven Stop（如果還沒移過）
@@ -165,6 +182,51 @@ class PositionSyncer:
             new_sl = trough + 1.5 * atr
             if new_sl < entry and (sl is None or new_sl < sl):
                 self.executor.move_trailing_sl(symbol, trade_id, new_sl, direction)
+
+    # ── 平倉原因判斷 ─────────────────────────────────────────────
+    def _detect_close_reason(self, trade: dict, exit_price: float) -> str:
+        """
+        根據平倉價格與 TP/SL 比較，推斷平倉原因。
+        已走過 partial（TP1）的單，完全平倉時比對 TP2/SL。
+        """
+        if not exit_price or exit_price <= 0:
+            return "UNKNOWN"
+
+        direction = trade["direction"]
+        tp1 = trade.get("tp1") or 0
+        tp2 = trade.get("tp2") or 0
+        sl  = trade.get("sl") or 0
+        entry = trade.get("entry") or 0
+        was_partial = trade.get("status") == "partial"
+
+        # 容差：價格的 0.3%（避免滑價造成誤判）
+        tol = entry * 0.003 if entry > 0 else 0
+
+        if direction == "LONG":
+            if tp2 > 0 and exit_price >= tp2 - tol:
+                return "TP2"
+            if tp1 > 0 and not was_partial and exit_price >= tp1 - tol:
+                return "TP1"
+            if sl > 0 and exit_price <= sl + tol:
+                return "SL"
+            # breakeven 觸發（止損在入場價附近）
+            if trade.get("breakeven") and abs(exit_price - entry) <= tol:
+                return "BREAKEVEN"
+        else:  # SHORT
+            if tp2 > 0 and exit_price <= tp2 + tol:
+                return "TP2"
+            if tp1 > 0 and not was_partial and exit_price <= tp1 + tol:
+                return "TP1"
+            if sl > 0 and exit_price >= sl - tol:
+                return "SL"
+            if trade.get("breakeven") and abs(exit_price - entry) <= tol:
+                return "BREAKEVEN"
+
+        # 追蹤止盈
+        if trade.get("use_trailing"):
+            return "TRAILING"
+
+        return "UNKNOWN"
 
     # ── 輔助方法 ─────────────────────────────────────────────────
 

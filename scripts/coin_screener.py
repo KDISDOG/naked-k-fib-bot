@@ -16,11 +16,13 @@ Coin Screener v2 — 為裸K + Fibonacci 策略量身設計的選幣模組
 """
 import argparse
 import os
+import time
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
 import logging
 from binance.client import Client
+from api_retry import retry_api
 
 log = logging.getLogger("screener")
 
@@ -41,7 +43,8 @@ class CoinScreener:
     # ── 取得 K 線 ────────────────────────────────────────────────
 
     def _get_klines(self, symbol: str, interval="1h", limit=200) -> pd.DataFrame:
-        raw = self.client.futures_klines(
+        raw = retry_api(
+            self.client.futures_klines,
             symbol=symbol, interval=interval, limit=limit
         )
         df = pd.DataFrame(raw, columns=[
@@ -79,7 +82,8 @@ class CoinScreener:
         # Funding Rate（方向感知）
         fr_raw = 0.0
         try:
-            funding = self.client.futures_funding_rate(
+            funding = retry_api(
+                self.client.futures_funding_rate,
                 symbol=symbol, limit=1
             )
             fr_raw = float(funding[-1]["fundingRate"]) if funding else 0.0
@@ -376,7 +380,7 @@ class CoinScreener:
         """掃描全市場，回傳評分最高的幣種清單"""
         log.info("開始全市場掃描（裸K+Fib 專用選幣）...")
 
-        info = self.client.futures_exchange_info()
+        info = retry_api(self.client.futures_exchange_info)
         symbols = [
             s["symbol"] for s in info["symbols"]
             if s["quoteAsset"] == "USDT"
@@ -404,6 +408,10 @@ class CoinScreener:
         for i, sym in enumerate(symbols):
             if i % 50 == 0 and i > 0:
                 log.info(f"掃描進度：{i}/{len(symbols)}")
+
+            # 速率限制：每 5 個 symbol 休息 0.5 秒，避免觸發幣安 rate limit
+            if i > 0 and i % 5 == 0:
+                time.sleep(0.5)
 
             score, details = self._score(sym)
             if score >= min_score:

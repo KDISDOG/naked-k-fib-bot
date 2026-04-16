@@ -57,13 +57,13 @@ class Config:
 
     # ── 方案 A：RSI 均值回歸參數 ─────────────────────────────────
     MR_RSI_PERIOD    = int(os.getenv("MR_RSI_PERIOD", 14))
-    MR_RSI_OVERSOLD  = float(os.getenv("MR_RSI_OVERSOLD", 30))
-    MR_RSI_OVERBOUGHT= float(os.getenv("MR_RSI_OVERBOUGHT", 70))
+    MR_RSI_OVERSOLD  = float(os.getenv("MR_RSI_OVERSOLD", 25))
+    MR_RSI_OVERBOUGHT= float(os.getenv("MR_RSI_OVERBOUGHT", 75))
     MR_BB_PERIOD     = int(os.getenv("MR_BB_PERIOD", 20))
     MR_BB_STD        = float(os.getenv("MR_BB_STD", 2.0))
     MR_TIMEFRAME     = os.getenv("MR_TIMEFRAME", "15m")
     MR_TP_PCT        = float(os.getenv("MR_TP_PCT", 0.05))    # 5% 止盈
     MR_SL_PCT        = float(os.getenv("MR_SL_PCT", 0.025))   # 2.5% 止損
-    MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 2))
-    MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 1.5))   # 均值回歸：容許適量放量
+    MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 3))
+    MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 0.9))   # 均值回歸：縮量（核心語意）
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數

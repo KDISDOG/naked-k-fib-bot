@@ -1,10 +1,10 @@
-# 多策略交易機器人 Skill (v5)
+# 多策略交易機器人 Skill (v5.1)
 
-> 基於 naked-k-fib-bot v4 升級，新增策略抽象層 + RSI 均值回歸策略
+> 基於 naked-k-fib-bot v5 升級，新增安全基礎設施（Telegram 通知 / API 重試 / 每日虧損熔斷 / SL 掛單驗證 / 選幣限流）
 
 | name        | multi-strategy-trading-bot                                                                                                                                                                                                                 |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| description | 升級版幣安合約交易機器人，支援多策略切換：裸K+Fib、RSI均值回歸。具備策略抽象基類、自動選幣、自動開單、風控、倉位同步、分批止盈、即時 Dashboard。觸發時機：使用者提到「均值回歸」「RSI」「mean reversion」「多策略」「策略切換」「方案A」。 |
+| description | 升級版幣安合約交易機器人，支援多策略切換：裸K+Fib、RSI均值回歸。具備策略抽象基類、自動選幣、自動開單、風控、倉位同步、分批止盈、即時 Dashboard、Telegram 即時通知、API 重試容錯、每日虧損熔斷。觸發時機：使用者提到「均值回歸」「RSI」「mean reversion」「多策略」「策略切換」「通知」「安全」。 |
 
 ## 快速決策樹
 
@@ -42,7 +42,7 @@ Binance Futures API + CoinGecko
         │
     Config（統一 .env 配置）
         │
-    Scheduler (掃幣 / 訊號檢查 / 倉位同步 + 超時檢查)
+    Scheduler (掃幣 / 訊號檢查 / 倉位同步 + 超時檢查 + 每日總結)
         │
   ┌─────┴──────────────────────────────────────────┐
          MarketContext（BTC Dom / 週線 / ADX 狀態偵測）
@@ -58,12 +58,14 @@ Binance Futures API + CoinGecko
         │
   ┌─────┴──────────────────────────────────────────┐
   Risk Manager ──→ Order Executor（分批 TP / breakeven）
+  │  └→ daily_loss_exceeded() 熔斷                 │
+  │  └→ SL 掛單失敗 → 自動平倉保護                │
   └─────┬──────────────────────────────────────────┘
-        │
-  ┌─────┴─────────┐
-Position    State     Dashboard
-Syncer    Manager    (FastAPI)
-(含超時) (v5 DB)    (含策略篩選)
+        │            ↓
+  ┌─────┴─────────┐  api_retry（指數退避重試 wrapper）
+Position    State     Dashboard    Notifier
+Syncer    Manager    (FastAPI)   (Telegram)
+(含超時) (v5 DB)    (含策略篩選)  (開/平倉/錯誤/日報)
 ```
 
 ## 新增檔案清單
@@ -75,16 +77,21 @@ Syncer    Manager    (FastAPI)
 | `scripts/strategies/naked_k_fib.py`    | 原 v4 策略重構（從 signal_engine.py 搬入） | P1     |
 | `scripts/strategies/mean_reversion.py` | 方案 A：RSI + BB 均值回歸策略              | P2     |
 | `scripts/config.py`                    | 統一 .env 配置管理                         | P1     |
+| `scripts/notifier.py`                  | Telegram 即時通知（開/平倉、錯誤、日報）   | P1     |
+| `scripts/api_retry.py`                 | API 指數退避重試 wrapper（3次，1→2→4秒）   | P1     |
 
 ## 修改檔案清單
 
 | 檔案                             | 修改內容                                         | 優先級 |
 | -------------------------------- | ------------------------------------------------ | ------ |
-| `scripts/bot_main.py`            | 多策略載入 + 調度 + 超時檢查                     | P1     |
+| `scripts/bot_main.py`            | 多策略載入 + 調度 + 超時檢查 + 每日虧損熔斷 + TG通知 | P1     |
 | `scripts/signal_engine.py`       | 精簡為策略調度器（或廢棄，由 bot_main 直接調度） | P1     |
 | `scripts/state_manager.py`       | trades 表加 strategy + timeout_bars 欄位         | P1     |
 | `scripts/init_db.py`             | DB schema 加新欄位                               | P1     |
-| `scripts/risk_manager.py`        | 支援不同策略的風控參數                           | P2     |
+| `scripts/risk_manager.py`        | 支援不同策略風控 + API retry                     | P2     |
+| `scripts/order_executor.py`      | SL 掛單驗證 + 失敗自動平倉 + API retry + TG通知  | P1     |
+| `scripts/position_syncer.py`     | API retry + 平倉時 TG 通知                       | P2     |
+| `scripts/coin_screener.py`       | 選幣限流（每5幣停0.5秒）+ API retry              | P2     |
 | `scripts/backtest.py`            | 支援 --strategy 參數                             | P2     |
 | `scripts/coin_screener.py`       | 支援策略專屬選幣邏輯                             | P2     |
 | `dashboard/server.py`            | 策略標籤 + 分別統計 + 切換 API                   | P3     |
@@ -95,16 +102,16 @@ Syncer    Manager    (FastAPI)
 
 ### 選幣（`MeanReversionStrategy._score_symbol`，滿分 10 分，≥ 6 才入選）
 
-| 條件 | 分值 | 實際判斷 |
-|------|------|----------|
-| 流動性：24h USDT 成交量 ≥ 500 萬 | +2（≥200萬得+1；不足直接跳過） | `qav.tail(96).sum()` |
-| 波動適中：ATR(14) 在 1.5%-4% | +2（1%-1.5%得+1） | `atr / close * 100` |
-| 非趨勢：ADX(14) < 25 | +2（<20得+2；<25得+1；≥25直接排除） | `adx_df["ADX_14"].iloc[-1]` |
-| BB 帶寬適中：3%-15% | +2（1.5%-3%得+1） | `(BBU-BBL)/BBM * 100` |
-| 均值吸引：近50根觸及BB中軌 ≥ 5次 | +2（≥3次得+1） | `abs(close - bb_mid) <= bb_mid × 0.5%` |
-| 過濾：近24h跳空 > 5% → 排除 | 硬門檻 | `max(abs(open-prev_close)/prev_close)` |
+| 條件                             | 分值                                | 實際判斷                               |
+| -------------------------------- | ----------------------------------- | -------------------------------------- |
+| 流動性：24h USDT 成交量 ≥ 500 萬 | +2（≥200萬得+1；不足直接跳過）      | `qav.tail(96).sum()`                   |
+| 波動適中：ATR(14) 在 1.5%-4%     | +2（1%-1.5%得+1）                   | `atr / close * 100`                    |
+| 非趨勢：ADX(14) < 25             | +2（<20得+2；<25得+1；≥25直接排除） | `adx_df["ADX_14"].iloc[-1]`            |
+| BB 帶寬適中：3%-15%              | +2（1.5%-3%得+1）                   | `(BBU-BBL)/BBM * 100`                  |
+| 均值吸引：近50根觸及BB中軌 ≥ 5次 | +2（≥3次得+1）                      | `abs(close - bb_mid) <= bb_mid × 0.5%` |
+| 過濾：近24h跳空 > 5% → 排除      | 硬門檻                              | `max(abs(open-prev_close)/prev_close)` |
 
-> ⚠ **BB 欄位命名**：pandas_ta 產生 `BBU_20_2.0_2.0`（雙 std 後綴），需用 `startswith("BBU_")` 自動偵測，不可硬編碼欄位名稱。
+> ⚠ **BB 欄位命名**：pandas*ta 產生 `BBU_20_2.0_2.0`（雙 std 後綴），需用 `startswith("BBU*")` 自動偵測，不可硬編碼欄位名稱。
 
 ### 入場（`MeanReversionStrategy.check_signal`）
 
@@ -112,11 +119,11 @@ Syncer    Manager    (FastAPI)
 - RSI ≥ `MR_RSI_OVERBOUGHT`（70）+ 收盤 ≥ BB 上軌 × 0.995（0.5% 容忍）→ 做空
 - ADX < 25（作為 score bonus，不是硬門檻）
 - 評分制（min_score=2，base score=1）：
-  - 止跌/見頂 K 棒形態（`_has_reversal`）：+1
-  - vol_ok（成交量 ≤ 均量 × `MR_VOL_MULT` = 1.5）：+1
-  - RSI 極端（≤15 或 ≥85）：+1
-  - Stoch RSI 同向確認：+1
-  - MACD 直方圖方向確認：+1
+    - 止跌/見頂 K 棒形態（`_has_reversal`）：+1
+    - vol_ok（成交量 ≤ 均量 × `MR_VOL_MULT` = 1.5）：+1
+    - RSI 極端（≤15 或 ≥85）：+1
+    - Stoch RSI 同向確認：+1
+    - MACD 直方圖方向確認：+1
 
 ### 止盈止損
 
@@ -131,20 +138,20 @@ Syncer    Manager    (FastAPI)
 
 ### 選幣（`CoinScreener.scan`，滿分 12 分，≥ 8 才入選）
 
-| 維度 | 分值 | 實際判斷 |
-|------|------|----------|
-| **流動性品質**（3分）| | |
-| 24h USDT 成交量 ≥ 2億 | +2（≥5千萬得+1） | `qav.tail(24).sum()` |
-| 資金費率中性（\|FR\| < 0.05%）| +1（方向有利+1；極端不利-1）| `futures_funding_rate()` |
-| **趨勢結構品質**（3分）| | |
-| ADX 在 `SCREEN_ADX_MIN`-`SCREEN_ADX_MAX`（15-45）| +1 | 適中趨勢，Fib 回撤有效 |
-| Swing count 在 3-8 個 | +1 | `_count_swings(left=5, right=5)` |
-| ATR% 在 1.2%-`SCREEN_ATR_MAX`（做多4%/做空8%）| +1 | 波動適中，不過激 |
-| **K 棒品質**（3分）| | |
-| 實體佔比 ≥ 50%（≥35%得+1）| +2 / +1 | `body / total_range` |
-| 方向一致性 ≥ 45% | +1 | 連續同向K棒比例 |
-| **Fib 歷史反應**（3分）| | |
-| 近60根內Fib位觸及後反應，反應率 ≥ 60% | +3（≥40%得+2；≥25%得+1）| 0.382/0.5/0.618 位 ±0.8% 容忍 |
+| 維度                                              | 分值                         | 實際判斷                         |
+| ------------------------------------------------- | ---------------------------- | -------------------------------- |
+| **流動性品質**（3分）                             |                              |                                  |
+| 24h USDT 成交量 ≥ 2億                             | +2（≥5千萬得+1）             | `qav.tail(24).sum()`             |
+| 資金費率中性（\|FR\| < 0.05%）                    | +1（方向有利+1；極端不利-1） | `futures_funding_rate()`         |
+| **趨勢結構品質**（3分）                           |                              |                                  |
+| ADX 在 `SCREEN_ADX_MIN`-`SCREEN_ADX_MAX`（15-45） | +1                           | 適中趨勢，Fib 回撤有效           |
+| Swing count 在 3-8 個                             | +1                           | `_count_swings(left=5, right=5)` |
+| ATR% 在 1.2%-`SCREEN_ATR_MAX`（做多4%/做空8%）    | +1                           | 波動適中，不過激                 |
+| **K 棒品質**（3分）                               |                              |                                  |
+| 實體佔比 ≥ 50%（≥35%得+1）                        | +2 / +1                      | `body / total_range`             |
+| 方向一致性 ≥ 45%                                  | +1                           | 連續同向K棒比例                  |
+| **Fib 歷史反應**（3分）                           |                              |                                  |
+| 近60根內Fib位觸及後反應，反應率 ≥ 60%             | +3（≥40%得+2；≥25%得+1）     | 0.382/0.5/0.618 位 ±0.8% 容忍    |
 
 **策略 ADX 分工**：NKF = ADX 15-45（有趨勢）；MR = ADX < 25（非趨勢），兩者不重疊。
 
@@ -163,7 +170,26 @@ Syncer    Manager    (FastAPI)
 
 ---
 
-## ✅ 實作完成狀態 (2026-04-16)
+## ✅ 實作完成狀態 (2026-04-17)
+
+### 安全基礎設施（v5.1 新增，已完成）
+
+| 項目                         | 狀態 | 說明                                                                                   |
+| ---------------------------- | ---- | -------------------------------------------------------------------------------------- |
+| Telegram 通知                | ✅   | `scripts/notifier.py`：開倉🟢/平倉✅❌/SL失敗⚠️/每日虧損暫停🚨/日報📊/啟停🤖🛑 |
+| API 指數退避重試             | ✅   | `scripts/api_retry.py`：3 次重試（1→2→4 秒），所有關鍵 API 呼叫已套用                  |
+| 每日虧損熔斷                 | ✅   | `bot_main.py` 的 `check_signals()` 開頭呼叫 `daily_loss_exceeded()`，觸發則暫停+TG通知 |
+| SL 掛單失敗保護              | ✅   | `order_executor.py`：SL 下單失敗 → 自動市價平倉 + TG 通知，不留裸倉                    |
+| 選幣 API 限流                | ✅   | `coin_screener.py`：每 5 個幣種暫停 0.5 秒，避免觸發幣安 1200 weight/min 限制          |
+| 每日總結排程                 | ✅   | `bot_main.py`：`schedule.every().day.at("23:55")`，Telegram 推送當日 PnL / 勝率 / 持倉  |
+
+### 安全守則補充（v5.1）
+
+12. SL 掛單失敗時**必須立即平倉**，無 SL 保護的倉位=無限風險
+13. API 呼叫均需通過 `retry_api()` wrapper，不可裸呼叫 `client.futures_*`
+14. 選幣掃描（`coin_screener.scan()`）必須設 rate limit，禁止 200+ 幣種無間隔連續呼叫
+15. `daily_loss_exceeded()` 必須在每次 `check_signals()` 開頭執行，不可跳過
+16. Telegram token 不可提交到 Git（`.env` 已在 `.gitignore`）
 
 ### 核心架構（已完成）
 
@@ -193,17 +219,17 @@ Syncer    Manager    (FastAPI)
 
 ### 回測（已完成）
 
-| 項目                    | 狀態 | 說明                                                  |
-| ----------------------- | ---- | ----------------------------------------------------- |
-| `BacktestSignalEngine`  | ✅   | NKF 回測引擎（繼承 SignalEngine）                     |
-| `BacktestMREngine`      | ✅   | MR 回測引擎（RSI/BB/ADX on local DataFrame）          |
-| `run_backtest()`        | ✅   | NKF 主回測迴圈                                        |
-| `run_backtest_mr()`     | ✅   | MR 主回測迴圈，矢量化預計算指標（O(n)），超時=`MR_TIMEOUT_BARS`  |
-| `--strategy` 參數       | ✅   | `naked_k_fib` / `mean_reversion` / `all`              |
-| `--adx-max` 參數        | ✅   | MR 回測 ADX 上限（預設 25，可改 20 更嚴格）            |
-| `--scan` 模式           | ✅   | 批量掃描 20 個幣種，找最適合 MR 的幣，輸出排名表      |
-| 合併統計                | ✅   | `--strategy all` 時列印 NKF 合計 + MR 合計 + 兩者合併 |
-| `BtTrade.strategy` 欄位 | ✅   | 合併報告時可區分來源策略                              |
+| 項目                    | 狀態 | 說明                                                            |
+| ----------------------- | ---- | --------------------------------------------------------------- |
+| `BacktestSignalEngine`  | ✅   | NKF 回測引擎（繼承 SignalEngine）                               |
+| `BacktestMREngine`      | ✅   | MR 回測引擎（RSI/BB/ADX on local DataFrame）                    |
+| `run_backtest()`        | ✅   | NKF 主回測迴圈                                                  |
+| `run_backtest_mr()`     | ✅   | MR 主回測迴圈，矢量化預計算指標（O(n)），超時=`MR_TIMEOUT_BARS` |
+| `--strategy` 參數       | ✅   | `naked_k_fib` / `mean_reversion` / `all`                        |
+| `--adx-max` 參數        | ✅   | MR 回測 ADX 上限（預設 25，可改 20 更嚴格）                     |
+| `--scan` 模式           | ✅   | 批量掃描 20 個幣種，找最適合 MR 的幣，輸出排名表                |
+| 合併統計                | ✅   | `--strategy all` 時列印 NKF 合計 + MR 合計 + 兩者合併           |
+| `BtTrade.strategy` 欄位 | ✅   | 合併報告時可區分來源策略                                        |
 
 ---
 
@@ -278,6 +304,10 @@ SCREEN_MIN_SCORE=6
 SCREEN_MIN_VOL_M=50
 SCREEN_ADX_MIN=15
 SCREEN_ADX_MAX=45
+
+# Telegram 通知（v5.1 新增）
+TG_BOT_TOKEN=                # 從 @BotFather 取得
+TG_CHAT_ID=                  # 從 @userinfobot 取得
 ```
 
 ---
@@ -311,7 +341,19 @@ A: 切換寫入 `.env`；Bot 下次排程週期才讀新設定。若要立即生
 A: 用 `--scan --months 3 --adx-max 20` 找當前最適合幣種。若全部虧損代表市場目前趨勢性過強，MR 策略暫時不適用。
 
 **Q: pandas_ta BB 欄位找不到？**
-A: pandas_ta 產生的欄位名為 `BBU_20_2.0_2.0`（雙 std 後綴），不是 `BBU_20_2.0`。**一律用 `startswith("BBU_")` 自動偵測**，禁止硬編碼欄位名稱。
+A: pandas*ta 產生的欄位名為 `BBU_20_2.0_2.0`（雙 std 後綴），不是 `BBU_20_2.0`。\*\*一律用 `startswith("BBU*")` 自動偵測\*\*，禁止硬編碼欄位名稱。
 
 **Q: 回測速度很慢（跑超過 2 分鐘）？**
 A: 每根 K 棒內重新計算 `ta.rsi()`/`ta.bbands()` 等是 O(n²) 反模式。正確做法：在迴圈外一次性計算全部指標，迴圈內只做 `iloc[i]` 查找。
+
+**Q: Telegram 通知沒收到？**
+A: 1) 確認 `.env` 的 `TG_BOT_TOKEN` 和 `TG_CHAT_ID` 已填寫。2) `notifier.py` 需要 `load_dotenv()` 先載入環境變數。3) 確認你已在 Telegram 對 bot 按過 Start。4) 用 `python -c "from notifier import notify; notify._send('test')"` 測試。
+
+**Q: `daily_loss_exceeded()` 何時重置？**
+A: 每次呼叫時計算當日已實現 PnL（`get_today_pnl()`）vs 帳戶總餘額。跨日自動重置（因為 today_pnl 只計算當天的交易）。`bot_paused` 需重啟 bot 才會解除。
+
+**Q: SL 掛單失敗後倉位怎麼辦？**
+A: `order_executor.py` 會自動市價平倉並發 Telegram 通知。如果連平倉都失敗，會再發一次錯誤通知，需人工介入。
+
+**Q: API retry 最多等多久？**
+A: 3 次重試，退避 1s→2s→4s，最長等 7 秒。第 4 次仍失敗則拋出原始例外。

@@ -17,6 +17,7 @@ from binance.client import Client
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import Config
+from api_retry import retry_api
 
 log = logging.getLogger("risk")
 
@@ -79,7 +80,7 @@ class RiskManager:
 
     def _get_available_balance(self) -> float:
         try:
-            account = self.client.futures_account()
+            account = retry_api(self.client.futures_account)
             for asset in account["assets"]:
                 if asset["asset"] == "USDT":
                     return float(asset["availableBalance"])
@@ -89,7 +90,7 @@ class RiskManager:
 
     def _get_total_balance(self) -> float:
         try:
-            account = self.client.futures_account()
+            account = retry_api(self.client.futures_account)
             for asset in account["assets"]:
                 if asset["asset"] == "USDT":
                     return float(asset["walletBalance"])

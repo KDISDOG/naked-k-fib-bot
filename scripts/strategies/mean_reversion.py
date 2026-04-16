@@ -7,12 +7,13 @@ mean_reversion.py — 方案 A：RSI 均值回歸策略
 選幣條件（滿分 10 分，≥ 6 才入選）：
   - 流動性：USDT 24h 成交量 ≥ 500 萬          2 分
   - 波動適中：ATR(14) 在 1.5%-4% 之間          2 分
-  - 非趨勢：ADX(14) < 25                       2 分
+  - 非趨勢：ADX(14) < 20 (+2) / < 25 (+1) / ≥ 25 直接淘汰（與 NKF 分離）
   - BB 帶寬適中：3%-15%                        2 分
   - 均值吸引：50 根 K 棒內觸及 BB 中軌 ≥ 5 次  2 分
 
 入場條件（做多）：
-  RSI ≤ 20 + 收盤 ≤ BB 下軌 + 止跌K棒 + 縮量（≤ 0.8x均量）+ ADX < 30
+  RSI ≤ MR_RSI_OVERSOLD(=25) + 收盤 ≤ BB 下軌 + 止跌K棒
+  + 縮量（≤ MR_VOL_MULT(=0.9)x 均量）+ ADX < 20
 
 止盈止損：
   TP1（60%）: +3%（動態調整） → TP2（40%）: +5%
@@ -139,7 +140,8 @@ class MeanReversionStrategy(BaseStrategy):
         # 5. 近 50 根觸及 BB 中軌次數 ≥ 5（均值吸引）
         mid_prices = bb[col_m].tail(50)
         closes     = df["close"].tail(50)
-        tol = bb_mid * 0.005
+        # 以 BB 帶寬的 10% 作為觸及容差（低波動幣種也能偵測到均值吸引）
+        tol = bb_width * 0.1
         touches = int(np.sum(np.abs(closes.values - mid_prices.values) <= tol))
         if touches >= 5:
             score += 2
@@ -205,8 +207,8 @@ class MeanReversionStrategy(BaseStrategy):
         last_vol = float(df_a["volume"].iloc[-1])
         vol_ok = last_vol <= avg_vol * Config.MR_VOL_MULT
 
-        # ADX 過濾（MR 只在非趨勢盤運作）
-        adx_ok = adx_val < 25
+        # ADX 過濾（MR 只在非趨勢盤運作；與 NKF 的 20-45 區間分開）
+        adx_ok = adx_val < 20
 
         side = None
 

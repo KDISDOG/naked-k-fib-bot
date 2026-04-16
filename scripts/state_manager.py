@@ -36,7 +36,7 @@ class Trade(Base):
     signal_score = Column(Integer, default=0)
     timeframe    = Column(String, default="1h")
     breakeven    = Column(Boolean, default=False)       # 是否已移至保本
-    opened_at    = Column(DateTime, default=datetime.utcnow)
+    opened_at    = Column(DateTime, default=datetime.now)
     closed_at    = Column(DateTime, nullable=True)
     # 用於追蹤幣安訂單
     order_id     = Column(String, nullable=True)
@@ -52,6 +52,9 @@ class Trade(Base):
     # v5 新增：多策略支援
     strategy     = Column(String, default="naked_k_fib", index=True)  # 策略標識
     timeout_bars = Column(Integer, default=0)          # 已持倉 K 棒數（超時平倉用）
+    # v5.1 新增
+    margin       = Column(Float, default=0.0)          # 開倉保證金（entry×qty/leverage）
+    close_reason = Column(String, nullable=True)       # 平倉原因：TP1/TP2/SL/TIMEOUT/MANUAL/TRAILING
 
 
 class StateManager:
@@ -75,6 +78,9 @@ class StateManager:
             # v5
             "strategy":      "TEXT DEFAULT 'naked_k_fib'",
             "timeout_bars":  "INTEGER DEFAULT 0",
+            # v5.1
+            "margin":        "FLOAT DEFAULT 0",
+            "close_reason":  "TEXT",
         }
         try:
             insp = inspect(self.engine)
@@ -97,7 +103,8 @@ class StateManager:
                    tp1_order_id=None, tp2_order_id=None,
                    use_trailing=False, trailing_atr=None,
                    btc_corr=None,
-                   strategy="naked_k_fib") -> Trade:
+                   strategy="naked_k_fib",
+                   margin=0.0) -> Trade:
         with self.Session() as session:
             trade = Trade(
                 symbol=symbol, direction=direction,
@@ -109,6 +116,7 @@ class StateManager:
                 use_trailing=use_trailing, trailing_atr=trailing_atr,
                 btc_corr=btc_corr,
                 strategy=strategy,
+                margin=margin,
                 highest_price=entry if direction == "LONG" else None,
                 lowest_price=entry if direction == "SHORT" else None,
             )
@@ -122,16 +130,26 @@ class StateManager:
 
     def close_trade(self, trade_id: int, exit_price: float,
                     fee: float = 0.0, partial: bool = False,
-                    closed_qty: float = 0.0):
+                    closed_qty: float = 0.0,
+                    close_reason: str = None):
         """
         更新平倉紀錄
         partial=True: 部分止盈（tp1 觸發），狀態改為 partial
         partial=False: 完全平倉
+        close_reason: TP1 / TP2 / SL / TIMEOUT / MANUAL / TRAILING
         """
         with self.Session() as session:
             trade = session.get(Trade, trade_id)
             if not trade:
                 return
+
+            # 防護：exit_price=0 會產生天文數字 PnL，改用入場價
+            if exit_price <= 0:
+                log.warning(
+                    f"[DB] #{trade_id} exit_price={exit_price}，"
+                    f"fallback 至 entry={trade.entry}"
+                )
+                exit_price = trade.entry
 
             if partial:
                 trade.status = "partial"
@@ -144,7 +162,7 @@ class StateManager:
                 trade.pnl += partial_pnl
             else:
                 trade.status = "closed"
-                trade.closed_at = datetime.utcnow()
+                trade.closed_at = datetime.now()
                 remaining = trade.qty - trade.qty_closed
                 if trade.direction == "LONG":
                     final_pnl = (exit_price - trade.entry) * remaining
@@ -155,6 +173,8 @@ class StateManager:
 
             trade.fee += fee
             trade.net_pnl = trade.pnl - trade.fee
+            if close_reason:
+                trade.close_reason = close_reason
             session.commit()
             log.info(
                 f"[DB] {'部分' if partial else '完全'}平倉：#{trade_id} "
@@ -238,7 +258,7 @@ class StateManager:
           不同策略間不互相阻擋，避免一邊虧了另一邊也被封鎖。
         """
         cooldown_delta = timedelta(minutes=cooldown_bars * bar_minutes)
-        cutoff = datetime.utcnow() - cooldown_delta
+        cutoff = datetime.now() - cooldown_delta
         with self.Session() as session:
             q = session.query(Trade).filter(
                 Trade.symbol == symbol,
@@ -276,7 +296,7 @@ class StateManager:
             return self._trade_to_dict(trade)
 
     def get_today_pnl(self) -> float:
-        today = datetime.utcnow().date()
+        today = datetime.now().date()
         with self.Session() as session:
             result = session.query(func.sum(Trade.net_pnl)).filter(
                 func.date(Trade.closed_at) == today,
@@ -285,7 +305,7 @@ class StateManager:
             return float(result or 0.0)
 
     def get_today_fee(self) -> float:
-        today = datetime.utcnow().date()
+        today = datetime.now().date()
         with self.Session() as session:
             result = session.query(func.sum(Trade.fee)).filter(
                 func.date(Trade.closed_at) == today,
@@ -363,6 +383,8 @@ class StateManager:
             "btc_corr":     t.btc_corr,
             "strategy":     getattr(t, "strategy", "naked_k_fib"),
             "timeout_bars": getattr(t, "timeout_bars", 0),
+            "margin":       getattr(t, "margin", 0) or 0,
+            "close_reason": getattr(t, "close_reason", None),
         }
 
     def get_open_trades_by_direction(self, direction: str) -> list[dict]:

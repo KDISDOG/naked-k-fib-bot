@@ -10,7 +10,37 @@
     * {
       box-sizing: border-box;
       margin: 0;
-      padding: 0
+      padding: 0;
+      scrollbar-gutter: stable
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: #2d3748;
+      border-radius: 3px
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: #4a5568
+    }
+
+    ::-webkit-scrollbar-corner {
+      background: transparent
+    }
+
+    /* Firefox */
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: #2d3748 transparent
     }
 
     body {
@@ -391,6 +421,10 @@
           {% if stats.net_pnl > 0 %}+{% endif %}{{ stats.net_pnl }} USDT
         </div>
       </div>
+      <div class="kpi">
+        <div class="kpi-label">合計報酬率</div>
+        <div id="kpi-return-pct" class="kpi-value neu">—</div>
+      </div>
     </div>
 
     <!-- 策略分項統計 -->
@@ -402,6 +436,8 @@
         <div class="stat-row"><span class="stat-label">總盈虧</span><span id="nkf-pnl" class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="nkf-net-pnl" class="stat-val">—</span>
         </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="nkf-return-pct"
+            class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="nkf-avg-pnl" class="stat-val">—</span></div>
       </div>
       <div class="strategy-card">
@@ -411,8 +447,11 @@
         <div class="stat-row"><span class="stat-label">總盈虧</span><span id="mr-pnl" class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="mr-net-pnl" class="stat-val">—</span>
         </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="mr-return-pct"
+            class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="mr-avg-pnl" class="stat-val">—</span></div>
       </div>
+
     </div>
 
     <!-- 風控參數 + 緊急操作 -->
@@ -493,7 +532,7 @@
       </div>
       <div class="card">
         <h3>最近 50 筆交易</h3>
-        <div style="overflow-x:auto;max-height:220px;overflow-y:auto">
+        <div style="overflow-x:auto;max-height:220px;overflow-y:auto;scrollbar-gutter:stable">
           <table>
             <thead>
               <tr>
@@ -502,7 +541,10 @@
                 <th>策略</th>
                 <th>Fib</th>
                 <th>形態</th>
+                <th>保證金</th>
                 <th>P&L</th>
+                <th>報酬率</th>
+                <th>關倉原因</th>
                 <th>狀態</th>
                 <th>時間</th>
               </tr>
@@ -517,9 +559,28 @@
                     'MR' if t.strategy == 'mean_reversion' else 'NKF' }}</span></td>
                 <td>{{ t.fib_level }}</td>
                 <td style="font-size:11px">{{ t.pattern }}</td>
+                {% set margin = t.margin if t.margin and t.margin > 0 else (t.entry * t.qty / 3 if t.entry and t.qty
+                else 0) %}
+                <td style="color:#a0aec0">{% if margin > 0 %}{{ "%.2f"|format(margin) }} U{% else %}—{% endif %}</td>
                 <td class="{% if t.net_pnl > 0 %}pnl-pos{% elif t.net_pnl < 0 %}pnl-neg{% endif %}">
                   {% if t.net_pnl %}{% if t.net_pnl > 0 %}+{% endif %}{{ "%.2f"|format(t.net_pnl) }}{% else %}—{% endif
                   %}
+                </td>
+                {% set pct = (t.net_pnl / margin * 100) if margin > 0 and t.net_pnl else 0 %}
+                <td class="{% if pct > 0 %}pnl-pos{% elif pct < 0 %}pnl-neg{% endif %}" style="font-size:11px">
+                  {% if margin > 0 and t.net_pnl %}{% if pct > 0 %}+{% endif %}{{ "%.2f"|format(pct) }}%{% else %}—{%
+                  endif %}
+                </td>
+                <td style="font-size:11px">
+                  {% if t.close_reason == 'TP1' %}<span style="color:#68d391">TP1</span>
+                  {% elif t.close_reason == 'TP2' %}<span style="color:#4fd1c5">TP2</span>
+                  {% elif t.close_reason == 'SL' %}<span style="color:#fc8181">SL</span>
+                  {% elif t.close_reason == 'TIMEOUT' %}<span style="color:#ecc94b">TIMEOUT</span>
+                  {% elif t.close_reason == 'MANUAL' %}<span style="color:#a0aec0">MANUAL</span>
+                  {% elif t.close_reason == 'BREAKEVEN' %}<span style="color:#63b3ed">BE</span>
+                  {% elif t.close_reason == 'TRAILING' %}<span style="color:#b794f4">TRAIL</span>
+                  {% elif t.status == 'open' or t.status == 'partial' %}—
+                  {% else %}{{ t.close_reason or '—' }}{% endif %}
                 </td>
                 <td class="{% if t.status=='open' %}status-open{% else %}status-closed{% endif %}">{{ t.status }}</td>
                 <td style="font-size:11px;color:#718096">{{ t.opened_at[:16] if t.opened_at else '' }}</td>
@@ -527,7 +588,7 @@
               {% endfor %}
               {% if not trades %}
               <tr>
-                <td colspan="8" style="text-align:center;padding:20px;color:#4a5568">尚無交易紀錄</td>
+                <td colspan="11" style="text-align:center;padding:20px;color:#4a5568">尚無交易紀錄</td>
               </tr>
               {% endif %}
             </tbody>
@@ -615,7 +676,7 @@
         const timeEl = document.getElementById('pos-update-time');
         if (timeEl) timeEl.textContent = `（${new Date().toLocaleTimeString('zh-TW')} 更新）`;
         if (!positions || positions.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#4a5568;padding:20px">目前無開倉</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#4a5568;padding:20px">目前無開倉</td></tr>';
           if (header) header.childNodes[0].textContent = '當前持倉（0）';
           return;
         }
@@ -700,7 +761,14 @@
     // ── 策略統計 ─────────────────────────────────────────────
     async function refreshStrategyStats() {
       try {
-        const data = await fetch('/api/stats/all_strategies').then(r => r.json());
+        const [data, balData] = await Promise.all([
+          fetch('/api/stats/all_strategies').then(r => r.json()),
+          fetch('/api/balance').then(r => r.json()),
+        ]);
+        const wallet = (balData.wallet && balData.wallet > 0) ? balData.wallet : null;
+
+        // 所有策略報酬率用同一個分母(wallet)，這樣 NKF% + MR% = 合計%
+        // (前提：所有交易都有打策略標籤)
         function fillStats(prefix, s) {
           if (!s) return;
           const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
@@ -715,9 +783,31 @@
               el.className = 'stat-val ' + (s[field] > 0 ? 'pnl-pos' : s[field] < 0 ? 'pnl-neg' : '');
             }
           });
+          const retEl = document.getElementById(`${prefix}-return-pct`);
+          if (retEl && s.net_pnl != null && wallet) {
+            const pct = (s.net_pnl / wallet * 100);
+            const sign = pct > 0 ? '+' : '';
+            retEl.textContent = `${sign}${pct.toFixed(2)}%`;
+            retEl.className = 'stat-val ' + (pct > 0 ? 'pnl-pos' : pct < 0 ? 'pnl-neg' : '');
+          } else if (retEl) {
+            retEl.textContent = '—';
+          }
         }
+
         fillStats('nkf', data.naked_k_fib);
         fillStats('mr', data.mean_reversion);
+
+        // 合計報酬率顯示在頂部 KPI 欄
+        const retKpi = document.getElementById('kpi-return-pct');
+        if (retKpi && data.combined && data.combined.net_pnl != null && wallet) {
+          const pct = (data.combined.net_pnl / wallet * 100);
+          const sign = pct > 0 ? '+' : '';
+          retKpi.textContent = `${sign}${pct.toFixed(2)}%`;
+          retKpi.className = 'kpi-value ' + (pct > 0 ? 'pos' : pct < 0 ? 'neg' : 'neu');
+        } else if (retKpi) {
+          retKpi.textContent = '—';
+          retKpi.className = 'kpi-value neu';
+        }
       } catch (e) { console.warn('策略統計刷新失敗', e); }
     }
 
