@@ -51,18 +51,17 @@ DEFAULT_TF        = ["1h", "4h"]
 DEFAULT_MONTHS    = 6         # 抓幾個月歷史資料
 INITIAL_BALANCE   = 1000.0    # 模擬起始資金（.env 沒有此項，手動設定）
 RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE",    "0.02"))
-MAX_NOTIONAL_PCT  = float(os.getenv("MAX_NOTIONAL_PCT",  "0.20"))
+MAX_NOTIONAL_PCT  = float(os.getenv("MAX_NOTIONAL_PCT",  str(round(1/6, 4))))
 LEVERAGE          = int(os.getenv("MAX_LEVERAGE",        "2"))
 MIN_SCORE         = int(os.getenv("MIN_SIGNAL_SCORE",    "3"))
 TAKER_FEE_RATE    = TAKER_FEE
 COOLDOWN_BARS     = int(os.getenv("COOLDOWN_BARS",       "6"))
 
-# ── 可調實驗參數（預設值 = 寬鬆模式，方便回測）────────────────────
-# 這些參數只影響回測，不自動同步到真實 bot
-BT_FIB_TOL        = 0.008   # Fib 容忍度（真實 bot 是 0.005）
-BT_VOL_MULT       = 1.1     # 成交量倍率門檻（真實 bot 是 1.3）
-BT_SKIP_VOL_RISE  = False   # True = 不要求「當根>前根」
-BT_SKIP_BAD_FIB   = True    # True = 跳過 R:R 差的 0.236/0.786 位
+# ── NKF 回測參數（同步 Config，確保與正式 bot 一致）──────────────
+BT_FIB_TOL        = Config.NKF_FIB_TOL       # 同正式 (0.005)
+BT_VOL_MULT       = Config.NKF_VOL_RATIO     # 同正式 (1.3)
+BT_SKIP_VOL_RISE  = not Config.NKF_VOL_RISING # 正式要求 vol rising
+BT_SKIP_BAD_FIB   = False                     # 同正式（不跳過任何 Fib 位）
 
 
 # ── 資料結構 ──────────────────────────────────────────────────────
@@ -220,12 +219,16 @@ class BacktestSignalEngine(SignalEngine):
         elif direction == "SHORT" and self._volume_exhaustion_short(df):
             exhaustion_bonus = 1
 
+        # btc_weekly_penalty：回測無 market_ctx，設為 0（與正式差異已記錄）
+        btc_weekly_penalty = 0
+
         score = (
             pattern_strength
             + (1 if float(fib_hit) == 0.618 else 0)
             + (1 if swing_trend == ("up" if direction == "LONG" else "down") else 0)
             + vol_score
             + exhaustion_bonus
+            + btc_weekly_penalty
         )
         score = max(0, min(5, score))
 
@@ -301,26 +304,20 @@ class BacktestMREngine:
         last_vol = float(df["volume"].iloc[-1])
         vol_ok   = last_vol <= avg_vol * Config.MR_VOL_MULT
 
-        # BB 容差：允許最多 0.5% 超出 BB 軌道（增加入場機會）
-        bb_tol = bb_lower * 0.005
+        # ── 入場判斷（同正式：無 BB 容差，反轉 K 棒為硬性條件）──
         side = None
-        has_reversal = False
-        if rsi_val <= Config.MR_RSI_OVERSOLD and price <= bb_lower + bb_tol:
-            side = "LONG"
-            has_reversal = self._has_reversal(df, "LONG")
-        elif rsi_val >= Config.MR_RSI_OVERBOUGHT and price >= bb_upper - bb_tol:
-            side = "SHORT"
-            has_reversal = self._has_reversal(df, "SHORT")
+        if rsi_val <= Config.MR_RSI_OVERSOLD and price <= bb_lower:
+            if self._has_reversal(df, "LONG"):
+                side = "LONG"
+        elif rsi_val >= Config.MR_RSI_OVERBOUGHT and price >= bb_upper:
+            if self._has_reversal(df, "SHORT"):
+                side = "SHORT"
 
         if side is None:
             return None
 
-        # ── 評分 ─────────────────────────────────────────────────
+        # ── 評分（同正式 _score_signal）──────────────────────────
         score = 1
-        if has_reversal:
-            score += 1  # 反轉K棒形態加分
-        if vol_ok:
-            score += 1  # 縮量確認加分
         if (side == "LONG" and rsi_val <= 15) or \
            (side == "SHORT" and rsi_val >= 85):
             score += 1
@@ -356,18 +353,23 @@ class BacktestMREngine:
             pass
         score = min(score, 5)
 
-        # ── TP/SL ────────────────────────────────────────────────
+        # ── TP/SL（同正式 _calc_tp_sl）─────────────────────────────
         sl_dist = min(Config.MR_SL_PCT * price, atr_val * 1.0)
         sl_dist = max(sl_dist, price * 0.005)
         sl_dist = min(sl_dist, price * 0.03)
 
+        # TP1：ATR-based 短目標（同正式）
+        mid_dist = abs(bb_mid - price)
+        tp1_dist = min(atr_val * 1.2, mid_dist) if mid_dist > atr_val * 0.5 else atr_val * 1.0
+        tp1_dist = max(tp1_dist, price * 0.005)  # 最少 0.5%
+
         if side == "LONG":
-            tp1 = bb_mid if bb_mid > price else price * 1.010
-            tp2 = bb_upper if bb_upper > tp1 else tp1 * 1.015
+            tp1 = price + tp1_dist
+            tp2 = bb_mid if bb_mid > tp1 else tp1 * 1.015
             sl  = price - sl_dist
         else:
-            tp1 = bb_mid if bb_mid < price else price * 0.990
-            tp2 = bb_lower if bb_lower < tp1 else tp1 * 0.985
+            tp1 = price - tp1_dist
+            tp2 = bb_mid if bb_mid < tp1 else tp1 * 0.985
             sl  = price + sl_dist
 
         from types import SimpleNamespace
@@ -410,9 +412,507 @@ class BacktestMREngine:
         return False
 
 
-# ── 倉位計算（脫離 client，使用模擬餘額）───────────────────────────
+# ── ML 回測引擎 ──────────────────────────────────────────────────
+class BacktestMLEngine:
+    """
+    Momentum Long 策略回測引擎：在本地 DataFrame 上逐根偵測
+    阻力突破做多訊號，使用預計算指標（向量化 O(n)）。
+    """
+
+    def _find_swing_highs(self, df: pd.DataFrame,
+                          left: int = 5, right: int = 5) -> list:
+        swings = []
+        for i in range(left, len(df) - right):
+            window = df["high"].iloc[i - left:i + right + 1]
+            if df["high"].iloc[i] == window.max():
+                swings.append({"idx": i, "price": float(df["high"].iloc[i])})
+        return swings
+
+    def _find_swing_lows(self, df: pd.DataFrame,
+                         left: int = 5, right: int = 5) -> list:
+        swings = []
+        for i in range(left, len(df) - right):
+            window = df["low"].iloc[i - left:i + right + 1]
+            if df["low"].iloc[i] == window.min():
+                swings.append({"idx": i, "price": float(df["low"].iloc[i])})
+        return swings
+
+    def _has_bullish_candle(self, df_slice: pd.DataFrame) -> bool:
+        if len(df_slice) < 2:
+            return False
+        c = df_slice.iloc[-1]
+        body = abs(float(c["close"]) - float(c["open"]))
+        total = float(c["high"]) - float(c["low"])
+        if total <= 0:
+            return False
+        # 大陽線
+        if float(c["close"]) > float(c["open"]) and body / total > 0.70:
+            return True
+        # 錘子
+        lower = min(float(c["close"]), float(c["open"])) - float(c["low"])
+        if body > 0 and lower >= body * 2:
+            return True
+        # 多頭吞噬
+        prev = df_slice.iloc[-2]
+        if (float(prev["close"]) < float(prev["open"]) and
+                float(c["close"]) > float(c["open"]) and
+                float(c["open"]) <= float(prev["close"]) and
+                float(c["close"]) >= float(prev["open"])):
+            return True
+        return False
+
+
+# ── ML 主回測邏輯 ───────────────────────────────────────────────
+def run_backtest_ml(client: Client, symbol: str, months: int,
+                    debug: bool = False) -> list:
+    """
+    Momentum Long 策略回測：使用 ML_TIMEFRAME K 線逐根回放。
+    指標在完整 DataFrame 上一次性計算（向量化 O(n)）。
+    只做多：突破近 N 根最高點 + 放量 + 多頭結構。
+    """
+    tf = Config.ML_TIMEFRAME
+    print(f"\n[{symbol} ML {tf}] 回測開始")
+
+    df_tf = fetch_klines(client, symbol, tf, months)
+    if len(df_tf) < 100:
+        print(f"  資料不足（{len(df_tf)} 根），跳過")
+        return []
+
+    # ── 一次性預計算所有指標 ─────────────────────────────────────
+    print(f"  預計算指標...", end="", flush=True)
+    ema20_s   = ta.ema(df_tf["close"], length=20)
+    ema50_s   = ta.ema(df_tf["close"], length=50)
+    adx_full  = ta.adx(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    atr_full  = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    macd_full = ta.macd(df_tf["close"])
+    avg_vol_s = df_tf["volume"].rolling(21).mean().shift(1)
+
+    # 滾動最高點（近 ML_LOOKBACK_BARS 根的 high 最大值，不含當根）
+    lookback = Config.ML_LOOKBACK_BARS
+    rolling_high_s = df_tf["high"].rolling(lookback).max().shift(1)
+    print(" 完成")
+
+    warmup       = max(60, lookback + 1)
+    engine       = BacktestMLEngine()
+    trades       = []
+    balance      = INITIAL_BALANCE
+    cooldown_until = -1
+    timeout_bars = Config.ML_TIMEOUT_BARS
+    min_score    = Config.ML_MIN_SCORE
+
+    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 1):
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+
+        # ── 讀取預計算指標值 ──────────────────────────────────────
+        ema20_val = ema20_s.iloc[i] if ema20_s is not None else float("nan")
+        ema50_val = ema50_s.iloc[i] if ema50_s is not None else float("nan")
+        adx_val   = adx_full["ADX_14"].iloc[i] if adx_full is not None else float("nan")
+        atr_val   = atr_full.iloc[i] if atr_full is not None else float("nan")
+        price     = float(df_tf["close"].iloc[i])
+        avg_vol_i = avg_vol_s.iloc[i]
+        resistance = rolling_high_s.iloc[i]
+
+        if pd.isna(ema20_val) or pd.isna(ema50_val) or pd.isna(adx_val) or \
+                pd.isna(atr_val) or pd.isna(avg_vol_i) or pd.isna(resistance):
+            dbg["no_sig"] += 1
+            continue
+
+        ema20_val = float(ema20_val)
+        ema50_val = float(ema50_val)
+        adx_val   = float(adx_val)
+        atr_val   = float(atr_val)
+        resistance = float(resistance)
+
+        # ── 基本條件：多頭結構 ───────────────────────────────────
+        if ema20_val <= ema50_val:
+            dbg["no_sig"] += 1
+            continue
+        if price <= ema50_val:
+            dbg["no_sig"] += 1
+            continue
+        if adx_val < 20:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 突破偵測：收盤突破近 N 根最高點 ─────────────────────
+        if price <= resistance:
+            dbg["no_sig"] += 1
+            continue
+        break_pct = (price - resistance) / resistance
+        if break_pct < 0.001:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 放量確認 ─────────────────────────────────────────────
+        last_vol = float(df_tf["volume"].iloc[i])
+        if last_vol < float(avg_vol_i) * Config.ML_VOL_MULT:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 評分 ─────────────────────────────────────────────────
+        score = 1  # 基礎分
+
+        if adx_val > 30:
+            score += 1
+        if float(avg_vol_i) > 0 and last_vol >= float(avg_vol_i) * 2.0:
+            score += 1
+        # 多頭 K 棒
+        df_slice = df_tf.iloc[max(0, i - 1):i + 1]
+        if engine._has_bullish_candle(df_slice):
+            score += 1
+        # MACD 多頭加速
+        try:
+            if macd_full is not None and macd_full.shape[1] >= 3:
+                hist = macd_full.iloc[:, 2]
+                if not pd.isna(hist.iloc[i]) and not pd.isna(hist.iloc[i - 1]):
+                    if float(hist.iloc[i]) > 0 and float(hist.iloc[i]) > float(hist.iloc[i - 1]):
+                        score += 1
+        except Exception:
+            pass
+
+        score = min(score, 5)
+
+        if score < min_score:
+            dbg["low_score"] += 1
+            continue
+
+        dbg["signals"] += 1
+
+        # ── TP/SL（Fib extension）────────────────────────────────
+        df_recent = df_tf.iloc[max(0, i - 60):i + 1].reset_index(drop=True)
+        swing_highs = engine._find_swing_highs(df_recent, left=5, right=5)
+        swing_lows = engine._find_swing_lows(df_recent, left=5, right=5)
+
+        if swing_highs and swing_lows:
+            sh = swing_highs[-1]["price"]
+            sl_swing = swing_lows[-1]["price"]
+            if sh > sl_swing:
+                diff = sh - sl_swing
+                tp1 = sh + diff * 0.272
+                tp2 = sh + diff * 0.618
+            else:
+                tp1 = price * 1.03
+                tp2 = price * 1.05
+        else:
+            tp1 = price * 1.03
+            tp2 = price * 1.05
+
+        sl = resistance - Config.ML_SL_ATR_MULT * atr_val
+        sl = max(sl, price * 0.95)
+        sl = min(sl, price * 0.997)
+
+        if tp1 <= price:
+            tp1 = price * 1.015
+        if tp2 <= tp1:
+            tp2 = tp1 * 1.015
+
+        pos = calc_position(balance, price, sl, tp1, tp2)
+        if not pos:
+            dbg["bad_pos"] += 1
+            continue
+
+        trade = BtTrade(
+            symbol    = symbol,
+            direction = "LONG",
+            entry     = price,
+            sl        = sl,
+            tp1       = tp1,
+            tp2       = tp2,
+            qty       = pos["qty"],
+            qty_tp1   = pos["qty_tp1"],
+            qty_tp2   = pos["qty_tp2"],
+            fib_level = "—",
+            pattern   = "ML_BREAKOUT",
+            score     = score,
+            timeframe = tf,
+            open_bar  = i,
+            open_time = df_tf["time"].iloc[i],
+            strategy  = "momentum_long",
+        )
+
+        df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
+        trade = simulate_trade(trade, df_future, max_bars=timeout_bars)
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        balance += trade.net_pnl
+        trades.append(trade)
+
+        if "SL" in trade.result:
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+
+    print(f" 找到 {len(trades)} 筆訊號")
+    if debug or len(trades) == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"]
+        print(f"\n  ── ML 診斷（為何沒有入場？）──")
+        print(f"  總掃描根數：{scanned}")
+        print(f"  ├─ 沒通過訊號過濾：{dbg['no_sig']} 根  （EMA/ADX/突破/放量）")
+        print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根")
+        print(f"  ├─ 倉位計算失敗   ：{dbg['bad_pos']} 根  （R:R < 1.2 或 SL% 範圍外）")
+        print(f"  └─ 通過全部過濾   ：{dbg['signals']} 根")
+    return trades
+
+
+# ── BD 回測引擎 ──────────────────────────────────────────────────
+class BacktestBDEngine:
+    """
+    Breakdown Short 策略回測引擎：在本地 DataFrame 上逐根偵測
+    支撐突破做空訊號，使用預計算指標（向量化 O(n)）。
+    """
+
+    def _find_swing_highs(self, df: pd.DataFrame,
+                          left: int = 5, right: int = 5) -> list:
+        swings = []
+        for i in range(left, len(df) - right):
+            window = df["high"].iloc[i - left:i + right + 1]
+            if df["high"].iloc[i] == window.max():
+                swings.append({"idx": i, "price": float(df["high"].iloc[i])})
+        return swings
+
+    def _find_swing_lows(self, df: pd.DataFrame,
+                         left: int = 5, right: int = 5) -> list:
+        swings = []
+        for i in range(left, len(df) - right):
+            window = df["low"].iloc[i - left:i + right + 1]
+            if df["low"].iloc[i] == window.min():
+                swings.append({"idx": i, "price": float(df["low"].iloc[i])})
+        return swings
+
+    def _has_bearish_candle(self, df_slice: pd.DataFrame) -> bool:
+        if len(df_slice) < 2:
+            return False
+        c = df_slice.iloc[-1]
+        body = abs(float(c["close"]) - float(c["open"]))
+        total = float(c["high"]) - float(c["low"])
+        if total <= 0:
+            return False
+        # 大陰線
+        if float(c["close"]) < float(c["open"]) and body / total > 0.70:
+            return True
+        # 射擊之星
+        upper = float(c["high"]) - max(float(c["close"]), float(c["open"]))
+        if body > 0 and upper >= body * 2:
+            return True
+        # 空頭吞噬
+        prev = df_slice.iloc[-2]
+        if (float(prev["close"]) > float(prev["open"]) and
+                float(c["close"]) < float(c["open"]) and
+                float(c["open"]) >= float(prev["close"]) and
+                float(c["close"]) <= float(prev["open"])):
+            return True
+        return False
+
+
+# ── BD 主回測邏輯 ───────────────────────────────────────────────
+def run_backtest_bd(client: Client, symbol: str, months: int,
+                    debug: bool = False) -> list:
+    """
+    Breakdown Short 策略回測：使用 BD_TIMEFRAME K 線逐根回放。
+    指標在完整 DataFrame 上一次性計算（向量化 O(n)）。
+    只做空：跌破近 N 根最低點 + 放量 + 空頭結構。
+    """
+    tf = Config.BD_TIMEFRAME
+    print(f"\n[{symbol} BD {tf}] 回測開始")
+
+    df_tf = fetch_klines(client, symbol, tf, months)
+    if len(df_tf) < 100:
+        print(f"  資料不足（{len(df_tf)} 根），跳過")
+        return []
+
+    # ── 一次性預計算所有指標 ─────────────────────────────────────
+    print(f"  預計算指標...", end="", flush=True)
+    ema20_s   = ta.ema(df_tf["close"], length=20)
+    ema50_s   = ta.ema(df_tf["close"], length=50)
+    adx_full  = ta.adx(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    atr_full  = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    macd_full = ta.macd(df_tf["close"])
+    avg_vol_s = df_tf["volume"].rolling(21).mean().shift(1)
+
+    # 滾動最低點（近 BD_LOOKBACK_BARS 根的 low 最小值，不含當根）
+    lookback = Config.BD_LOOKBACK_BARS
+    rolling_low_s = df_tf["low"].rolling(lookback).min().shift(1)
+    print(" 完成")
+
+    warmup       = max(60, lookback + 1)
+    engine       = BacktestBDEngine()
+    trades       = []
+    balance      = INITIAL_BALANCE
+    cooldown_until = -1
+    timeout_bars = Config.BD_TIMEOUT_BARS
+    min_score    = Config.BD_MIN_SCORE
+
+    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 1):
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+
+        # ── 讀取預計算指標值 ──────────────────────────────────────
+        ema20_val = ema20_s.iloc[i] if ema20_s is not None else float("nan")
+        ema50_val = ema50_s.iloc[i] if ema50_s is not None else float("nan")
+        adx_val   = adx_full["ADX_14"].iloc[i] if adx_full is not None else float("nan")
+        atr_val   = atr_full.iloc[i] if atr_full is not None else float("nan")
+        price     = float(df_tf["close"].iloc[i])
+        avg_vol_i = avg_vol_s.iloc[i]
+        support   = rolling_low_s.iloc[i]
+
+        if pd.isna(ema20_val) or pd.isna(ema50_val) or pd.isna(adx_val) or \
+                pd.isna(atr_val) or pd.isna(avg_vol_i) or pd.isna(support):
+            dbg["no_sig"] += 1
+            continue
+
+        ema20_val = float(ema20_val)
+        ema50_val = float(ema50_val)
+        adx_val   = float(adx_val)
+        atr_val   = float(atr_val)
+        support   = float(support)
+
+        # ── 基本條件：空頭結構 ───────────────────────────────────
+        if ema20_val >= ema50_val:
+            dbg["no_sig"] += 1
+            continue
+        if price >= ema50_val:
+            dbg["no_sig"] += 1
+            continue
+        if adx_val < 20:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 突破偵測：收盤跌破近 N 根最低點 ─────────────────────
+        if price >= support:
+            dbg["no_sig"] += 1
+            continue
+        break_pct = (support - price) / support
+        if break_pct < 0.001:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 放量確認 ─────────────────────────────────────────────
+        last_vol = float(df_tf["volume"].iloc[i])
+        if last_vol < float(avg_vol_i) * Config.BD_VOL_MULT:
+            dbg["no_sig"] += 1
+            continue
+
+        # ── 評分 ─────────────────────────────────────────────────
+        score = 1  # 基礎分
+
+        if adx_val > 30:
+            score += 1
+        if float(avg_vol_i) > 0 and last_vol >= float(avg_vol_i) * 2.0:
+            score += 1
+        # 空頭 K 棒
+        df_slice = df_tf.iloc[max(0, i - 1):i + 1]
+        if engine._has_bearish_candle(df_slice):
+            score += 1
+        # MACD 空頭加速
+        try:
+            if macd_full is not None and macd_full.shape[1] >= 3:
+                hist = macd_full.iloc[:, 2]
+                if not pd.isna(hist.iloc[i]) and not pd.isna(hist.iloc[i - 1]):
+                    if float(hist.iloc[i]) < 0 and float(hist.iloc[i]) < float(hist.iloc[i - 1]):
+                        score += 1
+        except Exception:
+            pass
+
+        score = min(score, 5)
+
+        if score < min_score:
+            dbg["low_score"] += 1
+            continue
+
+        dbg["signals"] += 1
+
+        # ── TP/SL（Fib extension）────────────────────────────────
+        # 找最近的 swing pair
+        df_recent = df_tf.iloc[max(0, i - 60):i + 1].reset_index(drop=True)
+        swing_highs = engine._find_swing_highs(df_recent, left=5, right=5)
+        swing_lows = engine._find_swing_lows(df_recent, left=5, right=5)
+
+        if swing_highs and swing_lows:
+            sh = swing_highs[-1]["price"]
+            sl_swing = swing_lows[-1]["price"]
+            if sh > sl_swing:
+                diff = sh - sl_swing
+                tp1 = sl_swing - diff * 0.272
+                tp2 = sl_swing - diff * 0.618
+            else:
+                tp1 = price * 0.97
+                tp2 = price * 0.95
+        else:
+            tp1 = price * 0.97
+            tp2 = price * 0.95
+
+        sl = support + Config.BD_SL_ATR_MULT * atr_val
+        sl = min(sl, price * 1.05)
+        sl = max(sl, price * 1.003)
+
+        if tp1 >= price:
+            tp1 = price * 0.985
+        if tp2 >= tp1:
+            tp2 = tp1 * 0.985
+
+        pos = calc_position(balance, price, sl, tp1, tp2)
+        if not pos:
+            dbg["bad_pos"] += 1
+            continue
+
+        trade = BtTrade(
+            symbol    = symbol,
+            direction = "SHORT",
+            entry     = price,
+            sl        = sl,
+            tp1       = tp1,
+            tp2       = tp2,
+            qty       = pos["qty"],
+            qty_tp1   = pos["qty_tp1"],
+            qty_tp2   = pos["qty_tp2"],
+            fib_level = "—",
+            pattern   = "BD_BREAKDOWN",
+            score     = score,
+            timeframe = tf,
+            open_bar  = i,
+            open_time = df_tf["time"].iloc[i],
+            strategy  = "breakdown_short",
+        )
+
+        df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
+        trade = simulate_trade(trade, df_future, max_bars=timeout_bars)
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        balance += trade.net_pnl
+        trades.append(trade)
+
+        if "SL" in trade.result:
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+
+    print(f" 找到 {len(trades)} 筆訊號")
+    if debug or len(trades) == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"]
+        print(f"\n  ── BD 診斷（為何沒有入場？）──")
+        print(f"  總掃描根數：{scanned}")
+        print(f"  ├─ 沒通過訊號過濾：{dbg['no_sig']} 根  （EMA/ADX/突破/放量）")
+        print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根")
+        print(f"  ├─ 倉位計算失敗   ：{dbg['bad_pos']} 根  （R:R < 1.2 或 SL% 範圍外）")
+        print(f"  └─ 通過全部過濾   ：{dbg['signals']} 根")
+    return trades
+
+
+# ── 倉位計算（脫離 client，使用模擬餘額；同 risk_manager.calc_position）──
 def calc_position(balance: float, entry: float, sl: float,
-                  tp1: float, tp2: float) -> Optional[dict]:
+                  tp1: float, tp2: float, min_rr: float = 1.2,
+                  tp1_split_pct: float = 0.5) -> Optional[dict]:
     sl_pct = abs(entry - sl) / entry
     if sl_pct < 0.003 or sl_pct > 0.12:
         return None
@@ -428,9 +928,12 @@ def calc_position(balance: float, entry: float, sl: float,
         notional = margin * LEVERAGE
         qty = notional / entry
 
-    qty = max(round(qty, 6), 0.000001)
-    qty_tp1 = round(qty * 0.5, 6)
+    qty = max(round(qty, 3), 0.001)             # 同正式：3 位精度
+    qty_tp1 = round(qty * tp1_split_pct, 3)      # 同正式：依 tp1_split_pct 分倉
     qty_tp2 = qty - qty_tp1
+    if qty_tp1 < 0.001:
+        qty_tp1 = qty
+        qty_tp2 = 0.0
 
     # 手續費估算
     fee_open  = qty * entry * TAKER_FEE_RATE
@@ -441,7 +944,7 @@ def calc_position(balance: float, entry: float, sl: float,
     raw_reward = (abs(tp1 - entry) * qty_tp1 + abs(tp2 - entry) * qty_tp2)
     net_rr = (raw_reward - fee_if_tp) / (raw_risk + fee_if_sl) if (raw_risk + fee_if_sl) > 0 else 0
 
-    if net_rr < 1.2:
+    if net_rr < min_rr:
         return None
 
     return {"qty": qty, "qty_tp1": qty_tp1, "qty_tp2": qty_tp2, "margin": margin}
@@ -612,7 +1115,7 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
     trades         = []
     balance        = INITIAL_BALANCE
     cooldown_until = -1
-    timeout_bars   = int(os.getenv("MR_TIMEOUT_BARS", "24"))
+    timeout_bars   = Config.MR_TIMEOUT_BARS
     min_score      = Config.MR_MIN_SCORE
 
     dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
@@ -653,27 +1156,22 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
 
         last_vol  = float(df_tf["volume"].iloc[i])
         vol_ok    = last_vol <= float(avg_vol_i) * Config.MR_VOL_MULT
-        bb_tol    = bb_lower * 0.005
 
+        # ── 入場判斷（同正式：無 BB 容差，反轉 K 棒為硬性條件）──
         side = None
-        has_reversal = False
-        if rsi_val <= Config.MR_RSI_OVERSOLD and price <= bb_lower + bb_tol:
-            side = "LONG"
-            has_reversal = engine._has_reversal(df_tf.iloc[max(0, i - 3):i + 1], "LONG")
-        elif rsi_val >= Config.MR_RSI_OVERBOUGHT and price >= bb_upper - bb_tol:
-            side = "SHORT"
-            has_reversal = engine._has_reversal(df_tf.iloc[max(0, i - 3):i + 1], "SHORT")
+        if rsi_val <= Config.MR_RSI_OVERSOLD and price <= bb_lower:
+            if engine._has_reversal(df_tf.iloc[max(0, i - 3):i + 1], "LONG"):
+                side = "LONG"
+        elif rsi_val >= Config.MR_RSI_OVERBOUGHT and price >= bb_upper:
+            if engine._has_reversal(df_tf.iloc[max(0, i - 3):i + 1], "SHORT"):
+                side = "SHORT"
 
         if side is None:
             dbg["no_sig"] += 1
             continue
 
-        # ── 評分 ─────────────────────────────────────────────────
+        # ── 評分（同正式 _score_signal：base=1, RSI極端+1, BB超出+1, StochRSI+1, MACD背離+1）
         score = 1
-        if has_reversal:
-            score += 1
-        if vol_ok:
-            score += 1
         if (side == "LONG" and rsi_val <= 15) or (side == "SHORT" and rsi_val >= 85):
             score += 1
         bb_width = bb_upper - bb_lower
@@ -713,17 +1211,23 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
         sl_dist = min(Config.MR_SL_PCT * price, atr_val * 1.0)
         sl_dist = max(sl_dist, price * 0.005)
         sl_dist = min(sl_dist, price * 0.03)
+
+        # MR 核心：快進快出。TP1 用 ATR 距離（小目標高勝率）
+        tp1_dist = min(atr_val * 1.2, abs(bb_mid - price)) if abs(bb_mid - price) > atr_val * 0.5 else atr_val * 1.0
+        tp1_dist = max(tp1_dist, price * 0.005)  # 最少 0.5%
+
         if side == "LONG":
-            tp1 = bb_mid if bb_mid > price else price * 1.010
-            tp2 = bb_upper if bb_upper > tp1 else tp1 * 1.015
+            tp1 = price + tp1_dist
+            tp2 = bb_mid if bb_mid > tp1 else tp1 * 1.015
             sl  = price - sl_dist
         else:
-            tp1 = bb_mid if bb_mid < price else price * 0.990
-            tp2 = bb_lower if bb_lower < tp1 else tp1 * 0.985
+            tp1 = price - tp1_dist
+            tp2 = bb_mid if bb_mid < tp1 else tp1 * 0.985
             sl  = price + sl_dist
 
         dbg["signals"] += 1
-        pos = calc_position(balance, price, sl, tp1, tp2)
+        pos = calc_position(balance, price, sl, tp1, tp2,
+                            min_rr=Config.MR_MIN_RR, tp1_split_pct=0.7)
         if not pos:
             dbg["bad_pos"] += 1
             continue
@@ -765,7 +1269,7 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
         print(f"\n  ── MR 診斷（為何沒有入場？）──")
         print(f"  總掃描根數：{scanned}")
         print(f"  ├─ 沒通過訊號過濾：{dbg['no_sig']} 根  （ADX/RSI/BB）")
-        print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根  （需要 vol_ok 或 reversal 其中一個）")
+        print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根")
         print(f"  ├─ 倉位計算失敗   ：{dbg['bad_pos']} 根  （R:R < 1.2 或 SL% 範圍外）")
         print(f"  └─ 通過全部過濾   ：{dbg['signals']} 根")
     return trades
@@ -897,10 +1401,10 @@ def run_backtest(client: Client, symbol: str, timeframe: str,
 
     # 建立回測引擎（使用可調參數）
     engine = BacktestSignalEngine(
-        fib_tol       = BT_FIB_TOL,
-        vol_mult      = BT_VOL_MULT,
-        skip_vol_rise = BT_SKIP_VOL_RISE,
-        skip_bad_fib  = BT_SKIP_BAD_FIB,
+        fib_tol       = Config.NKF_FIB_TOL,
+        vol_mult      = Config.NKF_VOL_RATIO,
+        skip_vol_rise = not Config.NKF_VOL_RISING,
+        skip_bad_fib  = False,   # 同正式：不跳過任何 Fib 位
     )
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
@@ -1129,8 +1633,8 @@ def main():
     parser.add_argument("--skip-vol-rise",  action="store_true", default=BT_SKIP_VOL_RISE,  help="不要求當根成交量>前根")
     parser.add_argument("--no-skip-bad-fib",action="store_true",                   help="包含低R:R的0.236/0.786位")
     parser.add_argument("--strategy",       default="naked_k_fib",
-                        choices=["naked_k_fib", "mean_reversion", "all"],
-                        help="回測策略：naked_k_fib / mean_reversion / all")
+                        choices=["naked_k_fib", "mean_reversion", "breakdown_short", "momentum_long", "all"],
+                        help="回測策略：naked_k_fib / mean_reversion / breakdown_short / momentum_long / all")
     parser.add_argument("--max-bars",       type=int,   default=48,
                         help="NKF 最大持倉根數（超時平倉，預設 48）")
     parser.add_argument("--testnet",        action="store_true",
@@ -1168,6 +1672,8 @@ def main():
 
     run_nkf = args.strategy in ("naked_k_fib", "all")
     run_mr  = args.strategy in ("mean_reversion", "all")
+    run_bd  = args.strategy in ("breakdown_short", "all")
+    run_ml  = args.strategy in ("momentum_long", "all")
 
     # ── 掃描模式（優先）──────────────────────────────────────────
     if args.scan:
@@ -1182,6 +1688,10 @@ def main():
         print(f"  [NKF] 時間框架：{timeframes}  超時：{args.max_bars} 根")
     if run_mr:
         print(f"  [MR]  時間框架：{Config.MR_TIMEFRAME}  超時：{os.getenv('MR_TIMEOUT_BARS', '24')} 根")
+    if run_bd:
+        print(f"  [BD]  時間框架：{Config.BD_TIMEFRAME}  超時：{Config.BD_TIMEOUT_BARS} 根  做空突破策略")
+    if run_ml:
+        print(f"  [ML]  時間框架：{Config.ML_TIMEFRAME}  超時：{Config.ML_TIMEOUT_BARS} 根  做多突破策略")
     print(f"  回測期間：最近 {args.months} 個月")
     print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每單風險：{RISK_PER_TRADE*100:.1f}%")
     if run_nkf:
@@ -1190,6 +1700,8 @@ def main():
 
     all_nkf = []
     all_mr  = []
+    all_bd  = []
+    all_ml  = []
 
     # ── NKF 回測 ──────────────────────────────────────────────────
     if run_nkf:
@@ -1214,11 +1726,28 @@ def main():
                     args.balance, label="MR")
         all_mr.extend(trades_mr)
 
+    # ── BD 回測 ───────────────────────────────────────────────────
+    if run_bd:
+        trades_bd = run_backtest_bd(client, args.symbol, args.months,
+                                    debug=args.debug_indicators)
+        print_stats(trades_bd, Config.BD_TIMEFRAME, args.symbol,
+                    args.balance, label="BD")
+        all_bd.extend(trades_bd)
+
+    # ── ML 回測 ───────────────────────────────────────────────────
+    if run_ml:
+        trades_ml = run_backtest_ml(client, args.symbol, args.months,
+                                    debug=args.debug_indicators)
+        print_stats(trades_ml, Config.ML_TIMEFRAME, args.symbol,
+                    args.balance, label="ML")
+        all_ml.extend(trades_ml)
+
     # ── 合併統計（only when running all）─────────────────────────
-    if args.strategy == "all" and (all_nkf or all_mr):
-        combined = all_nkf + all_mr
+    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml):
+        combined = all_nkf + all_mr + all_bd + all_ml
         combined.sort(key=lambda t: t.open_time or datetime.min)
-        print_stats(combined, "ALL", args.symbol, args.balance, label="NKF+MR 合併")
+        strats = "+".join(s for s, flag in [("NKF", bool(all_nkf)), ("MR", bool(all_mr)), ("BD", bool(all_bd)), ("ML", bool(all_ml))] if flag)
+        print_stats(combined, "ALL", args.symbol, args.balance, label=f"{strats} 合併")
 
 
 if __name__ == "__main__":

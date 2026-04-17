@@ -207,25 +207,34 @@ class MeanReversionStrategy(BaseStrategy):
         last_vol = float(df_a["volume"].iloc[-1])
         vol_ok = last_vol <= avg_vol * Config.MR_VOL_MULT
 
-        # ADX 過濾（MR 只在非趨勢盤運作；與 NKF 的 20-45 區間分開）
-        adx_ok = adx_val < 20
+        # ADX 過濾（MR 只在非趨勢盤運作；ADX < 25 與 NKF 的 15-45 區間部分重疊但不衝突）
+        adx_ok = adx_val < 25
 
         side = None
 
-        # ── 做多判斷 ─────────────────────────────────────────────
+        # ── 做多判斷 ─────────────────────────────
         if (rsi_val <= Config.MR_RSI_OVERSOLD and
                 price <= bb_lower and adx_ok):
-            if vol_ok and self._has_reversal_candle(df_a, "LONG"):
+            if self._has_reversal_candle(df_a, "LONG"):
                 side = "LONG"
 
-        # ── 做空判斷 ─────────────────────────────────────────────
+        # ── 做空判斷 ─────────────────────────────
         elif (rsi_val >= Config.MR_RSI_OVERBOUGHT and
               price >= bb_upper and adx_ok):
-            if vol_ok and self._has_reversal_candle(df_a, "SHORT"):
+            if self._has_reversal_candle(df_a, "SHORT"):
                 side = "SHORT"
 
         if side is None:
             return None
+
+        # ── BTC 週線多頭過濾（MR LONG 不逆大盤）────────────────
+        if side == "LONG" and self._market_ctx:
+            btc_bull = self._market_ctx.btc_weekly_bullish()
+            if btc_bull is False:
+                log.debug(
+                    f"[{symbol}] MR LONG 被 BTC 週線空頭過濾"
+                )
+                return None
 
         # ── 訊號評分 ─────────────────────────────────────────────
         score = self._score_signal(df_a, side, rsi_val, bb_upper,
@@ -392,10 +401,11 @@ class MeanReversionStrategy(BaseStrategy):
                     bb_mid: float, atr_val: float,
                     Config) -> tuple[float, float, float]:
         """
-        使用 BB 結構作為 TP 目標：
-          TP1 = BB 中軌（高勝率的回歸目標，~60%-70% 勝率）
-          TP2 = BB 對側（低機率高報酬，全幅反轉）
-        SL  = min(MR_SL_PCT × entry, 1.0 × ATR)（貼近波動性）
+        MR 核心：快進快出。
+          TP1 = min(1.2×ATR, 到BB中軌距離)（短距高勝率）
+          TP2 = BB 中軌（回歸目標）
+        SL  = min(MR_SL_PCT × entry, 1.0 × ATR)
+        分倉 70/30：TP1 取 70% 快出鎖利。
         """
         # 止損距離：取 MR_SL_PCT 與 1×ATR 較小者（保護資金）
         sl_dist = min(Config.MR_SL_PCT * entry, atr_val * 1.0)
@@ -403,22 +413,18 @@ class MeanReversionStrategy(BaseStrategy):
         sl_dist = max(sl_dist, entry * 0.005)
         sl_dist = min(sl_dist, entry * 0.03)
 
+        # TP1：ATR-based 短目標（高勝率）
+        mid_dist = abs(bb_mid - entry)
+        tp1_dist = min(atr_val * 1.2, mid_dist) if mid_dist > atr_val * 0.5 else atr_val * 1.0
+        tp1_dist = max(tp1_dist, entry * 0.005)  # 最少 0.5%
+
         if side == "LONG":
-            tp1 = bb_mid            # 回歸中軌
-            tp2 = bb_upper          # 搏對側反轉
+            tp1 = entry + tp1_dist
+            tp2 = bb_mid if bb_mid > tp1 else tp1 * 1.015
             sl  = entry - sl_dist
-            # 合理性保護（BB 異常時 fallback）
-            if tp1 <= entry:
-                tp1 = entry * 1.010
-            if tp2 <= tp1:
-                tp2 = tp1 * 1.015
         else:
-            tp1 = bb_mid
-            tp2 = bb_lower
+            tp1 = entry - tp1_dist
+            tp2 = bb_mid if bb_mid < tp1 else tp1 * 0.985
             sl  = entry + sl_dist
-            if tp1 >= entry:
-                tp1 = entry * 0.990
-            if tp2 >= tp1:
-                tp2 = tp1 * 0.985
 
         return tp1, tp2, sl

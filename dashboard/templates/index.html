@@ -297,9 +297,19 @@
       color: #b794f4
     }
 
+    .strategy-bd {
+      background: #3a1a1a;
+      color: #fc8181
+    }
+
+    .strategy-ml {
+      background: #1a3a1a;
+      color: #68d391
+    }
+
     .strategy-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
       gap: 16px;
       margin-bottom: 20px
     }
@@ -332,6 +342,12 @@
     .stat-val {
       color: #e2e8f0;
       font-weight: 500
+    }
+
+    @media(max-width:1024px) {
+      .strategy-grid {
+        grid-template-columns: 1fr 1fr
+      }
     }
 
     @media(max-width:768px) {
@@ -451,6 +467,28 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="mr-avg-pnl" class="stat-val">—</span></div>
       </div>
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-bd">BD</span>&nbsp; Breakdown Short 統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="bd-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="bd-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="bd-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="bd-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="bd-return-pct"
+            class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="bd-avg-pnl" class="stat-val">—</span></div>
+      </div>
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-ml">ML</span>&nbsp; Momentum Long 統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="ml-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="ml-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="ml-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="ml-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="ml-return-pct"
+            class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="ml-avg-pnl" class="stat-val">—</span></div>
+      </div>
 
     </div>
 
@@ -482,6 +520,8 @@
               <option value="all">全部策略</option>
               <option value="naked_k_fib">裸K + Fib</option>
               <option value="mean_reversion">均值回歸 (MR)</option>
+              <option value="breakdown_short">Breakdown Short (BD)</option>
+              <option value="momentum_long">Momentum Long (ML)</option>
             </select>
           </div>
           <button type="button" class="btn btn-primary" onclick="switchStrategy()">套用</button>
@@ -555,8 +595,9 @@
                 <td>{{ t.symbol }}</td>
                 <td class="{% if t.direction=='LONG' %}dir-long{% else %}dir-short{% endif %}">{{ t.direction }}</td>
                 <td><span
-                    class="strategy-badge {% if t.strategy == 'mean_reversion' %}strategy-mr{% else %}strategy-nkf{% endif %}">{{
-                    'MR' if t.strategy == 'mean_reversion' else 'NKF' }}</span></td>
+                    class="strategy-badge {% if t.strategy == 'mean_reversion' %}strategy-mr{% elif t.strategy == 'breakdown_short' %}strategy-bd{% elif t.strategy == 'momentum_long' %}strategy-ml{% else %}strategy-nkf{% endif %}">{{
+                    'MR' if t.strategy == 'mean_reversion' else ('BD' if t.strategy == 'breakdown_short' else ('ML' if
+                    t.strategy == 'momentum_long' else 'NKF')) }}</span></td>
                 <td>{{ t.fib_level }}</td>
                 <td style="font-size:11px">{{ t.pattern }}</td>
                 {% set margin = t.margin if t.margin and t.margin > 0 else (t.entry * t.qty / 3 if t.entry and t.qty
@@ -605,6 +646,8 @@
     // ── 工具函數 ──────────────────────────────────────────────
     function fmtStrategy(s) {
       if (s === 'mean_reversion') return '<span class="strategy-badge strategy-mr">MR</span>';
+      if (s === 'breakdown_short') return '<span class="strategy-badge strategy-bd">BD</span>';
+      if (s === 'momentum_long') return '<span class="strategy-badge strategy-ml">ML</span>';
       return '<span class="strategy-badge strategy-nkf">NKF</span>';
     }
     function fmtUsdt(v) {
@@ -796,6 +839,8 @@
 
         fillStats('nkf', data.naked_k_fib);
         fillStats('mr', data.mean_reversion);
+        fillStats('bd', data.breakdown_short);
+        fillStats('ml', data.momentum_long);
 
         // 合計報酬率顯示在頂部 KPI 欄
         const retKpi = document.getElementById('kpi-return-pct');

@@ -136,3 +136,40 @@ class MarketContext:
         if corr is None:
             return False
         return abs(corr) >= threshold
+
+    # ── Open Interest 異常偵測 ───────────────────────────────────
+    def oi_change_pct(self, symbol: str) -> Optional[float]:
+        """
+        計算 symbol 的 OI 24h 變化百分比。
+        使用幣安 futures openInterestHist API（5m 粒度，取最近 288 根 = 24h）。
+        回傳百分比（如 25.0 代表 +25%），失敗回傳 None。
+        """
+        key = f"oi_chg_{symbol}"
+        cached = self._get_cached(key)
+        if cached is not None:
+            return cached
+        try:
+            # openInterestHist 需要 period 參數
+            hist = self.client.futures_open_interest_hist(
+                symbol=symbol, period="5m", limit=288
+            )
+            if not hist or len(hist) < 10:
+                return None
+            oi_start = float(hist[0]["sumOpenInterest"])
+            oi_end   = float(hist[-1]["sumOpenInterest"])
+            if oi_start <= 0:
+                return None
+            change_pct = (oi_end - oi_start) / oi_start * 100
+            self._set_cached(key, change_pct)
+            return change_pct
+        except Exception as e:
+            log.debug(f"{symbol} OI 查詢失敗: {e}")
+            return None
+
+    def is_oi_anomaly(self, symbol: str,
+                      threshold_pct: float = 20.0) -> bool:
+        """OI 24h 變動 > threshold_pct% → 視為異常（大戶佈局，技術面容易失效）"""
+        change = self.oi_change_pct(symbol)
+        if change is None:
+            return False  # 查詢失敗不阻擋
+        return abs(change) > threshold_pct

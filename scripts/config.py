@@ -17,8 +17,8 @@ class Config:
     # ── 通用風控 ─────────────────────────────────────────────────
     MAX_LEVERAGE      = int(os.getenv("MAX_LEVERAGE", 3))      # 固定 3x
     RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE", 0.05))
-    MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", 3))     # 小資金適用
-    MAX_NOTIONAL_PCT  = float(os.getenv("MAX_NOTIONAL_PCT", 0.20))
+    MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", 6))     # 同時最多 6 倉
+    MAX_NOTIONAL_PCT  = float(os.getenv("MAX_NOTIONAL_PCT", round(1/6, 4)))  # 每筆保證金 ≈ 16.67%
     COOLDOWN_BARS     = int(os.getenv("COOLDOWN_BARS", 6))
     MAX_DAILY_LOSS    = float(os.getenv("MAX_DAILY_LOSS", 0.08))
 
@@ -53,7 +53,7 @@ class Config:
     NKF_VOL_RISING       = os.getenv("SIGNAL_VOL_RISING", "true").lower() == "true"
     NKF_FIB_MAX_TOUCHES  = int(os.getenv("SIGNAL_FIB_MAX_TOUCHES", 1))
     NKF_FRACTAL_LR       = int(os.getenv("SIGNAL_FRACTAL_LR", 5))
-    NKF_TIMEFRAME        = os.getenv("NKF_TIMEFRAME", "15m")
+    NKF_TIMEFRAME        = os.getenv("NKF_TIMEFRAME", "1h")
 
     # ── 方案 A：RSI 均值回歸參數 ─────────────────────────────────
     MR_RSI_PERIOD    = int(os.getenv("MR_RSI_PERIOD", 14))
@@ -65,5 +65,38 @@ class Config:
     MR_TP_PCT        = float(os.getenv("MR_TP_PCT", 0.05))    # 5% 止盈
     MR_SL_PCT        = float(os.getenv("MR_SL_PCT", 0.025))   # 2.5% 止損
     MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 3))
-    MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 0.9))   # 均值回歸：縮量（核心語意）
+    MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 1.2))   # 均值回歸：不要求極端縮量，允許小幅放量
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
+
+    # ── 追蹤止盈（Trailing Stop）────────────────────────────────
+    TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", 1.5))  # 追蹤距離 = N × ATR
+    TRAILING_ACTIVATE_AFTER_TP1 = os.getenv(
+        "TRAILING_ACTIVATE_AFTER_TP1", "true"
+    ).lower() == "true"  # TP1 成交後自動啟用追蹤止盈
+
+    # ── Breakdown Short 策略（熊市做空）──────────────────────────
+    BD_TIMEFRAME     = os.getenv("BD_TIMEFRAME", "1h")
+    BD_ADX_MIN       = float(os.getenv("BD_ADX_MIN", 25))
+    BD_ADX_MAX       = float(os.getenv("BD_ADX_MAX", 50))
+    BD_LOOKBACK_BARS = int(os.getenv("BD_LOOKBACK_BARS", 20))    # 支撐突破回看根數
+    BD_VOL_MULT      = float(os.getenv("BD_VOL_MULT", 1.3))     # 突破量確認倍數
+    BD_SL_ATR_MULT   = float(os.getenv("BD_SL_ATR_MULT", 1.0))  # SL = 突破點 + N×ATR
+    BD_MIN_SCORE     = int(os.getenv("BD_MIN_SCORE", 3))         # 最低訊號評分
+    BD_TIMEOUT_BARS  = int(os.getenv("BD_TIMEOUT_BARS", 48))     # 超時平倉根數
+    BD_MIN_RR        = float(os.getenv("BD_MIN_RR", 1.2))        # 最低 R:R
+    BD_MAX_POSITIONS = int(os.getenv("BD_MAX_POSITIONS", 2))      # 最大持倉數
+
+    # ── Momentum Breakout Long 策略（牛市做多）───────────────────
+    ML_TIMEFRAME     = os.getenv("ML_TIMEFRAME", "1h")
+    ML_ADX_MIN       = float(os.getenv("ML_ADX_MIN", 25))
+    ML_ADX_MAX       = float(os.getenv("ML_ADX_MAX", 50))
+    ML_LOOKBACK_BARS = int(os.getenv("ML_LOOKBACK_BARS", 20))    # 阻力突破回看根數
+    ML_VOL_MULT      = float(os.getenv("ML_VOL_MULT", 1.3))     # 突破量確認倍數
+    ML_SL_ATR_MULT   = float(os.getenv("ML_SL_ATR_MULT", 1.0))  # SL = 突破點 - N×ATR
+    ML_MIN_SCORE     = int(os.getenv("ML_MIN_SCORE", 3))         # 最低訊號評分
+    ML_TIMEOUT_BARS  = int(os.getenv("ML_TIMEOUT_BARS", 48))     # 超時平倉根數
+    ML_MIN_RR        = float(os.getenv("ML_MIN_RR", 1.2))        # 最低 R:R
+    ML_MAX_POSITIONS = int(os.getenv("ML_MAX_POSITIONS", 2))      # 最大持倉數
+
+    # ── OI 異常過濾 ──────────────────────────────────────────────
+    OI_CHANGE_MAX = float(os.getenv("OI_CHANGE_MAX", 20.0))      # OI 24h 變動 > N% 視為異常

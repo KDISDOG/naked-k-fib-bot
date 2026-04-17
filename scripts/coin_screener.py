@@ -39,6 +39,7 @@ class CoinScreener:
         self.adx_max           = Config.SCREEN_ADX_MAX
         self.atr_max_long      = Config.SCREEN_ATR_MAX_LONG
         self.atr_max_short     = Config.SCREEN_ATR_MAX_SHORT
+        self.oi_change_max     = Config.OI_CHANGE_MAX
 
     # ── 取得 K 線 ────────────────────────────────────────────────
 
@@ -412,6 +413,13 @@ class CoinScreener:
             # 速率限制：每 5 個 symbol 休息 0.5 秒，避免觸發幣安 rate limit
             if i > 0 and i % 5 == 0:
                 time.sleep(0.5)
+
+            # OI 異常過濾：24h OI 變動 > 閾值 → 跳過（大戶佈局，技術面易失效）
+            if self.market_ctx:
+                if self.market_ctx.is_oi_anomaly(sym, self.oi_change_max):
+                    oi_chg = self.market_ctx.oi_change_pct(sym)
+                    log.debug(f"{sym} OI 24h 變動 {oi_chg:.1f}% > {self.oi_change_max}%，跳過")
+                    continue
 
             score, details = self._score(sym)
             if score >= min_score:

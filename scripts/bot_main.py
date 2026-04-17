@@ -38,6 +38,8 @@ from position_syncer import PositionSyncer
 from market_context import MarketContext
 from strategies.naked_k_fib import NakedKFibStrategy
 from strategies.mean_reversion import MeanReversionStrategy
+from strategies.breakdown_short import BreakdownShortStrategy
+from strategies.momentum_long import MomentumLongStrategy
 from notifier import notify
 
 # ── 設定 ───────────────────────────────────────────────────────
@@ -72,6 +74,8 @@ _nkf_strategy = NakedKFibStrategy(
     coin_screener=screener, signal_engine=signal_e
 )
 _mr_strategy = MeanReversionStrategy(client, market_ctx=market_ctx)
+_bd_strategy = BreakdownShortStrategy(client, market_ctx=market_ctx)
+_ml_strategy = MomentumLongStrategy(client, market_ctx=market_ctx)
 
 # 全局狀態
 candidate_symbols: dict[str, list[str]] = {}   # strategy_name → symbols
@@ -85,8 +89,10 @@ _active_strategy_override: str | None = None
 def load_strategies() -> list:
     active = _active_strategy_override or Config.ACTIVE_STRATEGY
     all_strategies = {
-        "naked_k_fib":    _nkf_strategy,
-        "mean_reversion": _mr_strategy,
+        "naked_k_fib":      _nkf_strategy,
+        "mean_reversion":   _mr_strategy,
+        "breakdown_short":  _bd_strategy,
+        "momentum_long":    _ml_strategy,
     }
     if active == "all":
         return list(all_strategies.values())
@@ -126,40 +132,67 @@ def scan_coins():
             log.error(f"[{strategy.name}] 選幣失敗: {e}")
 
 
-# ── 超時平倉（均值回歸）─────────────────────────────────────────
-def check_mr_timeout():
+# ── 超時平倉（均值回歸 + Breakdown Short）────────────────────────
+def check_strategy_timeout():
     """
-    均值回歸超時機制（以時間計算，不受排程頻率影響）：
-    持倉時間 >= MR_TIMEOUT_BARS × MR timeframe → 強制市價平倉
+    策略超時機制（以時間計算，不受排程頻率影響）：
+    持倉時間 >= TIMEOUT_BARS × timeframe → 強制市價平倉
+    支援：mean_reversion, breakdown_short
     """
     tf_map = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
               "1h": 60, "2h": 120, "4h": 240}
-    tf_min = tf_map.get(Config.MR_TIMEFRAME, 15)
-    timeout_sec = Config.MR_TIMEOUT_BARS * tf_min * 60
+
+    # 各策略的超時配置
+    timeout_configs = [
+        {
+            "strategy": "mean_reversion",
+            "timeframe": Config.MR_TIMEFRAME,
+            "timeout_bars": Config.MR_TIMEOUT_BARS,
+        },
+        {
+            "strategy": "breakdown_short",
+            "timeframe": Config.BD_TIMEFRAME,
+            "timeout_bars": Config.BD_TIMEOUT_BARS,
+        },
+        {
+            "strategy": "momentum_long",
+            "timeframe": Config.ML_TIMEFRAME,
+            "timeout_bars": Config.ML_TIMEOUT_BARS,
+        },
+    ]
+
     now = datetime.now()
 
-    mr_trades = db.get_open_by_strategy("mean_reversion")
-    for t in mr_trades:
-        if t["status"] not in ("open", "partial"):
-            continue
-        if not t.get("opened_at"):
-            continue
-        try:
-            opened = datetime.fromisoformat(t["opened_at"])
-        except Exception:
-            continue
-        elapsed = (now - opened).total_seconds()
-        if elapsed >= timeout_sec:
-            bars = int(elapsed / 60 / tf_min)
-            log.warning(
-                f"[{t['symbol']}] MR 超時平倉（持倉 {bars} 根 "
-                f"{Config.MR_TIMEFRAME} K 棒）"
-            )
+    for cfg in timeout_configs:
+        tf_min = tf_map.get(cfg["timeframe"], 15)
+        timeout_sec = cfg["timeout_bars"] * tf_min * 60
+        trades = db.get_open_by_strategy(cfg["strategy"])
+
+        for t in trades:
+            if t["status"] not in ("open", "partial"):
+                continue
+            if not t.get("opened_at"):
+                continue
             try:
-                executor.close_position_market(t["symbol"], t["id"],
-                                              close_reason="TIMEOUT")
-            except Exception as e:
-                log.error(f"[{t['symbol']}] MR 超時平倉失敗: {e}")
+                opened = datetime.fromisoformat(t["opened_at"])
+            except Exception:
+                continue
+            elapsed = (now - opened).total_seconds()
+            if elapsed >= timeout_sec:
+                bars = int(elapsed / 60 / tf_min)
+                log.warning(
+                    f"[{t['symbol']}] {cfg['strategy']} 超時平倉"
+                    f"（持倉 {bars} 根 {cfg['timeframe']} K 棒）"
+                )
+                try:
+                    executor.close_position_market(
+                        t["symbol"], t["id"], close_reason="TIMEOUT"
+                    )
+                except Exception as e:
+                    log.error(
+                        f"[{t['symbol']}] {cfg['strategy']} "
+                        f"超時平倉失敗: {e}"
+                    )
 
 
 # ── 訊號檢查任務（每 SIGNAL_CHECK_MIN 分鐘）────────────────────
@@ -184,19 +217,21 @@ def check_signals():
         log.info(f"已達最大倉位數 {Config.MAX_POSITIONS}，等待空位")
         return
 
-    # 均值回歸超時檢查（每次訊號檢查時順便執行）
+    # 策略超時檢查（MR + BD，每次訊號檢查時順便執行）
     try:
-        check_mr_timeout()
+        check_strategy_timeout()
     except Exception as e:
-        log.error(f"MR 超時檢查失敗: {e}")
+        log.error(f"策略超時檢查失敗: {e}")
 
     for strategy in load_strategies():
         symbols = candidate_symbols.get(strategy.name, [])
-        min_score = (
-            Config.NKF_MIN_SIGNAL_SCORE
-            if strategy.name == "naked_k_fib"
-            else Config.MR_MIN_SCORE
-        )
+        min_score_map = {
+            "naked_k_fib":     Config.NKF_MIN_SIGNAL_SCORE,
+            "mean_reversion":  Config.MR_MIN_SCORE,
+            "breakdown_short": Config.BD_MIN_SCORE,
+            "momentum_long":   Config.ML_MIN_SCORE,
+        }
+        min_score = min_score_map.get(strategy.name, 3)
 
         for symbol in symbols:
             if open_count >= Config.MAX_POSITIONS:
@@ -235,10 +270,18 @@ def check_signals():
                 continue
 
             # per-strategy 的 R:R 門檻
-            min_rr = (
-                Config.MR_MIN_RR if strategy.name == "mean_reversion"
-                else Config.NKF_MIN_RR
-            )
+            min_rr_map = {
+                "naked_k_fib":     Config.NKF_MIN_RR,
+                "mean_reversion":  Config.MR_MIN_RR,
+                "breakdown_short": Config.BD_MIN_RR,
+                "momentum_long":   Config.ML_MIN_RR,
+            }
+            min_rr = min_rr_map.get(strategy.name, 1.2)
+            # MR 用 70/30 分倉（快出鎖利），其他策略 50/50
+            tp1_split_map = {
+                "mean_reversion": 0.7,
+            }
+            tp1_split = tp1_split_map.get(strategy.name, 0.5)
             # 風控計算
             pos = risk.calc_position(
                 entry     = sig.entry_price,
@@ -246,6 +289,7 @@ def check_signals():
                 tp1       = sig.take_profit_1,
                 tp2       = sig.take_profit_2,
                 min_rr    = min_rr,
+                tp1_split_pct = tp1_split,
             )
             if not pos:
                 log.warning(f"[{symbol}] 風控拒絕")
@@ -381,7 +425,8 @@ def main():
     parser.add_argument("--skip-wait", action="store_true",
                         help="跳過等待 K 棒收盤")
     parser.add_argument("--strategy",
-                        choices=["naked_k_fib", "mean_reversion", "all"],
+                        choices=["naked_k_fib", "mean_reversion",
+                                 "breakdown_short", "momentum_long", "all"],
                         default=None,
                         help="覆蓋 .env 的 ACTIVE_STRATEGY")
     args = parser.parse_args()

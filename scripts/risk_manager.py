@@ -40,7 +40,7 @@ class RiskManager:
             os.getenv("MAX_SAME_DIR_HIGH_CORR", 2)
         )
         self.high_corr_threshold = float(
-            os.getenv("HIGH_CORR_THRESHOLD", 0.8)
+            os.getenv("HIGH_CORR_THRESHOLD", 0.6)
         )
 
     # ── 相關性控管 ───────────────────────────────────────────────
@@ -140,10 +140,11 @@ class RiskManager:
         tp1:       float,
         tp2:       float,
         min_rr:    float = 1.2,
+        tp1_split_pct: float = 0.5,
     ) -> Optional[dict]:
         """
         計算倉位大小（考慮手續費）
-        分批止盈：50% qty 在 TP1，50% 在 TP2
+        分批止盈：tp1_split_pct 在 TP1，其余在 TP2
 
         回傳:
             {
@@ -193,8 +194,8 @@ class RiskManager:
         # 精度處理
         qty = max(round(qty, 3), 0.001)
 
-        # 分批止盈：50/50
-        qty_tp1 = round(qty * 0.5, 3)
+        # 分批止盈：依 tp1_split_pct 分配
+        qty_tp1 = round(qty * tp1_split_pct, 3)
         qty_tp2 = qty - qty_tp1
         # 確保最小下單量
         if qty_tp1 < 0.001:

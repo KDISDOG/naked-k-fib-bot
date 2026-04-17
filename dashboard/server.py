@@ -226,9 +226,11 @@ async def api_strategy_stats(strategy_name: str):
 async def api_all_strategy_stats():
     """一次取得所有策略的統計"""
     return {
-        "naked_k_fib":    db.get_stats_by_strategy("naked_k_fib"),
-        "mean_reversion": db.get_stats_by_strategy("mean_reversion"),
-        "combined":       db.get_stats(),
+        "naked_k_fib":     db.get_stats_by_strategy("naked_k_fib"),
+        "mean_reversion":  db.get_stats_by_strategy("mean_reversion"),
+        "breakdown_short": db.get_stats_by_strategy("breakdown_short"),
+        "momentum_long":   db.get_stats_by_strategy("momentum_long"),
+        "combined":        db.get_stats(),
     }
 
 @app.post("/api/switch_strategy")
@@ -238,7 +240,7 @@ async def switch_strategy(strategy: str = Form(...)):
     已開倉的單不受影響，走完原策略邏輯。
     有效值：naked_k_fib / mean_reversion / all
     """
-    valid = {"naked_k_fib", "mean_reversion", "all"}
+    valid = {"naked_k_fib", "mean_reversion", "breakdown_short", "momentum_long", "all"}
     if strategy not in valid:
         return JSONResponse(
             {"status": "error", "message": f"無效策略：{strategy}"},

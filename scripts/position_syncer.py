@@ -17,7 +17,9 @@ Position Syncer — 倉位同步模組
 """
 import logging
 from typing import Optional
+import pandas_ta as ta
 from binance.client import Client
+from config import Config
 from risk_manager import RiskManager
 from api_retry import retry_api
 from notifier import notify
@@ -127,6 +129,20 @@ class PositionSyncer:
                         direction   = direction,
                     )
 
+                # TP1 後自動啟用追蹤止盈（所有策略通用）
+                if Config.TRAILING_ACTIVATE_AFTER_TP1 and \
+                        not trade.get("use_trailing"):
+                    atr_val = self._get_current_atr(
+                        symbol, trade.get("timeframe", "15m")
+                    )
+                    if atr_val and atr_val > 0:
+                        self.db.enable_trailing(trade_id, atr_val)
+                        log.info(
+                            f"[{symbol}] TP1 後啟用追蹤止盈"
+                            f"（ATR={atr_val:.4f}，"
+                            f"距離={Config.TRAILING_ATR_MULT}×ATR）"
+                        )
+
             # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
             if trade.get("use_trailing"):
                 self._update_trailing(trade)
@@ -134,11 +150,13 @@ class PositionSyncer:
     # ── 追蹤止盈邏輯 ─────────────────────────────────────────────
     def _update_trailing(self, trade: dict):
         """
-        追蹤止盈：
-          1. 取當前價格
-          2. 更新 LONG 最高價 / SHORT 最低價
-          3. 若已達 1R 獲利 → 把止損推進到「最新極值 - 1.5×ATR」（LONG）
-             或「最新極值 + 1.5×ATR」（SHORT）
+        追蹤止盈（v5.2 增強版）：
+          1. 取當前價格，更新 LONG 最高價 / SHORT 最低價
+          2. 啟動條件：
+             - TP1 已成交（status=partial）→ 立即啟動（不需等 1R）
+             - 尚未 TP1 → 需達 1R 獲利才啟動
+          3. 追蹤距離 = TRAILING_ATR_MULT × ATR（預設 1.5×ATR）
+          4. 止損只能朝獲利方向推進，不能後退
         """
         symbol = trade["symbol"]
         trade_id = trade["id"]
@@ -150,7 +168,9 @@ class PositionSyncer:
             return
 
         try:
-            ticker = self.client.futures_symbol_ticker(symbol=symbol)
+            ticker = retry_api(
+                self.client.futures_symbol_ticker, symbol=symbol
+            )
             price = float(ticker["price"])
         except Exception:
             return
@@ -158,30 +178,69 @@ class PositionSyncer:
         # 更新高/低點
         self.db.update_trailing_price(trade_id, price)
 
-        # 檢查是否已達 1R 獲利
-        risk = abs(entry - sl)
-        if risk <= 0:
-            return
-        profit = (price - entry) if direction == "LONG" else (entry - price)
-        if profit < risk:   # 未達 1R，暫不啟動追蹤
-            return
+        # 啟動門檻：TP1 已成交 → 立即追蹤；否則需 1R 獲利
+        is_partial = trade.get("status") == "partial"
+        if not is_partial:
+            risk = abs(entry - sl)
+            if risk <= 0:
+                return
+            profit = (price - entry) if direction == "LONG" else (entry - price)
+            if profit < risk:
+                return
 
-        # 從 DB 重讀最新極值（剛剛 update_trailing_price 可能有更新）
+        # 從 DB 重讀最新極值
         latest = self.db.get_trade_by_id(trade_id)
         if not latest:
             return
 
+        trail_dist = Config.TRAILING_ATR_MULT * atr
+
         if direction == "LONG":
             peak = latest.get("highest_price") or price
-            new_sl = peak - 1.5 * atr
-            # 止損只能往上推，不能低於入場價
+            new_sl = peak - trail_dist
+            # 止損只能往上推，且不低於入場價
             if new_sl > entry and (sl is None or new_sl > sl):
-                self.executor.move_trailing_sl(symbol, trade_id, new_sl, direction)
+                self.executor.move_trailing_sl(
+                    symbol, trade_id, new_sl, direction
+                )
+                log.debug(
+                    f"[{symbol}] LONG trailing: peak={peak:.4f} "
+                    f"new_sl={new_sl:.4f} (dist={trail_dist:.4f})"
+                )
         else:
             trough = latest.get("lowest_price") or price
-            new_sl = trough + 1.5 * atr
+            new_sl = trough + trail_dist
             if new_sl < entry and (sl is None or new_sl < sl):
-                self.executor.move_trailing_sl(symbol, trade_id, new_sl, direction)
+                self.executor.move_trailing_sl(
+                    symbol, trade_id, new_sl, direction
+                )
+                log.debug(
+                    f"[{symbol}] SHORT trailing: trough={trough:.4f} "
+                    f"new_sl={new_sl:.4f} (dist={trail_dist:.4f})"
+                )
+
+    # ── 即時 ATR 取得（追蹤止盈用）────────────────────────────────
+    def _get_current_atr(self, symbol: str,
+                         interval: str = "15m") -> Optional[float]:
+        """取得當前 ATR(14) 值，用於 TP1 後啟用追蹤止盈"""
+        try:
+            import pandas as pd
+            raw = retry_api(
+                self.client.futures_klines,
+                symbol=symbol, interval=interval, limit=30
+            )
+            df = pd.DataFrame(raw, columns=[
+                "time", "open", "high", "low", "close", "volume",
+                "close_time", "qav", "trades", "tbav", "tbqv", "ignore"
+            ])
+            for col in ["high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            atr_s = ta.atr(df["high"], df["low"], df["close"], length=14)
+            if atr_s is not None and not atr_s.empty:
+                return float(atr_s.iloc[-1])
+        except Exception as e:
+            log.warning(f"[{symbol}] 取得 ATR 失敗: {e}")
+        return None
 
     # ── 平倉原因判斷 ─────────────────────────────────────────────
     def _detect_close_reason(self, trade: dict, exit_price: float) -> str:

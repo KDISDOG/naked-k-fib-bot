@@ -223,6 +223,24 @@ class StateManager:
                 trade.sl_order_id = sl_order_id
             session.commit()
 
+    def enable_trailing(self, trade_id: int, trailing_atr: float):
+        """TP1 成交後啟用追蹤止盈（對已開倉的交易動態開啟）"""
+        with self.Session() as session:
+            trade = session.get(Trade, trade_id)
+            if not trade:
+                return
+            trade.use_trailing = True
+            trade.trailing_atr = trailing_atr
+            # 初始化極值追蹤（用目前入場價作為起點）
+            if trade.direction == "LONG" and trade.highest_price is None:
+                trade.highest_price = trade.entry
+            elif trade.direction == "SHORT" and trade.lowest_price is None:
+                trade.lowest_price = trade.entry
+            session.commit()
+            log.info(
+                f"[DB] #{trade_id} 啟用追蹤止盈：ATR={trailing_atr:.4f}"
+            )
+
     def update_order_ids(self, trade_id: int, **kwargs):
         """更新訂單 ID（sl_order_id, tp1_order_id, tp2_order_id）"""
         with self.Session() as session:
