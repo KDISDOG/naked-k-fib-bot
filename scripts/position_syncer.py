@@ -55,97 +55,113 @@ class PositionSyncer:
                 position_map[pos["symbol"]] = amt
 
         for trade in open_trades:
-            symbol    = trade["symbol"]
-            trade_id  = trade["id"]
-            direction = trade["direction"]
-            entry     = trade["entry"]
-            qty       = trade["qty"]
-            qty_closed = trade["qty_closed"]
+            try:
+                symbol    = trade["symbol"]
+                trade_id  = trade["id"]
+                direction = trade["direction"]
+                entry     = trade["entry"]
+                qty       = trade["qty"]
+                qty_closed = trade["qty_closed"]
 
-            # 幣安端實際持倉量
-            actual_amt = position_map.get(symbol, 0)
-            # LONG = 正，SHORT = 負
-            if direction == "LONG":
-                actual_qty = actual_amt
-            else:
-                actual_qty = abs(actual_amt)
-
-            expected_remaining = qty - qty_closed
-
-            # ── 情況 1: 完全平倉 ────────────────────────────────
-            if actual_qty <= 0 or abs(actual_qty) < 0.0001:
-                log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
-                exit_price = self._get_last_trade_price(symbol)
-                fee = self._get_recent_fee(symbol, qty)
-
-                # 判斷平倉原因
-                reason = self._detect_close_reason(trade, exit_price or entry)
-
-                self.db.close_trade(
-                    trade_id     = trade_id,
-                    exit_price   = exit_price or entry,
-                    fee          = fee,
-                    partial      = False,
-                    close_reason = reason,
-                )
-                # 計算淨盈虧通知
-                _ep = exit_price or entry
+                # 幣安端實際持倉量
+                actual_amt = position_map.get(symbol, 0)
+                # LONG = 正，SHORT = 負
                 if direction == "LONG":
-                    _raw_pnl = (_ep - entry) * qty
+                    actual_qty = actual_amt
                 else:
-                    _raw_pnl = (entry - _ep) * qty
-                _net = _raw_pnl - fee
-                notify.trade_closed(symbol, direction, _net, reason)
-                continue
+                    actual_qty = abs(actual_amt)
 
-            # ── 情況 2: 部分平倉（TP1 觸發）──────────────────────
-            qty_diff = expected_remaining - actual_qty
-            if qty_diff > 0.0005:
-                # 有一部分被平掉了（很可能是 TP1）
-                log.info(
-                    f"[{symbol}] #{trade_id} 偵測到部分平倉："
-                    f"預期剩餘={expected_remaining:.4f} "
-                    f"實際={actual_qty:.4f} 差異={qty_diff:.4f}"
-                )
-                # 估算平倉價格（用 TP1 價格）
-                exit_price = trade["tp1"] or self._get_last_trade_price(symbol)
-                fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+                expected_remaining = qty - qty_closed
 
-                self.db.close_trade(
-                    trade_id     = trade_id,
-                    exit_price   = exit_price or entry,
-                    fee          = fee,
-                    partial      = True,
-                    closed_qty   = qty_diff,
-                    close_reason = "TP1",
-                )
+                # ── 情況 1: 完全平倉 ────────────────────────────────
+                if actual_qty <= 0 or abs(actual_qty) < 0.0001:
+                    log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
+                    exit_price = self._get_last_trade_price(symbol)
+                    fee = self._get_recent_fee(symbol, qty)
 
-                # 觸發 Breakeven Stop（如果還沒移過）
-                if not trade["breakeven"]:
-                    self.executor.move_to_breakeven(
-                        symbol      = symbol,
-                        trade_id    = trade_id,
-                        entry_price = entry,
-                        direction   = direction,
+                    # 判斷平倉原因
+                    reason = self._detect_close_reason(trade, exit_price or entry)
+
+                    self.db.close_trade(
+                        trade_id     = trade_id,
+                        exit_price   = exit_price or entry,
+                        fee          = fee,
+                        partial      = False,
+                        close_reason = reason,
+                    )
+                    # 計算淨盈虧通知
+                    _ep = exit_price or entry
+                    if direction == "LONG":
+                        _raw_pnl = (_ep - entry) * qty
+                    else:
+                        _raw_pnl = (entry - _ep) * qty
+                    _net = _raw_pnl - fee
+                    notify.trade_closed(symbol, direction, _net, reason)
+                    continue
+
+                # ── 情況 2: 部分平倉（TP1 觸發）──────────────────────
+                qty_diff = expected_remaining - actual_qty
+                if qty_diff > 0.0005:
+                    # 有一部分被平掉了（很可能是 TP1）
+                    log.info(
+                        f"[{symbol}] #{trade_id} 偵測到部分平倉："
+                        f"預期剩餘={expected_remaining:.4f} "
+                        f"實際={actual_qty:.4f} 差異={qty_diff:.4f}"
+                    )
+                    # 估算平倉價格（用 TP1 價格）
+                    exit_price = trade["tp1"] or self._get_last_trade_price(symbol)
+                    fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+
+                    self.db.close_trade(
+                        trade_id     = trade_id,
+                        exit_price   = exit_price or entry,
+                        fee          = fee,
+                        partial      = True,
+                        closed_qty   = qty_diff,
+                        close_reason = "TP1",
                     )
 
-                # TP1 後自動啟用追蹤止盈（所有策略通用）
-                if Config.TRAILING_ACTIVATE_AFTER_TP1 and \
-                        not trade.get("use_trailing"):
-                    atr_val = self._get_current_atr(
-                        symbol, trade.get("timeframe", "15m")
-                    )
-                    if atr_val and atr_val > 0:
-                        self.db.enable_trailing(trade_id, atr_val)
-                        log.info(
-                            f"[{symbol}] TP1 後啟用追蹤止盈"
-                            f"（ATR={atr_val:.4f}，"
-                            f"距離={Config.TRAILING_ATR_MULT}×ATR）"
-                        )
+                    # 觸發 Breakeven Stop（如果還沒移過）
+                    if not trade["breakeven"]:
+                        try:
+                            self.executor.move_to_breakeven(
+                                symbol      = symbol,
+                                trade_id    = trade_id,
+                                entry_price = entry,
+                                direction   = direction,
+                            )
+                        except Exception as be:
+                            log.error(f"[{symbol}] #{trade_id} move_to_breakeven 失敗: {be}")
 
-            # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
-            if trade.get("use_trailing"):
-                self._update_trailing(trade)
+                    # TP1 後自動啟用追蹤止盈（所有策略通用）
+                    if Config.TRAILING_ACTIVATE_AFTER_TP1 and \
+                            not trade.get("use_trailing"):
+                        try:
+                            atr_val = self._get_current_atr(
+                                symbol, trade.get("timeframe", "15m")
+                            )
+                            if atr_val and atr_val > 0:
+                                self.db.enable_trailing(trade_id, atr_val)
+                                log.info(
+                                    f"[{symbol}] TP1 後啟用追蹤止盈"
+                                    f"（ATR={atr_val:.4f}，"
+                                    f"距離={Config.TRAILING_ATR_MULT}×ATR）"
+                                )
+                        except Exception as te:
+                            log.error(f"[{symbol}] #{trade_id} 啟用追蹤止盈失敗: {te}")
+
+                # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
+                if trade.get("use_trailing"):
+                    try:
+                        self._update_trailing(trade)
+                    except Exception as ute:
+                        log.error(f"[{symbol}] #{trade_id} _update_trailing 失敗: {ute}")
+
+            except Exception as e:
+                log.error(
+                    f"[{trade.get('symbol', '?')}] "
+                    f"#{trade.get('id', '?')} 同步處理失敗，跳過此筆: {e}"
+                )
 
     # ── 追蹤止盈邏輯 ─────────────────────────────────────────────
     def _update_trailing(self, trade: dict):
@@ -195,28 +211,39 @@ class PositionSyncer:
 
         trail_dist = Config.TRAILING_ATR_MULT * atr
 
+        # Breakeven 下限（含來回手續費 + 0.02% buffer ≈ 0.1%）
+        # 讓 trailing 至少鎖住「真實保本」價，避免 SL 觸發後還輸手續費
+        be_buffer = 0.001  # 0.1%
+
         if direction == "LONG":
             peak = latest.get("highest_price") or price
-            new_sl = peak - trail_dist
-            # 止損只能往上推，且不低於入場價
-            if new_sl > entry and (sl is None or new_sl > sl):
+            breakeven_price = entry * (1 + be_buffer)
+            # TP1 後 trailing 下限 = breakeven；未 TP1 時下限 = entry
+            floor_price = breakeven_price if is_partial else entry
+            new_sl = max(peak - trail_dist, floor_price)
+            # 止損只能往上推
+            if new_sl > floor_price and (sl is None or new_sl > sl):
                 self.executor.move_trailing_sl(
                     symbol, trade_id, new_sl, direction
                 )
                 log.debug(
                     f"[{symbol}] LONG trailing: peak={peak:.4f} "
-                    f"new_sl={new_sl:.4f} (dist={trail_dist:.4f})"
+                    f"new_sl={new_sl:.4f} floor={floor_price:.4f} "
+                    f"(dist={trail_dist:.4f})"
                 )
         else:
             trough = latest.get("lowest_price") or price
-            new_sl = trough + trail_dist
-            if new_sl < entry and (sl is None or new_sl < sl):
+            breakeven_price = entry * (1 - be_buffer)
+            floor_price = breakeven_price if is_partial else entry
+            new_sl = min(trough + trail_dist, floor_price)
+            if new_sl < floor_price and (sl is None or new_sl < sl):
                 self.executor.move_trailing_sl(
                     symbol, trade_id, new_sl, direction
                 )
                 log.debug(
                     f"[{symbol}] SHORT trailing: trough={trough:.4f} "
-                    f"new_sl={new_sl:.4f} (dist={trail_dist:.4f})"
+                    f"new_sl={new_sl:.4f} floor={floor_price:.4f} "
+                    f"(dist={trail_dist:.4f})"
                 )
 
     # ── 即時 ATR 取得（追蹤止盈用）────────────────────────────────
@@ -292,7 +319,8 @@ class PositionSyncer:
     def _get_last_trade_price(self, symbol: str) -> Optional[float]:
         """取得最近一筆成交價格"""
         try:
-            trades = self.client.futures_account_trades(
+            trades = retry_api(
+                self.client.futures_account_trades,
                 symbol=symbol, limit=5
             )
             if trades:
@@ -304,7 +332,8 @@ class PositionSyncer:
     def _get_recent_fee(self, symbol: str, qty: float) -> float:
         """取得最近交易的實際手續費"""
         try:
-            trades = self.client.futures_account_trades(
+            trades = retry_api(
+                self.client.futures_account_trades,
                 symbol=symbol, limit=10
             )
             total_fee = 0.0

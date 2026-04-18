@@ -82,7 +82,7 @@ class Config:
     BD_VOL_MULT      = float(os.getenv("BD_VOL_MULT", 1.3))     # 突破量確認倍數
     BD_SL_ATR_MULT   = float(os.getenv("BD_SL_ATR_MULT", 1.0))  # SL = 突破點 + N×ATR
     BD_MIN_SCORE     = int(os.getenv("BD_MIN_SCORE", 3))         # 最低訊號評分
-    BD_TIMEOUT_BARS  = int(os.getenv("BD_TIMEOUT_BARS", 48))     # 超時平倉根數
+    BD_TIMEOUT_BARS  = int(os.getenv("BD_TIMEOUT_BARS", 24))     # 超時平倉根數（15m×24=6h）
     BD_MIN_RR        = float(os.getenv("BD_MIN_RR", 1.2))        # 最低 R:R
     BD_MAX_POSITIONS = int(os.getenv("BD_MAX_POSITIONS", 2))      # 最大持倉數
 
@@ -94,9 +94,25 @@ class Config:
     ML_VOL_MULT      = float(os.getenv("ML_VOL_MULT", 1.3))     # 突破量確認倍數
     ML_SL_ATR_MULT   = float(os.getenv("ML_SL_ATR_MULT", 1.0))  # SL = 突破點 - N×ATR
     ML_MIN_SCORE     = int(os.getenv("ML_MIN_SCORE", 3))         # 最低訊號評分
-    ML_TIMEOUT_BARS  = int(os.getenv("ML_TIMEOUT_BARS", 48))     # 超時平倉根數
+    ML_TIMEOUT_BARS  = int(os.getenv("ML_TIMEOUT_BARS", 24))     # 超時平倉根數（15m×24=6h）
     ML_MIN_RR        = float(os.getenv("ML_MIN_RR", 1.2))        # 最低 R:R
     ML_MAX_POSITIONS = int(os.getenv("ML_MAX_POSITIONS", 2))      # 最大持倉數
 
     # ── OI 異常過濾 ──────────────────────────────────────────────
     OI_CHANGE_MAX = float(os.getenv("OI_CHANGE_MAX", 20.0))      # OI 24h 變動 > N% 視為異常
+
+    # ── Symbol 黑名單：穩定幣 / 包裝幣 / 指數類（避免誤開倉）────
+    EXCLUDED_SYMBOLS = {
+        "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT",
+        "DAIUSDT", "PAXUSDT", "USTUSDT", "USTCUSDT",
+        "BTCDOMUSDT", "DEFIUSDT",  # 指數類合約
+    }
+    # 名稱含這些 token 的槓桿代幣（幣安期貨已下架多數，但保險起見）
+    EXCLUDED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+
+    @classmethod
+    def is_excluded_symbol(cls, symbol: str) -> bool:
+        """檢查 symbol 是否在黑名單中"""
+        if symbol in cls.EXCLUDED_SYMBOLS:
+            return True
+        return any(symbol.endswith(s) for s in cls.EXCLUDED_SUFFIXES)

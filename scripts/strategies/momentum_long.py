@@ -59,6 +59,8 @@ class MomentumLongStrategy(BaseStrategy):
 
     def _get_klines(self, symbol: str, interval: str,
                     limit: int = 200) -> pd.DataFrame:
+        if self._market_ctx is not None and hasattr(self._market_ctx, "get_klines"):
+            return self._market_ctx.get_klines(symbol, interval, limit)
         raw = self._client.futures_klines(
             symbol=symbol, interval=interval, limit=limit
         )
@@ -139,7 +141,7 @@ class MomentumLongStrategy(BaseStrategy):
             return 0
 
         # 4. 上升波段：近期 swing low 遞升
-        swings_l = self._find_swing_lows(df, left=5, right=5)
+        swings_l = self._find_swing_lows(df, left=10, right=10)
         if len(swings_l) >= 2:
             if swings_l[-1]["price"] > swings_l[-2]["price"]:
                 score += 2  # Higher lows = 上升趨勢確認
@@ -419,23 +421,28 @@ class MomentumLongStrategy(BaseStrategy):
           TP2 = swing_high + diff * 0.618 (1.618 extension)
           SL  = resistance - ML_SL_ATR_MULT * ATR
         """
-        swing_highs = self._find_swing_highs(df, left=5, right=5)
-        swing_lows = self._find_swing_lows(df, left=5, right=5)
+        swing_highs = self._find_swing_highs(df, left=10, right=10)
+        swing_lows = self._find_swing_lows(df, left=10, right=10)
 
+        # 時序驗證：做多要找「先 low 後 high」的上升結構
+        valid_fib = False
         if swing_highs and swing_lows:
-            sh = swing_highs[-1]["price"]
-            sl_swing = swing_lows[-1]["price"]
+            sh_obj = swing_highs[-1]
+            sl_obj = swing_lows[-1]
+            sh = sh_obj["price"]
+            sl_swing = sl_obj["price"]
+            # 條件：swing_low 的 idx 必須在 swing_high 之前（先跌後漲的結構）
+            if sl_obj["idx"] < sh_obj["idx"] and sh > sl_swing:
+                valid_fib = True
 
-            if sh > sl_swing:
-                diff = sh - sl_swing
-                tp1 = sh + diff * 0.272  # 1.272 extension
-                tp2 = sh + diff * 0.618  # 1.618 extension
-            else:
-                tp1 = entry * 1.03   # +3%
-                tp2 = entry * 1.05   # +5%
+        if valid_fib:
+            diff = sh - sl_swing
+            tp1 = sh + diff * 0.272  # 1.272 extension
+            tp2 = sh + diff * 0.618  # 1.618 extension
         else:
-            tp1 = entry * 1.03
-            tp2 = entry * 1.05
+            # fallback: ATR-based 目標
+            tp1 = entry + atr_val * 1.5
+            tp2 = entry + atr_val * 3.0
 
         # SL：突破點下方 - ATR 緩衝
         sl = resistance - Config.ML_SL_ATR_MULT * atr_val

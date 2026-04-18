@@ -44,6 +44,9 @@ class CoinScreener:
     # ── 取得 K 線 ────────────────────────────────────────────────
 
     def _get_klines(self, symbol: str, interval="1h", limit=200) -> pd.DataFrame:
+        # 優先走 MarketContext 共用 cache
+        if self.market_ctx is not None and hasattr(self.market_ctx, "get_klines"):
+            return self.market_ctx.get_klines(symbol, interval, limit)
         raw = retry_api(
             self.client.futures_klines,
             symbol=symbol, interval=interval, limit=limit
@@ -381,12 +384,14 @@ class CoinScreener:
         """掃描全市場，回傳評分最高的幣種清單"""
         log.info("開始全市場掃描（裸K+Fib 專用選幣）...")
 
+        from config import Config
         info = retry_api(self.client.futures_exchange_info)
         symbols = [
             s["symbol"] for s in info["symbols"]
             if s["quoteAsset"] == "USDT"
             and s["status"] == "TRADING"
             and not s["symbol"].endswith("_PERP")
+            and not Config.is_excluded_symbol(s["symbol"])
         ]
 
         # 排除新上線（onboardDate 30 天內）的幣
