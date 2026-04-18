@@ -211,6 +211,10 @@ class PositionSyncer:
 
         trail_dist = Config.TRAILING_ATR_MULT * atr
 
+        # 最小推進步長：SL 必須比現值前進 >= min_step 才換單
+        # 避免 peak 微幅上移（0.01%）也觸發 → 每 30 秒重複下單
+        min_step = Config.TRAILING_MIN_STEP_ATR * atr
+
         # Breakeven 下限（含來回手續費 + 0.02% buffer ≈ 0.1%）
         # 讓 trailing 至少鎖住「真實保本」價，避免 SL 觸發後還輸手續費
         be_buffer = 0.001  # 0.1%
@@ -221,29 +225,31 @@ class PositionSyncer:
             # TP1 後 trailing 下限 = breakeven；未 TP1 時下限 = entry
             floor_price = breakeven_price if is_partial else entry
             new_sl = max(peak - trail_dist, floor_price)
-            # 止損只能往上推
-            if new_sl > floor_price and (sl is None or new_sl > sl):
+            # 止損只能往上推，且需大於最小步長
+            advance = new_sl - sl if sl is not None else new_sl - floor_price
+            if new_sl > floor_price and advance >= min_step:
                 self.executor.move_trailing_sl(
                     symbol, trade_id, new_sl, direction
                 )
-                log.debug(
+                log.info(
                     f"[{symbol}] LONG trailing: peak={peak:.4f} "
                     f"new_sl={new_sl:.4f} floor={floor_price:.4f} "
-                    f"(dist={trail_dist:.4f})"
+                    f"advance={advance:.4f} (min={min_step:.4f})"
                 )
         else:
             trough = latest.get("lowest_price") or price
             breakeven_price = entry * (1 - be_buffer)
             floor_price = breakeven_price if is_partial else entry
             new_sl = min(trough + trail_dist, floor_price)
-            if new_sl < floor_price and (sl is None or new_sl < sl):
+            advance = sl - new_sl if sl is not None else floor_price - new_sl
+            if new_sl < floor_price and advance >= min_step:
                 self.executor.move_trailing_sl(
                     symbol, trade_id, new_sl, direction
                 )
-                log.debug(
+                log.info(
                     f"[{symbol}] SHORT trailing: trough={trough:.4f} "
                     f"new_sl={new_sl:.4f} floor={floor_price:.4f} "
-                    f"(dist={trail_dist:.4f})"
+                    f"advance={advance:.4f} (min={min_step:.4f})"
                 )
 
     # ── 即時 ATR 取得（追蹤止盈用）────────────────────────────────

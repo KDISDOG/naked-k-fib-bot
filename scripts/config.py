@@ -73,6 +73,8 @@ class Config:
     TRAILING_ACTIVATE_AFTER_TP1 = os.getenv(
         "TRAILING_ACTIVATE_AFTER_TP1", "true"
     ).lower() == "true"  # TP1 成交後自動啟用追蹤止盈
+    # 最小推進步長：SL 至少前進 N × ATR 才換單，避免每 30 秒重下單（瘋狂開委託）
+    TRAILING_MIN_STEP_ATR = float(os.getenv("TRAILING_MIN_STEP_ATR", 0.3))
 
     # ── Breakdown Short 策略（熊市做空）──────────────────────────
     BD_TIMEFRAME     = os.getenv("BD_TIMEFRAME", "1h")
