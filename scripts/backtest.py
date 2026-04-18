@@ -50,8 +50,7 @@ DEFAULT_SYMBOL    = "BTCUSDT"
 DEFAULT_TF        = ["1h", "4h"]
 DEFAULT_MONTHS    = 6         # 抓幾個月歷史資料
 INITIAL_BALANCE   = 1000.0    # 模擬起始資金（.env 沒有此項，手動設定）
-RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE",    "0.02"))
-MAX_NOTIONAL_PCT  = float(os.getenv("MAX_NOTIONAL_PCT",  str(round(1/6, 4))))
+MARGIN_USDT       = float(os.getenv("MARGIN_USDT",       "50"))   # 每筆固定保證金（USDT）
 LEVERAGE          = int(os.getenv("MAX_LEVERAGE",        "2"))
 MIN_SCORE         = int(os.getenv("MIN_SIGNAL_SCORE",    "3"))
 TAKER_FEE_RATE    = TAKER_FEE
@@ -917,16 +916,12 @@ def calc_position(balance: float, entry: float, sl: float,
     if sl_pct < 0.003 or sl_pct > 0.12:
         return None
 
-    risk_usdt = balance * RISK_PER_TRADE
-    effective_sl_pct = sl_pct + 2 * TAKER_FEE_RATE
-    qty = risk_usdt / (effective_sl_pct * entry)
+    if balance < MARGIN_USDT:
+        return None
 
-    notional = qty * entry
-    margin = notional / LEVERAGE
-    if margin > balance * MAX_NOTIONAL_PCT:
-        margin = balance * MAX_NOTIONAL_PCT
-        notional = margin * LEVERAGE
-        qty = notional / entry
+    margin   = MARGIN_USDT
+    notional = margin * LEVERAGE
+    qty      = notional / entry
 
     qty = max(round(qty, 3), 0.001)             # 同正式：3 位精度
     qty_tp1 = round(qty * tp1_split_pct, 3)      # 同正式：依 tp1_split_pct 分倉
@@ -1693,7 +1688,7 @@ def main():
     if run_ml:
         print(f"  [ML]  時間框架：{Config.ML_TIMEFRAME}  超時：{Config.ML_TIMEOUT_BARS} 根  做多突破策略")
     print(f"  回測期間：最近 {args.months} 個月")
-    print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每單風險：{RISK_PER_TRADE*100:.1f}%")
+    print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每筆保證金：{MARGIN_USDT:.0f} USDT")
     if run_nkf:
         print(f"  [NKF] Fib 容忍度：±{BT_FIB_TOL*100:.1f}%  成交量門檻：{BT_VOL_MULT}x")
     print(f"{'='*60}")

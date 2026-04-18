@@ -456,6 +456,14 @@ def main():
 
     notify.bot_started()
     setup_schedule()
+
+    # 啟動時清理幣安上殘留的孤兒掛單（SL/TP 未被撤銷的殘留）
+    try:
+        syncer.cleanup_orphan_orders()
+        log.info("孤兒掛單清理完成")
+    except Exception as e:
+        log.warning(f"啟動孤兒清理失敗（不阻斷啟動）: {e}")
+
     scan_coins()
 
     if not args.skip_wait:

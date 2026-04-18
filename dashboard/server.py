@@ -72,15 +72,15 @@ async def index(request: Request):
     today_pnl = db.get_today_pnl()
     balance   = _get_account_balance()
     load_dotenv(override=True)  # 重新讀取最新 .env
-    risk_pct  = float(os.getenv("RISK_PER_TRADE", "0.03"))
+    margin_usdt = float(os.getenv("MARGIN_USDT", "50"))
     return templates.TemplateResponse(request, "index.html", context={
-        "stats":     stats,
-        "trades":    trades,
-        "today_pnl": round(today_pnl, 2),
-        "balance":   balance,
-        "now":       datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "testnet":   os.getenv("BINANCE_TESTNET", "true"),
-        "risk_pct":  risk_pct,
+        "stats":       stats,
+        "trades":      trades,
+        "today_pnl":   round(today_pnl, 2),
+        "balance":     balance,
+        "now":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "testnet":     os.getenv("BINANCE_TESTNET", "true"),
+        "margin_usdt": margin_usdt,
     })
 
 # ── API 端點 ───────────────────────────────────────────────────────
@@ -152,9 +152,10 @@ async def api_open_positions():
 
         leverage = int(os.getenv("MAX_LEVERAGE", 3))
         margin = round((t["qty"] or 0) * (t["entry"] or 0) / leverage, 2)
+        pnl_pct = round(unrealized_pnl / margin * 100, 2) if (margin and margin > 0 and unrealized_pnl is not None) else None
         result.append({**t, "current_price": current_price,
                        "unrealized_pnl": unrealized_pnl, "rr": rr,
-                       "margin": margin})
+                       "margin": margin, "pnl_pct": pnl_pct})
     return result
 
 @app.post("/api/close_position/{trade_id}")
@@ -197,21 +198,21 @@ async def api_close_position(trade_id: int):
 
 @app.post("/api/update_config")
 async def update_config(
-    risk_pct: float = Form(0.03),
+    margin_usdt: float = Form(50),
 ):
-    """更新每筆風險 %（寫入 .env，槓桿固定 2x）"""
+    """更新每筆保證金 USDT（寫入 .env）"""
     env_path = Path(".env")
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     new_lines = []
     updated = False
     for line in lines:
-        if line.startswith("RISK_PER_TRADE="):
-            new_lines.append(f"RISK_PER_TRADE={risk_pct}")
+        if line.startswith("MARGIN_USDT="):
+            new_lines.append(f"MARGIN_USDT={margin_usdt}")
             updated = True
         else:
             new_lines.append(line)
     if not updated:
-        new_lines.append(f"RISK_PER_TRADE={risk_pct}")
+        new_lines.append(f"MARGIN_USDT={margin_usdt}")
     env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     return {"status": "ok", "message": "參數已更新，下次啟動生效"}
 
