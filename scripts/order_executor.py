@@ -13,6 +13,9 @@ from typing import Optional
 from binance.client import Client
 from binance.enums import *
 from api_retry import retry_api, create_order_safe
+from binance_orders import (
+    list_open_orders, cancel_order, cancel_all_for_symbol, extract_id
+)
 from notifier import notify
 
 log = logging.getLogger("executor")
@@ -192,7 +195,7 @@ class OrderExecutor:
                     quantity   = qty,
                     reduceOnly = True,
                 )
-                sl_order_id = str(sl_order.get("orderId", ""))
+                sl_order_id, _ = extract_id(sl_order)
             except Exception as e:
                 log.error(f"[{symbol}] SL 掛單失敗，緊急平倉: {e}")
                 notify.sl_placement_failed(symbol, direction)
@@ -222,7 +225,7 @@ class OrderExecutor:
                         quantity   = qty_tp1,
                         reduceOnly = True,
                     )
-                    tp1_order_id = str(tp1_order.get("orderId", ""))
+                    tp1_order_id, _ = extract_id(tp1_order)
                 except Exception as e:
                     log.warning(f"[{symbol}] TP1 掛單失敗: {e}")
 
@@ -238,7 +241,7 @@ class OrderExecutor:
                         quantity   = qty_tp2,
                         reduceOnly = True,
                     )
-                    tp2_order_id = str(tp2_order.get("orderId", ""))
+                    tp2_order_id, _ = extract_id(tp2_order)
                 except Exception as e:
                     log.warning(f"[{symbol}] TP2 掛單失敗: {e}")
 
@@ -287,31 +290,23 @@ class OrderExecutor:
     def _cancel_existing_sl_orders(self, symbol: str, close_side: str) -> int:
         """
         枚舉 symbol 當前所有 STOP_MARKET（close_side 方向）掛單並全部取消。
-        這是防禦性清理：即使 DB 裡記錄的 sl_order_id 失效 / 重複 /
-        與 Binance 實際不一致，也能確保移動 SL 前沒有殘留 SL 掛單。
+        同時掃標準與 Algo 兩套系統 —— Binance 把 STOP_MARKET 歸到
+        Algo Conditional，舊版只看 openOrders 會漏單（見 binance_orders.py）。
+
+        防禦性清理：即使 DB 記錄的 sl_order_id 失效 / 重複，也能確保
+        移動 SL 前沒有殘留 SL 掛單。
         """
         cancelled = 0
         try:
-            open_orders = retry_api(
-                self.client.futures_get_open_orders, symbol=symbol
-            )
+            orders = list_open_orders(self.client, symbol=symbol)
         except Exception as e:
             log.warning(f"[{symbol}] 取得掛單列表失敗: {e}")
             return 0
 
-        for o in open_orders or []:
-            otype = o.get("type", "")
-            oside = o.get("side", "")
-            if otype == "STOP_MARKET" and oside == close_side:
-                try:
-                    self.client.futures_cancel_order(
-                        symbol=symbol, orderId=int(o["orderId"])
-                    )
+        for o in orders:
+            if o["type"] == "STOP_MARKET" and o["side"] == close_side:
+                if cancel_order(self.client, symbol, o):
                     cancelled += 1
-                except Exception as e:
-                    log.warning(
-                        f"[{symbol}] 取消殘留 SL #{o.get('orderId')} 失敗: {e}"
-                    )
         if cancelled:
             log.info(f"[{symbol}] 清理殘留 SL 掛單 {cancelled} 筆")
         return cancelled
@@ -363,7 +358,7 @@ class OrderExecutor:
                 quantity   = remaining,
                 reduceOnly = True,
             )
-            new_sl_id = str(new_sl_order.get("orderId", ""))
+            new_sl_id, _ = extract_id(new_sl_order)
 
             # 更新 DB
             self.db.update_breakeven(
@@ -419,7 +414,7 @@ class OrderExecutor:
                 quantity   = remaining,
                 reduceOnly = True,
             )
-            new_sl_id = str(new_sl_order.get("orderId", ""))
+            new_sl_id, _ = extract_id(new_sl_order)
             self.db.update_sl(trade_id, new_sl=new_sl, sl_order_id=new_sl_id)
 
             log.info(f"[{symbol}] 追蹤止盈推進：SL={new_sl}")
@@ -431,7 +426,7 @@ class OrderExecutor:
     # ── 緊急操作 ─────────────────────────────────────────────────
 
     def cancel_all(self):
-        """緊急撤銷所有未成交掛單（逐幣種取消）"""
+        """緊急撤銷所有未成交掛單（含 Algo），逐幣種取消"""
         try:
             positions = self.client.futures_position_information()
             cancelled_symbols = set()
@@ -439,11 +434,8 @@ class OrderExecutor:
                 symbol = pos["symbol"]
                 if symbol in cancelled_symbols:
                     continue
-                try:
-                    self.client.futures_cancel_all_open_orders(symbol=symbol)
-                    cancelled_symbols.add(symbol)
-                except Exception:
-                    pass
+                cancel_all_for_symbol(self.client, symbol)
+                cancelled_symbols.add(symbol)
             log.warning(
                 f"緊急撤單完成：已取消 {len(cancelled_symbols)} 個幣種的掛單"
             )
@@ -530,11 +522,8 @@ class OrderExecutor:
                         f"[{symbol}] 無法取得平倉價，fallback 至入場價 {exit_price}"
                     )
 
-            # 撤銷剩餘掛單
-            try:
-                self.client.futures_cancel_all_open_orders(symbol=symbol)
-            except Exception:
-                pass
+            # 撤銷剩餘掛單（含 Algo）
+            cancel_all_for_symbol(self.client, symbol)
 
             self.db.close_trade(trade_id, exit_price=exit_price or 0,
                                 close_reason=close_reason)

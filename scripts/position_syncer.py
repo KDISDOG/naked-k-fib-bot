@@ -22,6 +22,7 @@ from binance.client import Client
 from config import Config
 from risk_manager import RiskManager
 from api_retry import retry_api
+from binance_orders import list_open_orders, cancel_all_for_symbol
 from notifier import notify
 
 log = logging.getLogger("syncer")
@@ -96,12 +97,11 @@ class PositionSyncer:
                 if actual_qty <= 0 or abs(actual_qty) < 0.0001:
                     log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
 
-                    # 先清殘留掛單（reduceOnly TP/SL 不會自動取消）
+                    # 先清殘留掛單（含 Algo，reduceOnly TP/SL 不會自動取消）
                     # 放最前面：即使後續 close_trade/notify 丟例外，
                     # 孤兒單已經被清掉
                     try:
-                        retry_api(self.client.futures_cancel_all_open_orders,
-                                  symbol=symbol)
+                        cancel_all_for_symbol(self.client, symbol)
                         log.info(f"[{symbol}] 已清除平倉後殘留掛單")
                     except Exception as ce:
                         log.warning(f"[{symbol}] 清除殘留掛單失敗: {ce}")
@@ -199,7 +199,7 @@ class PositionSyncer:
     def _sweep_orphan_orders(self):
         """
         清除孤兒單：幣安上有掛單、但 DB 中沒有對應 open/partial trade
-        且幣安實際持倉為 0 的 symbol，全部取消。
+        且幣安實際持倉為 0 的 symbol，全部取消（含 Algo Conditional）。
 
         產生孤兒的情境：
           - TP2 觸發全平後，殘留的 reduceOnly SL / TP1 不會自動取消
@@ -207,7 +207,7 @@ class PositionSyncer:
           - 手動在幣安 APP 平倉後未同步
         """
         try:
-            all_open = retry_api(self.client.futures_get_open_orders)
+            all_open = list_open_orders(self.client)
         except Exception as e:
             log.warning(f"取得全站掛單失敗: {e}")
             return
@@ -242,13 +242,10 @@ class PositionSyncer:
                 continue  # 有持倉，不動
             if sym in db_symbols:
                 continue  # DB 還認為是 open，先不動（避免誤刪正常待觸發單）
-            # 孤兒 symbol：無持倉 + DB 無紀錄 → 全清
-            try:
-                self.client.futures_cancel_all_open_orders(symbol=sym)
-                cleaned_total += cnt
-                log.warning(f"[{sym}] 孤兒單掃蕩：取消 {cnt} 筆")
-            except Exception as e:
-                log.warning(f"[{sym}] 取消孤兒單失敗: {e}")
+            # 孤兒 symbol：無持倉 + DB 無紀錄 → 全清（含 Algo）
+            cancel_all_for_symbol(self.client, sym)
+            cleaned_total += cnt
+            log.warning(f"[{sym}] 孤兒單掃蕩：取消 {cnt} 筆")
 
         if cleaned_total:
             log.warning(f"孤兒單掃蕩完成，共清除 {cleaned_total} 筆")

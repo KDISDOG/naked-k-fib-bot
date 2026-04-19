@@ -19,6 +19,7 @@ from binance.client import Client
 
 from config import Config
 from state_manager import StateManager
+from binance_orders import list_open_orders, cancel_all_for_symbol
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,29 +69,31 @@ def main():
         log.error(f"帳號驗證失敗（API key 或網路問題）: {e}")
         return 1
 
-    # 1. 取所有未成交掛單
+    # 1. 取所有未成交掛單（標準 + Algo Conditional）
     try:
         if target_symbol:
-            all_open = client.futures_get_open_orders(symbol=target_symbol)
+            all_open = list_open_orders(client, symbol=target_symbol)
             log.info(
                 f"[診斷模式] 查詢 symbol={target_symbol} → {len(all_open)} 筆"
             )
             for o in all_open:
+                kind = "algo" if o["is_algo"] else "std"
+                oid = o["algoId"] if o["is_algo"] else o["orderId"]
                 log.info(
-                    f"  - type={o['type']} side={o['side']} "
-                    f"stopPrice={o.get('stopPrice')} "
-                    f"origQty={o.get('origQty')} "
-                    f"status={o.get('status')} orderId={o['orderId']}"
+                    f"  - [{kind}] type={o['type']} side={o['side']} "
+                    f"stopPrice={o['stopPrice']} "
+                    f"origQty={o['origQty']} "
+                    f"status={o['status']} id={oid}"
                 )
             if not apply:
                 return 0
         else:
-            all_open = client.futures_get_open_orders()
+            all_open = list_open_orders(client)
     except Exception as e:
         log.error(f"取得全站掛單失敗: {e}")
         return 1
 
-    log.info(f"futures_get_open_orders 回傳 {len(all_open)} 筆掛單")
+    log.info(f"list_open_orders 回傳 {len(all_open)} 筆掛單（含 Algo）")
 
     if not all_open:
         log.info("本帳號在此網域上沒有任何掛單")
@@ -138,11 +141,11 @@ def main():
     for sym, orders in orphan_symbols:
         log.warning(f"  [{sym}] {len(orders)} 筆：")
         for o in orders:
+            kind = "algo" if o["is_algo"] else "std"
+            oid = o["algoId"] if o["is_algo"] else o["orderId"]
             log.warning(
-                f"    - {o['type']} {o['side']} "
-                f"stop={o.get('stopPrice', 'N/A')} "
-                f"qty={o.get('origQty', 'N/A')} "
-                f"orderId={o['orderId']}"
+                f"    - [{kind}] {o['type']} {o['side']} "
+                f"stop={o['stopPrice']} qty={o['origQty']} id={oid}"
             )
         total_cnt += len(orders)
 
@@ -152,11 +155,11 @@ def main():
         log.info("DRY-RUN 模式結束。加 --apply 實際取消。")
         return 0
 
-    # 5. 實際取消
+    # 5. 實際取消（含 Algo）
     cleaned = 0
     for sym, orders in orphan_symbols:
         try:
-            client.futures_cancel_all_open_orders(symbol=sym)
+            cancel_all_for_symbol(client, sym)
             cleaned += len(orders)
             log.info(f"[{sym}] 已取消 {len(orders)} 筆")
         except Exception as e:
