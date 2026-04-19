@@ -267,6 +267,24 @@ class StateManager:
             )
             return count > 0
 
+    def has_opposite_position(self, symbol: str, direction: str) -> bool:
+        """
+        檢查某幣種是否已有「反向」未平倉（跨策略互斥）。
+        避免 NKF LONG + MR SHORT 同時存在自打架。
+        """
+        opposite = "SHORT" if direction == "LONG" else "LONG"
+        with self.Session() as session:
+            count = (
+                session.query(Trade)
+                .filter(
+                    Trade.symbol == symbol,
+                    Trade.direction == opposite,
+                    Trade.status.in_(["open", "partial"])
+                )
+                .count()
+            )
+            return count > 0
+
     def in_cooldown(self, symbol: str, cooldown_bars: int = 6,
                     bar_minutes: int = 15,
                     strategy: str = None) -> bool:

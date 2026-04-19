@@ -68,10 +68,15 @@ class Config:
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
 
     # ── 追蹤止盈（Trailing Stop）────────────────────────────────
+    # 總開關：關閉後純靠 SL/TP1/TP2 + 保本一次性移動。避免 30 秒推進
+    # 造成孤兒單累積 / 掛單爆量。預設 false 保守運行。
+    TRAILING_ENABLED = os.getenv("TRAILING_ENABLED", "false").lower() == "true"
     TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", 1.5))  # 追蹤距離 = N × ATR
     TRAILING_ACTIVATE_AFTER_TP1 = os.getenv(
         "TRAILING_ACTIVATE_AFTER_TP1", "true"
-    ).lower() == "true"  # TP1 成交後自動啟用追蹤止盈
+    ).lower() == "true"  # TP1 成交後自動啟用追蹤止盈（需 TRAILING_ENABLED=true）
+    # 最小推進步長：SL 至少前進 N × ATR 才換單，避免每 30 秒重下單（瘋狂開委託）
+    TRAILING_MIN_STEP_ATR = float(os.getenv("TRAILING_MIN_STEP_ATR", 0.3))
 
     # ── Breakdown Short 策略（熊市做空）──────────────────────────
     BD_TIMEFRAME     = os.getenv("BD_TIMEFRAME", "1h")
@@ -81,7 +86,7 @@ class Config:
     BD_VOL_MULT      = float(os.getenv("BD_VOL_MULT", 1.3))     # 突破量確認倍數
     BD_SL_ATR_MULT   = float(os.getenv("BD_SL_ATR_MULT", 1.0))  # SL = 突破點 + N×ATR
     BD_MIN_SCORE     = int(os.getenv("BD_MIN_SCORE", 3))         # 最低訊號評分
-    BD_TIMEOUT_BARS  = int(os.getenv("BD_TIMEOUT_BARS", 48))     # 超時平倉根數
+    BD_TIMEOUT_BARS  = int(os.getenv("BD_TIMEOUT_BARS", 24))     # 超時平倉根數（15m×24=6h）
     BD_MIN_RR        = float(os.getenv("BD_MIN_RR", 1.2))        # 最低 R:R
     BD_MAX_POSITIONS = int(os.getenv("BD_MAX_POSITIONS", 2))      # 最大持倉數
 
@@ -93,9 +98,25 @@ class Config:
     ML_VOL_MULT      = float(os.getenv("ML_VOL_MULT", 1.3))     # 突破量確認倍數
     ML_SL_ATR_MULT   = float(os.getenv("ML_SL_ATR_MULT", 1.0))  # SL = 突破點 - N×ATR
     ML_MIN_SCORE     = int(os.getenv("ML_MIN_SCORE", 3))         # 最低訊號評分
-    ML_TIMEOUT_BARS  = int(os.getenv("ML_TIMEOUT_BARS", 48))     # 超時平倉根數
+    ML_TIMEOUT_BARS  = int(os.getenv("ML_TIMEOUT_BARS", 24))     # 超時平倉根數（15m×24=6h）
     ML_MIN_RR        = float(os.getenv("ML_MIN_RR", 1.2))        # 最低 R:R
     ML_MAX_POSITIONS = int(os.getenv("ML_MAX_POSITIONS", 2))      # 最大持倉數
 
     # ── OI 異常過濾 ──────────────────────────────────────────────
     OI_CHANGE_MAX = float(os.getenv("OI_CHANGE_MAX", 20.0))      # OI 24h 變動 > N% 視為異常
+
+    # ── Symbol 黑名單：穩定幣 / 包裝幣 / 指數類（避免誤開倉）────
+    EXCLUDED_SYMBOLS = {
+        "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT",
+        "DAIUSDT", "PAXUSDT", "USTUSDT", "USTCUSDT",
+        "BTCDOMUSDT", "DEFIUSDT",  # 指數類合約
+    }
+    # 名稱含這些 token 的槓桿代幣（幣安期貨已下架多數，但保險起見）
+    EXCLUDED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+
+    @classmethod
+    def is_excluded_symbol(cls, symbol: str) -> bool:
+        """檢查 symbol 是否在黑名單中"""
+        if symbol in cls.EXCLUDED_SYMBOLS:
+            return True
+        return any(symbol.endswith(s) for s in cls.EXCLUDED_SUFFIXES)

@@ -108,7 +108,7 @@ def scan_coins():
     log.info("=" * 40)
     log.info("選幣掃描開始")
 
-    # 先取得全市場 USDT 合約列表（MR 使用）
+    # 先取得全市場 USDT 合約列表（MR/BD/ML 使用）
     try:
         info = client.futures_exchange_info()
         all_symbols = [
@@ -116,6 +116,7 @@ def scan_coins():
             if s["quoteAsset"] == "USDT"
             and s["status"] == "TRADING"
             and not s["symbol"].endswith("_PERP")
+            and not Config.is_excluded_symbol(s["symbol"])
         ]
     except Exception as e:
         log.error(f"取得全市場 symbol 失敗: {e}")
@@ -130,6 +131,13 @@ def scan_coins():
             )
         except Exception as e:
             log.error(f"[{strategy.name}] 選幣失敗: {e}")
+
+    # 掃幣後清空 K 線 cache（避免記憶體累積；訊號檢查會重抓最新 K 線）
+    try:
+        if hasattr(market_ctx, "clear_kline_cache"):
+            market_ctx.clear_kline_cache()
+    except Exception:
+        pass
 
 
 # ── 超時平倉（均值回歸 + Breakdown Short）────────────────────────
@@ -257,6 +265,14 @@ def check_signals():
                 log.debug(
                     f"[{symbol}][{strategy.name}] 訊號強度 {sig.score} "
                     f"< {min_score}，跳過"
+                )
+                continue
+
+            # 跨策略反向互斥：同幣種若已有反向倉位（他策略），跳過
+            if db.has_opposite_position(symbol, sig.side):
+                log.info(
+                    f"[{symbol}][{strategy.name}] 已有反向倉位，跳過"
+                    f"（避免跨策略自打架）"
                 )
                 continue
 

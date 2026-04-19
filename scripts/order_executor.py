@@ -12,7 +12,7 @@ import math
 from typing import Optional
 from binance.client import Client
 from binance.enums import *
-from api_retry import retry_api
+from api_retry import retry_api, create_order_safe
 from notifier import notify
 
 log = logging.getLogger("executor")
@@ -132,10 +132,9 @@ class OrderExecutor:
             side       = SIDE_BUY if direction == "LONG" else SIDE_SELL
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
 
-            # 3. 市價開倉
-            order = retry_api(
-                self.client.futures_create_order,
-                symbol   = symbol,
+            # 3. 市價開倉（冪等下單，避免網路超時時重複開倉）
+            order = create_order_safe(
+                self.client, symbol,
                 side     = side,
                 type     = ORDER_TYPE_MARKET,
                 quantity = qty,
@@ -181,9 +180,8 @@ class OrderExecutor:
             # 4. 止損單（全倉 closePosition）— 失敗則緊急平倉
             sl_order_id = ""
             try:
-                sl_order = retry_api(
-                    self.client.futures_create_order,
-                    symbol        = symbol,
+                sl_order = create_order_safe(
+                    self.client, symbol,
                     side          = close_side,
                     type          = FUTURE_ORDER_TYPE_STOP_MARKET,
                     stopPrice     = sl,
@@ -195,9 +193,8 @@ class OrderExecutor:
                 notify.sl_placement_failed(symbol, direction)
                 # 緊急平倉保護資金
                 try:
-                    retry_api(
-                        self.client.futures_create_order,
-                        symbol     = symbol,
+                    create_order_safe(
+                        self.client, symbol,
                         side       = close_side,
                         type       = ORDER_TYPE_MARKET,
                         quantity   = qty,
@@ -212,9 +209,8 @@ class OrderExecutor:
             tp1_order_id = ""
             if qty_tp1 > 0:
                 try:
-                    tp1_order = retry_api(
-                        self.client.futures_create_order,
-                        symbol     = symbol,
+                    tp1_order = create_order_safe(
+                        self.client, symbol,
                         side       = close_side,
                         type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                         stopPrice  = tp1,
@@ -229,9 +225,8 @@ class OrderExecutor:
             tp2_order_id = ""
             if qty_tp2 > 0:
                 try:
-                    tp2_order = retry_api(
-                        self.client.futures_create_order,
-                        symbol     = symbol,
+                    tp2_order = create_order_safe(
+                        self.client, symbol,
                         side       = close_side,
                         type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                         stopPrice  = tp2,
@@ -282,32 +277,63 @@ class OrderExecutor:
             log.error(f"[{symbol}] 開倉失敗: {e}")
             return None
 
+    # ── 清理既有 SL 掛單（避免重複堆疊）─────────────────────────
+
+    def _cancel_existing_sl_orders(self, symbol: str, close_side: str) -> int:
+        """
+        枚舉 symbol 當前所有 STOP_MARKET（close_side 方向）掛單並全部取消。
+        這是防禦性清理：即使 DB 裡記錄的 sl_order_id 失效 / 重複 /
+        與 Binance 實際不一致，也能確保移動 SL 前沒有殘留 SL 掛單。
+        """
+        cancelled = 0
+        try:
+            open_orders = retry_api(
+                self.client.futures_get_open_orders, symbol=symbol
+            )
+        except Exception as e:
+            log.warning(f"[{symbol}] 取得掛單列表失敗: {e}")
+            return 0
+
+        for o in open_orders or []:
+            otype = o.get("type", "")
+            oside = o.get("side", "")
+            if otype == "STOP_MARKET" and oside == close_side:
+                try:
+                    self.client.futures_cancel_order(
+                        symbol=symbol, orderId=int(o["orderId"])
+                    )
+                    cancelled += 1
+                except Exception as e:
+                    log.warning(
+                        f"[{symbol}] 取消殘留 SL #{o.get('orderId')} 失敗: {e}"
+                    )
+        if cancelled:
+            log.info(f"[{symbol}] 清理殘留 SL 掛單 {cancelled} 筆")
+        return cancelled
+
     # ── Breakeven Stop（移動止損至入場價）────────────────────────
 
     def move_to_breakeven(self, symbol: str, trade_id: int,
                           entry_price: float, direction: str) -> bool:
         """
         TP1 觸發後，把止損移到入場價（保本）
-        1. 取消舊的止損單
+        1. 取消所有既有 STOP_MARKET 掛單（含原 closePosition SL）
         2. 下新的止損單在入場價
-        3. 取消舊的 closePosition 止損（如果有的話）
         """
         try:
             trade = self.db.get_trade_by_id(trade_id)
             if not trade:
                 return False
 
+            # 冪等檢查：已經搬過保本就不要重複動作
+            if trade.get("breakeven"):
+                log.debug(f"[{symbol}] #{trade_id} 已 breakeven，跳過")
+                return True
+
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
 
-            # 取消舊止損
-            old_sl_id = trade.get("sl_order_id")
-            if old_sl_id:
-                try:
-                    self.client.futures_cancel_order(
-                        symbol=symbol, orderId=int(old_sl_id)
-                    )
-                except Exception as e:
-                    log.warning(f"取消舊止損失敗（可能已觸發）: {e}")
+            # 防禦性清理：取消所有此 symbol/方向的 SL 掛單
+            self._cancel_existing_sl_orders(symbol, close_side)
 
             # 加一點 buffer 避免滑價
             price_precision = self._get_symbol_info(symbol)["price_precision"]
@@ -323,9 +349,9 @@ class OrderExecutor:
             if remaining <= 0:
                 return True
 
-            # 下新止損
-            new_sl_order = self.client.futures_create_order(
-                symbol     = symbol,
+            # 下新止損（冪等下單）
+            new_sl_order = create_order_safe(
+                self.client, symbol,
                 side       = close_side,
                 type       = FUTURE_ORDER_TYPE_STOP_MARKET,
                 stopPrice  = new_sl,
@@ -372,23 +398,16 @@ class OrderExecutor:
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
             new_sl = self._round_price(symbol, new_sl)
 
-            # 取消舊止損
-            old_sl_id = trade.get("sl_order_id")
-            if old_sl_id:
-                try:
-                    self.client.futures_cancel_order(
-                        symbol=symbol, orderId=int(old_sl_id)
-                    )
-                except Exception as e:
-                    log.warning(f"取消舊止損失敗（可能已觸發）: {e}")
+            # 防禦性清理：取消所有此 symbol/方向的殘留 SL 掛單
+            self._cancel_existing_sl_orders(symbol, close_side)
 
             remaining = trade["qty"] - trade["qty_closed"]
             remaining = self._round_qty(symbol, remaining)
             if remaining <= 0:
                 return True
 
-            new_sl_order = self.client.futures_create_order(
-                symbol     = symbol,
+            new_sl_order = create_order_safe(
+                self.client, symbol,
                 side       = close_side,
                 type       = FUTURE_ORDER_TYPE_STOP_MARKET,
                 stopPrice  = new_sl,
@@ -438,8 +457,8 @@ class OrderExecutor:
                 symbol = pos["symbol"]
                 side   = SIDE_SELL if qty > 0 else SIDE_BUY
                 abs_qty = self._round_qty(symbol, abs(qty))
-                self.client.futures_create_order(
-                    symbol     = symbol,
+                create_order_safe(
+                    self.client, symbol,
                     side       = side,
                     type       = ORDER_TYPE_MARKET,
                     quantity   = abs_qty,
@@ -469,8 +488,8 @@ class OrderExecutor:
             side = SIDE_SELL if qty > 0 else SIDE_BUY
             abs_qty = self._round_qty(symbol, abs(qty))
 
-            order = self.client.futures_create_order(
-                symbol     = symbol,
+            order = create_order_safe(
+                self.client, symbol,
                 side       = side,
                 type       = ORDER_TYPE_MARKET,
                 quantity   = abs_qty,
