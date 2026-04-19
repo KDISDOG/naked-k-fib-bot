@@ -71,7 +71,7 @@ class PositionSyncer:
     def sync(self):
         """主同步邏輯：比對 DB 和幣安實際倉位"""
         self._sync_count += 1
-        # 每 10 次 sync（約 5 分鐘）執行一次孤兒清理
+        # 每 10 次 sync（約 5 分鐘）執行一次孤兒清理，作為撤單保底
         if self._sync_count % 10 == 1:
             self.cleanup_orphan_orders()
 
@@ -121,12 +121,13 @@ class PositionSyncer:
                 exit_price = self._get_last_trade_price(symbol)
                 fee = self._get_recent_fee(symbol, qty)
 
-                # 平倉後撤銷幣安上剩餘的 TP/SL 掛單（避免殘留訂單干擾新倉）
+                # 平倉後撤銷幣安上剩餘的 TP/SL 掛單（帶重試，避免殘留）
                 try:
-                    self.client.futures_cancel_all_open_orders(symbol=symbol)
+                    retry_api(self.client.futures_cancel_all_open_orders,
+                              symbol=symbol)
                     log.info(f"[{symbol}] 平倉後已撤銷全部掛單")
                 except Exception as _e:
-                    log.warning(f"[{symbol}] 撤銷剩餘掛單失敗（可能已自行觸發）: {_e}")
+                    log.warning(f"[{symbol}] 撤銷剩餘掛單失敗: {_e}")
 
                 # 判斷平倉原因
                 reason = self._detect_close_reason(trade, exit_price or entry)
