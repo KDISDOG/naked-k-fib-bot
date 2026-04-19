@@ -5,3 +5,5 @@ server_err.txt
 server_out.txt
 __pycache__/
 *.pyc
+# Copilot/Claude ¤u§@¥Ø¿ý
+.claude/

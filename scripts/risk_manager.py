@@ -32,9 +32,8 @@ class RiskManager:
         self.db           = db
         self.market_ctx   = market_ctx
         self.leverage     = Config.MAX_LEVERAGE          # 固定 3x
-        self.risk_pct     = Config.RISK_PER_TRADE
+        self.margin_usdt  = Config.MARGIN_USDT           # 每筆固定保證金（USDT）
         self.max_loss_pct = Config.MAX_DAILY_LOSS
-        self.max_notional_pct = Config.MAX_NOTIONAL_PCT
         # 同方向高相關倉位上限（預設 2，小資金更嚴格）
         self.max_same_direction_high_corr = int(
             os.getenv("MAX_SAME_DIR_HIGH_CORR", 2)
@@ -161,8 +160,11 @@ class RiskManager:
             log.warning("可用餘額為 0，略過")
             return None
 
-        # 每筆最大可承受虧損（含手續費預留）
-        risk_usdt = balance * self.risk_pct
+        # 固定保證金（USDT）——餘額不足則不開單
+        margin = self.margin_usdt
+        if balance < margin:
+            log.warning(f"可用餘額 {balance:.2f} < 每筆保證金 {margin:.2f} USDT，略過")
+            return None
 
         # 止損幅度
         sl_pct = abs(entry - stop_loss) / entry
@@ -173,23 +175,10 @@ class RiskManager:
             log.warning(f"止損幅度過大 ({sl_pct:.2%})，略過")
             return None
 
-        # 考慮手續費後的真實風險
-        # 止損時的來回手續費 = 2 * qty * entry * taker_rate（近似）
-        # 真實虧損 = (sl_pct * qty * entry) + (2 * qty * entry * taker_rate)
-        # risk_usdt = qty * entry * (sl_pct + 2 * taker_rate)
-        effective_sl_pct = sl_pct + 2 * TAKER_FEE_RATE
-        qty = risk_usdt / (effective_sl_pct * entry)
-
-        # 所需保證金
-        notional = qty * entry
-        margin   = notional / self.leverage
-
-        # 護欄：單筆保證金不超過帳戶 max_notional_pct
-        if margin > balance * self.max_notional_pct:
-            margin   = balance * self.max_notional_pct
-            notional = margin * self.leverage
-            qty      = notional / entry
-            log.info(f"倉位縮減至保證金上限：margin={margin:.2f} USDT")
+        # 計算倉位：固定保證金 → 名義值 → 數量
+        notional  = margin * self.leverage
+        qty       = notional / entry
+        risk_usdt = sl_pct * notional  # 止損時的預期虧損（供參考）
 
         # 精度處理
         qty = max(round(qty, 3), 0.001)

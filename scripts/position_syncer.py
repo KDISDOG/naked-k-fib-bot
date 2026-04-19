@@ -368,44 +368,51 @@ class PositionSyncer:
     def _detect_close_reason(self, trade: dict, exit_price: float) -> str:
         """
         根據平倉價格與 TP/SL 比較，推斷平倉原因。
-        已走過 partial（TP1）的單，完全平倉時比對 TP2/SL。
+        已走過 partial（TP1）的單，完全平倉時加上 TP1+ 前綴方便辨識。
+
+        注意：move_to_breakeven 後 DB 的 sl 欄位已更新為保本價，
+        因此必須在 SL 比對之前先判斷 BREAKEVEN，否則會被誤判為 SL。
         """
         if not exit_price or exit_price <= 0:
             return "UNKNOWN"
 
-        direction = trade["direction"]
-        tp1 = trade.get("tp1") or 0
-        tp2 = trade.get("tp2") or 0
-        sl  = trade.get("sl") or 0
-        entry = trade.get("entry") or 0
+        direction   = trade["direction"]
+        tp1         = trade.get("tp1") or 0
+        tp2         = trade.get("tp2") or 0
+        sl          = trade.get("sl") or 0
+        entry       = trade.get("entry") or 0
         was_partial = trade.get("status") == "partial"
+        is_be       = trade.get("breakeven", False)
 
         # 容差：價格的 0.3%（避免滑價造成誤判）
         tol = entry * 0.003 if entry > 0 else 0
 
+        # ── 1. BREAKEVEN 先判斷（SL 已移至 BE 價，必須優先於 SL 比對）──
+        if is_be and sl > 0 and abs(exit_price - sl) <= tol:
+            # TP1 一定已觸發才會有 breakeven，固定前綴 TP1+
+            return "TP1+BE"
+
+        # ── 2. TP2（最優先）──────────────────────────────────────
         if direction == "LONG":
             if tp2 > 0 and exit_price >= tp2 - tol:
                 return "TP2"
+            # TP1 全倉（未曾 partial）
             if tp1 > 0 and not was_partial and exit_price >= tp1 - tol:
                 return "TP1"
+            # SL
             if sl > 0 and exit_price <= sl + tol:
-                return "SL"
-            # breakeven 觸發（止損在入場價附近）
-            if trade.get("breakeven") and abs(exit_price - entry) <= tol:
-                return "BREAKEVEN"
+                return "TP1+SL" if was_partial else "SL"
         else:  # SHORT
             if tp2 > 0 and exit_price <= tp2 + tol:
                 return "TP2"
             if tp1 > 0 and not was_partial and exit_price <= tp1 + tol:
                 return "TP1"
             if sl > 0 and exit_price >= sl - tol:
-                return "SL"
-            if trade.get("breakeven") and abs(exit_price - entry) <= tol:
-                return "BREAKEVEN"
+                return "TP1+SL" if was_partial else "SL"
 
-        # 追蹤止盈
+        # ── 3. 追蹤止盈 ───────────────────────────────────────────
         if trade.get("use_trailing"):
-            return "TRAILING"
+            return "TP1+TRAILING" if was_partial else "TRAILING"
 
         return "UNKNOWN"
 

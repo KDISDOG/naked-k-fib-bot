@@ -498,8 +498,8 @@
       <form method="post" action="/api/update_config" id="configForm">
         <div class="form-row">
           <div class="form-group">
-            <label>每筆風險 %（如 0.03 = 3%）</label>
-            <input type="number" name="risk_pct" value="{{ risk_pct }}" step="0.005" min="0.005" max="0.1">
+            <label>每筆保證金（USDT）</label>
+            <input type="number" name="margin_usdt" value="{{ margin_usdt }}" step="1" min="1" max="10000">
           </div>
           <div style="display:flex;align-items:flex-end;padding-bottom:6px;font-size:12px;color:#718096">
             槓桿：固定 3x
@@ -549,13 +549,14 @@
               <th style="color:#fc8181">止損</th>
               <th>保證金</th>
               <th>未實現損益</th>
+              <th>損益%</th>
               <th>R:R</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody id="open-pos-body">
             <tr>
-              <td colspan="11" style="text-align:center;color:#4a5568;padding:20px">載入中...</td>
+              <td colspan="12" style="text-align:center;color:#4a5568;padding:20px">載入中...</td>
             </tr>
           </tbody>
         </table>
@@ -616,6 +617,9 @@
                   {% if t.close_reason == 'TP1' %}<span style="color:#68d391">TP1</span>
                   {% elif t.close_reason == 'TP2' %}<span style="color:#4fd1c5">TP2</span>
                   {% elif t.close_reason == 'SL' %}<span style="color:#fc8181">SL</span>
+                  {% elif t.close_reason == 'TP1+SL' %}<span style="color:#f6ad55">TP1+SL</span>
+                  {% elif t.close_reason == 'TP1+BE' %}<span style="color:#63b3ed">TP1+保本</span>
+                  {% elif t.close_reason == 'TP1+TRAILING' %}<span style="color:#b794f4">TP1+TRAIL</span>
                   {% elif t.close_reason == 'TIMEOUT' %}<span style="color:#ecc94b">TIMEOUT</span>
                   {% elif t.close_reason == 'MANUAL' %}<span style="color:#a0aec0">MANUAL</span>
                   {% elif t.close_reason == 'BREAKEVEN' %}<span style="color:#63b3ed">BE</span>
@@ -719,7 +723,7 @@
         const timeEl = document.getElementById('pos-update-time');
         if (timeEl) timeEl.textContent = `（${new Date().toLocaleTimeString('zh-TW')} 更新）`;
         if (!positions || positions.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#4a5568;padding:20px">目前無開倉</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#4a5568;padding:20px">目前無開倉</td></tr>';
           if (header) header.childNodes[0].textContent = '當前持倉（0）';
           return;
         }
@@ -736,6 +740,7 @@
             <td style="color:#fc8181">${fmtPrice(p.sl)}</td>
             <td style="color:#a0aec0">${p.margin != null ? p.margin.toFixed(2) + ' U' : '—'}</td>
             <td>${fmtUsdt(p.unrealized_pnl)}</td>
+            <td style="color:${p.pnl_pct == null ? '#a0aec0' : p.pnl_pct >= 0 ? '#68d391' : '#fc8181'}">${p.pnl_pct != null ? (p.pnl_pct >= 0 ? '+' : '') + p.pnl_pct.toFixed(2) + '%' : '—'}</td>
             <td>${p.rr != null ? p.rr.toFixed(2) : '—'}</td>
             <td><button class="btn btn-danger" style="font-size:11px;padding:4px 8px"
                   onclick="closePosition(${p.id},'${p.symbol}')">停單</button></td>

@@ -16,9 +16,8 @@ class Config:
 
     # ── 通用風控 ─────────────────────────────────────────────────
     MAX_LEVERAGE      = int(os.getenv("MAX_LEVERAGE", 3))      # 固定 3x
-    RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE", 0.05))
+    MARGIN_USDT       = float(os.getenv("MARGIN_USDT", 50.0))  # 每筆固定保證金（USDT），不足就不開單
     MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", 6))     # 同時最多 6 倉
-    MAX_NOTIONAL_PCT  = float(os.getenv("MAX_NOTIONAL_PCT", round(1/6, 4)))  # 每筆保證金 ≈ 16.67%
     COOLDOWN_BARS     = int(os.getenv("COOLDOWN_BARS", 6))
     MAX_DAILY_LOSS    = float(os.getenv("MAX_DAILY_LOSS", 0.08))
 

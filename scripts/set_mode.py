@@ -23,9 +23,8 @@ MODES = {
     "strict": {
         # 風控參數
         "MAX_LEVERAGE":            "3",
-        "RISK_PER_TRADE":          "0.05",
+        "MARGIN_USDT":             "50",
         "MAX_POSITIONS":           "5",
-        "MAX_NOTIONAL_PCT":        "0.20",
         "MIN_SIGNAL_SCORE":        "3",
         "COOLDOWN_BARS":           "6",
         # 選幣參數
@@ -45,9 +44,8 @@ MODES = {
     "loose": {
         # 風控參數
         "MAX_LEVERAGE":            "5",
-        "RISK_PER_TRADE":          "0.10",
+        "MARGIN_USDT":             "100",
         "MAX_POSITIONS":           "10",
-        "MAX_NOTIONAL_PCT":        "0.40",
         "MIN_SIGNAL_SCORE":        "2",
         "COOLDOWN_BARS":           "3",
         # 選幣參數（更低門檻 → 選更多幣）
@@ -69,9 +67,8 @@ MODES = {
 DESCRIPTIONS = {
     # 風控
     "MAX_LEVERAGE":           "最大槓桿倍率",
-    "RISK_PER_TRADE":         "每筆最大風險（佔可用餘額）",
+    "MARGIN_USDT":            "每筆固定保證金（USDT）",
     "MAX_POSITIONS":          "同時最多開倉數",
-    "MAX_NOTIONAL_PCT":       "單筆保證金上限（佔帳戶）",
     "MIN_SIGNAL_SCORE":       "最低訊號強度（1-5）",
     "COOLDOWN_BARS":          "止損後冷卻 K 棒數",
     # 選幣
