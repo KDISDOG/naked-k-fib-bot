@@ -28,14 +28,19 @@ log = logging.getLogger("syncer")
 
 
 class PositionSyncer:
-    # 孤兒單掃蕩頻率：每 N 次 sync 跑一次（預設 10 → 每 5 分鐘）
-    _ORPHAN_SWEEP_EVERY = 10
+    # 孤兒單掃蕩頻率：每 N 次 sync 跑一次（預設 2 → 每分鐘，SYNC_SEC=30 的情況）
+    _ORPHAN_SWEEP_EVERY = 2
 
     def __init__(self, client: Client, db, executor):
         self.client   = client
         self.db       = db
         self.executor = executor
         self._sync_count = 0
+        # 啟動時立刻掃一次孤兒單（清掉重啟前累積的殘留）
+        try:
+            self._sweep_orphan_orders()
+        except Exception as e:
+            log.error(f"啟動時孤兒單掃蕩失敗: {e}")
 
     def sync(self):
         """主同步邏輯：比對 DB 和幣安實際倉位"""
@@ -90,6 +95,16 @@ class PositionSyncer:
                 # ── 情況 1: 完全平倉 ────────────────────────────────
                 if actual_qty <= 0 or abs(actual_qty) < 0.0001:
                     log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
+
+                    # 先清殘留掛單（reduceOnly TP/SL 不會自動取消）
+                    # 放最前面：即使後續 close_trade/notify 丟例外，
+                    # 孤兒單已經被清掉
+                    try:
+                        self.client.futures_cancel_all_open_orders(symbol=symbol)
+                        log.info(f"[{symbol}] 已清除平倉後殘留掛單")
+                    except Exception as ce:
+                        log.warning(f"[{symbol}] 清除殘留掛單失敗: {ce}")
+
                     exit_price = self._get_last_trade_price(symbol)
                     fee = self._get_recent_fee(symbol, qty)
 
@@ -103,13 +118,6 @@ class PositionSyncer:
                         partial      = False,
                         close_reason = reason,
                     )
-
-                    # 清掉此 symbol 殘留掛單（reduceOnly TP/SL 不會自動取消）
-                    try:
-                        self.client.futures_cancel_all_open_orders(symbol=symbol)
-                        log.info(f"[{symbol}] 已清除平倉後殘留掛單")
-                    except Exception as ce:
-                        log.warning(f"[{symbol}] 清除殘留掛單失敗: {ce}")
                     # 計算淨盈虧通知
                     _ep = exit_price or entry
                     if direction == "LONG":
