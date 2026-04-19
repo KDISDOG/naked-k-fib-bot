@@ -28,14 +28,28 @@ log = logging.getLogger("syncer")
 
 
 class PositionSyncer:
+    # 孤兒單掃蕩頻率：每 N 次 sync 跑一次（預設 10 → 每 5 分鐘）
+    _ORPHAN_SWEEP_EVERY = 10
+
     def __init__(self, client: Client, db, executor):
         self.client   = client
         self.db       = db
         self.executor = executor
+        self._sync_count = 0
 
     def sync(self):
         """主同步邏輯：比對 DB 和幣安實際倉位"""
+        self._sync_count += 1
+
         open_trades = self.db.get_open_trades()
+
+        # 孤兒單掃蕩（獨立路徑，即使無 open_trades 也要跑）
+        if self._sync_count % self._ORPHAN_SWEEP_EVERY == 0:
+            try:
+                self._sweep_orphan_orders()
+            except Exception as e:
+                log.error(f"孤兒單掃蕩失敗: {e}")
+
         if not open_trades:
             return
 
@@ -89,6 +103,13 @@ class PositionSyncer:
                         partial      = False,
                         close_reason = reason,
                     )
+
+                    # 清掉此 symbol 殘留掛單（reduceOnly TP/SL 不會自動取消）
+                    try:
+                        self.client.futures_cancel_all_open_orders(symbol=symbol)
+                        log.info(f"[{symbol}] 已清除平倉後殘留掛單")
+                    except Exception as ce:
+                        log.warning(f"[{symbol}] 清除殘留掛單失敗: {ce}")
                     # 計算淨盈虧通知
                     _ep = exit_price or entry
                     if direction == "LONG":
@@ -162,6 +183,64 @@ class PositionSyncer:
                     f"[{trade.get('symbol', '?')}] "
                     f"#{trade.get('id', '?')} 同步處理失敗，跳過此筆: {e}"
                 )
+
+    # ── 孤兒單掃蕩 ───────────────────────────────────────────────
+    def _sweep_orphan_orders(self):
+        """
+        清除孤兒單：幣安上有掛單、但 DB 中沒有對應 open/partial trade
+        且幣安實際持倉為 0 的 symbol，全部取消。
+
+        產生孤兒的情境：
+          - TP2 觸發全平後，殘留的 reduceOnly SL / TP1 不會自動取消
+          - 歷史上因重複下單產生的冗餘訂單
+          - 手動在幣安 APP 平倉後未同步
+        """
+        try:
+            all_open = retry_api(self.client.futures_get_open_orders)
+        except Exception as e:
+            log.warning(f"取得全站掛單失敗: {e}")
+            return
+
+        if not all_open:
+            return
+
+        # 幣安上有實際持倉的 symbols
+        try:
+            positions = retry_api(self.client.futures_position_information)
+            has_pos = {
+                p["symbol"] for p in positions
+                if abs(float(p.get("positionAmt", 0))) > 0
+            }
+        except Exception as e:
+            log.warning(f"取得持倉資訊失敗: {e}")
+            return
+
+        # DB 中仍 open/partial 的 symbols
+        open_trades = self.db.get_open_trades()
+        db_symbols = {t["symbol"] for t in open_trades}
+
+        # 按 symbol 分組，找出「有掛單但無持倉 且 DB 無紀錄」的孤兒
+        symbols_in_orders: dict[str, int] = {}
+        for o in all_open:
+            sym = o["symbol"]
+            symbols_in_orders[sym] = symbols_in_orders.get(sym, 0) + 1
+
+        cleaned_total = 0
+        for sym, cnt in symbols_in_orders.items():
+            if sym in has_pos:
+                continue  # 有持倉，不動
+            if sym in db_symbols:
+                continue  # DB 還認為是 open，先不動（避免誤刪正常待觸發單）
+            # 孤兒 symbol：無持倉 + DB 無紀錄 → 全清
+            try:
+                self.client.futures_cancel_all_open_orders(symbol=sym)
+                cleaned_total += cnt
+                log.warning(f"[{sym}] 孤兒單掃蕩：取消 {cnt} 筆")
+            except Exception as e:
+                log.warning(f"[{sym}] 取消孤兒單失敗: {e}")
+
+        if cleaned_total:
+            log.warning(f"孤兒單掃蕩完成，共清除 {cleaned_total} 筆")
 
     # ── 追蹤止盈邏輯 ─────────────────────────────────────────────
     def _update_trailing(self, trade: dict):
