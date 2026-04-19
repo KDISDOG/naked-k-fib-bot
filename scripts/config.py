@@ -69,10 +69,13 @@ class Config:
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
 
     # ── 追蹤止盈（Trailing Stop）────────────────────────────────
+    # 總開關：關閉後純靠 SL/TP1/TP2 + 保本一次性移動。避免 30 秒推進
+    # 造成孤兒單累積 / 掛單爆量。預設 false 保守運行。
+    TRAILING_ENABLED = os.getenv("TRAILING_ENABLED", "false").lower() == "true"
     TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", 1.5))  # 追蹤距離 = N × ATR
     TRAILING_ACTIVATE_AFTER_TP1 = os.getenv(
         "TRAILING_ACTIVATE_AFTER_TP1", "true"
-    ).lower() == "true"  # TP1 成交後自動啟用追蹤止盈
+    ).lower() == "true"  # TP1 成交後自動啟用追蹤止盈（需 TRAILING_ENABLED=true）
     # 最小推進步長：SL 至少前進 N × ATR 才換單，避免每 30 秒重下單（瘋狂開委託）
     TRAILING_MIN_STEP_ATR = float(os.getenv("TRAILING_MIN_STEP_ATR", 0.3))
 

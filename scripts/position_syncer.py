@@ -162,8 +162,9 @@ class PositionSyncer:
                         except Exception as be:
                             log.error(f"[{symbol}] #{trade_id} move_to_breakeven 失敗: {be}")
 
-                    # TP1 後自動啟用追蹤止盈（所有策略通用）
-                    if Config.TRAILING_ACTIVATE_AFTER_TP1 and \
+                    # TP1 後自動啟用追蹤止盈（需總開關開啟）
+                    if Config.TRAILING_ENABLED and \
+                            Config.TRAILING_ACTIVATE_AFTER_TP1 and \
                             not trade.get("use_trailing"):
                         try:
                             atr_val = self._get_current_atr(
@@ -180,7 +181,8 @@ class PositionSyncer:
                             log.error(f"[{symbol}] #{trade_id} 啟用追蹤止盈失敗: {te}")
 
                 # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
-                if trade.get("use_trailing"):
+                # 總開關關閉時直接略過，即使 DB 既有紀錄 use_trailing=True
+                if Config.TRAILING_ENABLED and trade.get("use_trailing"):
                     try:
                         self._update_trailing(trade)
                     except Exception as ute:
