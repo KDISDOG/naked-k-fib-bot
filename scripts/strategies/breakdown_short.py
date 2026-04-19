@@ -59,6 +59,8 @@ class BreakdownShortStrategy(BaseStrategy):
 
     def _get_klines(self, symbol: str, interval: str,
                     limit: int = 200) -> pd.DataFrame:
+        if self._market_ctx is not None and hasattr(self._market_ctx, "get_klines"):
+            return self._market_ctx.get_klines(symbol, interval, limit)
         raw = self._client.futures_klines(
             symbol=symbol, interval=interval, limit=limit
         )
@@ -144,7 +146,7 @@ class BreakdownShortStrategy(BaseStrategy):
             return 0  # ADX 不在範圍內
 
         # 4. 下降波段：近期 swing high 遞降
-        swings_h = self._find_swing_highs(df, left=5, right=5)
+        swings_h = self._find_swing_highs(df, left=10, right=10)
         if len(swings_h) >= 2:
             # 最近兩個 swing high 遞降 = 下降趨勢確認
             if swings_h[-1]["price"] < swings_h[-2]["price"]:
@@ -430,26 +432,29 @@ class BreakdownShortStrategy(BaseStrategy):
           SL  = support + BD_SL_ATR_MULT * ATR
         """
         # 找最近的 swing high 和 swing low
-        swing_highs = self._find_swing_highs(df, left=5, right=5)
-        swing_lows = self._find_swing_lows(df, left=5, right=5)
+        swing_highs = self._find_swing_highs(df, left=10, right=10)
+        swing_lows = self._find_swing_lows(df, left=10, right=10)
 
+        # 時序驗證：做空要找「先 high 後 low」的下降結構
+        # 若最新 swing 是 higher low（low 在 high 之後），則結構不是下跌 → fallback
+        valid_fib = False
         if swing_highs and swing_lows:
-            # 取最近的 swing high（必須在 swing low 之前或附近）
-            sh = swing_highs[-1]["price"]
-            sl_swing = swing_lows[-1]["price"]
+            sh_obj = swing_highs[-1]
+            sl_obj = swing_lows[-1]
+            sh = sh_obj["price"]
+            sl_swing = sl_obj["price"]
+            # 條件：swing_high 的 idx 必須在 swing_low 之前（先漲後跌的結構）
+            if sh_obj["idx"] < sl_obj["idx"] and sh > sl_swing:
+                valid_fib = True
 
-            # 確保 swing high > swing low
-            if sh > sl_swing:
-                diff = sh - sl_swing
-                tp1 = sl_swing - diff * 0.272  # 1.272 extension
-                tp2 = sl_swing - diff * 0.618  # 1.618 extension
-            else:
-                # fallback: 用 ATR 計算
-                tp1 = entry * 0.97   # -3%
-                tp2 = entry * 0.95   # -5%
+        if valid_fib:
+            diff = sh - sl_swing
+            tp1 = sl_swing - diff * 0.272  # 1.272 extension
+            tp2 = sl_swing - diff * 0.618  # 1.618 extension
         else:
-            tp1 = entry * 0.97
-            tp2 = entry * 0.95
+            # fallback: ATR-based 目標
+            tp1 = entry - atr_val * 1.5
+            tp2 = entry - atr_val * 3.0
 
         # SL：突破點上方 + ATR 緩衝
         sl = support + Config.BD_SL_ATR_MULT * atr_val

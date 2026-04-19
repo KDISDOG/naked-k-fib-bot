@@ -51,6 +51,9 @@ class MeanReversionStrategy(BaseStrategy):
 
     def _get_klines(self, symbol: str, interval: str,
                     limit: int = 200) -> pd.DataFrame:
+        # 優先走 MarketContext 共用 cache，避免跨策略/跨呼叫重複抓
+        if self._market_ctx is not None and hasattr(self._market_ctx, "get_klines"):
+            return self._market_ctx.get_klines(symbol, interval, limit)
         raw = self._client.futures_klines(
             symbol=symbol, interval=interval, limit=limit
         )
@@ -214,13 +217,13 @@ class MeanReversionStrategy(BaseStrategy):
 
         # ── 做多判斷 ─────────────────────────────
         if (rsi_val <= Config.MR_RSI_OVERSOLD and
-                price <= bb_lower and adx_ok):
+                price <= bb_lower and adx_ok and vol_ok):
             if self._has_reversal_candle(df_a, "LONG"):
                 side = "LONG"
 
         # ── 做空判斷 ─────────────────────────────
         elif (rsi_val >= Config.MR_RSI_OVERBOUGHT and
-              price >= bb_upper and adx_ok):
+              price >= bb_upper and adx_ok and vol_ok):
             if self._has_reversal_candle(df_a, "SHORT"):
                 side = "SHORT"
 

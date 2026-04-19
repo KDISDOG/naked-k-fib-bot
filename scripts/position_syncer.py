@@ -28,54 +28,33 @@ log = logging.getLogger("syncer")
 
 
 class PositionSyncer:
+    # 孤兒單掃蕩頻率：每 N 次 sync 跑一次（預設 2 → 每分鐘，SYNC_SEC=30 的情況）
+    _ORPHAN_SWEEP_EVERY = 2
+
     def __init__(self, client: Client, db, executor):
         self.client   = client
         self.db       = db
         self.executor = executor
-        self._sync_count = 0          # 用於限制孤兒清理頻率
-
-    # ── 孤兒掛單清理 ─────────────────────────────────────────────
-    def cleanup_orphan_orders(self):
-        """
-        取消幣安上所有「無對應實際倉位」的掛單（TP/SL 孤兒）。
-        場景：SL 觸發後 TP 掛單沒被撤銷，積累過多掛單。
-        安全：只撤銷沒有真實倉位的 symbol 的掛單。
-        """
+        self._sync_count = 0
+        # 啟動時立刻掃一次孤兒單（清掉重啟前累積的殘留）
         try:
-            # 取得所有非零實際倉位（幣安端）
-            positions = retry_api(self.client.futures_position_information)
-            live_symbols: set[str] = set()
-            for pos in positions:
-                if float(pos["positionAmt"]) != 0:
-                    live_symbols.add(pos["symbol"])
-
-            # 取得所有有掛單的 symbol
-            open_orders = retry_api(self.client.futures_get_open_orders)
-            order_symbols: set[str] = {o["symbol"] for o in open_orders}
-
-            # 孤兒 = 有掛單 但 幣安無持倉
-            orphan_symbols = order_symbols - live_symbols
-            if not orphan_symbols:
-                return
-
-            log.info(f"發現孤兒掛單 symbols：{orphan_symbols}，開始清理")
-            for symbol in orphan_symbols:
-                try:
-                    self.client.futures_cancel_all_open_orders(symbol=symbol)
-                    log.info(f"[{symbol}] 孤兒掛單已撤銷")
-                except Exception as e:
-                    log.warning(f"[{symbol}] 撤孤兒掛單失敗: {e}")
+            self._sweep_orphan_orders()
         except Exception as e:
-            log.warning(f"孤兒掛單清理失敗: {e}")
+            log.error(f"啟動時孤兒單掃蕩失敗: {e}")
 
     def sync(self):
         """主同步邏輯：比對 DB 和幣安實際倉位"""
         self._sync_count += 1
-        # 每 10 次 sync（約 5 分鐘）執行一次孤兒清理
-        if self._sync_count % 10 == 1:
-            self.cleanup_orphan_orders()
 
         open_trades = self.db.get_open_trades()
+
+        # 孤兒單掃蕩（獨立路徑，即使無 open_trades 也要跑）
+        if self._sync_count % self._ORPHAN_SWEEP_EVERY == 0:
+            try:
+                self._sweep_orphan_orders()
+            except Exception as e:
+                log.error(f"孤兒單掃蕩失敗: {e}")
+
         if not open_trades:
             return
 
@@ -95,107 +74,183 @@ class PositionSyncer:
                 position_map[pos["symbol"]] = amt
 
         for trade in open_trades:
-            symbol    = trade["symbol"]
-            trade_id  = trade["id"]
-            direction = trade["direction"]
-            entry     = trade["entry"]
-            qty       = trade["qty"]
-            qty_closed = trade["qty_closed"]
+            try:
+                symbol    = trade["symbol"]
+                trade_id  = trade["id"]
+                direction = trade["direction"]
+                entry     = trade["entry"]
+                qty       = trade["qty"]
+                qty_closed = trade["qty_closed"]
 
-            # 幣安端實際持倉量
-            actual_amt = position_map.get(symbol, 0)
-            # LONG = positionAmt > 0，SHORT = positionAmt < 0
-            # 必須檢查方向是否符合，避免反向倉位被誤判為「完全平倉」
-            if direction == "LONG":
-                # LONG 倉不應計入 SHORT 的負數部分
-                actual_qty = actual_amt if actual_amt > 0 else 0
-            else:
-                # SHORT 倉不應計入 LONG 的正數部分
-                actual_qty = abs(actual_amt) if actual_amt < 0 else 0
-
-            expected_remaining = qty - qty_closed
-
-            # ── 情況 1: 完全平倉 ────────────────────────────────
-            if actual_qty <= 0 or abs(actual_qty) < 0.0001:
-                log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
-                exit_price = self._get_last_trade_price(symbol)
-                fee = self._get_recent_fee(symbol, qty)
-
-                # 平倉後撤銷幣安上剩餘的 TP/SL 掛單（避免殘留訂單干擾新倉）
-                try:
-                    self.client.futures_cancel_all_open_orders(symbol=symbol)
-                    log.info(f"[{symbol}] 平倉後已撤銷全部掛單")
-                except Exception as _e:
-                    log.warning(f"[{symbol}] 撤銷剩餘掛單失敗（可能已自行觸發）: {_e}")
-
-                # 判斷平倉原因
-                reason = self._detect_close_reason(trade, exit_price or entry)
-
-                self.db.close_trade(
-                    trade_id     = trade_id,
-                    exit_price   = exit_price or entry,
-                    fee          = fee,
-                    partial      = False,
-                    close_reason = reason,
-                )
-                # 計算淨盈虧通知
-                _ep = exit_price or entry
+                # 幣安端實際持倉量
+                actual_amt = position_map.get(symbol, 0)
+                # LONG = 正，SHORT = 負
                 if direction == "LONG":
-                    _raw_pnl = (_ep - entry) * qty
+                    actual_qty = actual_amt
                 else:
-                    _raw_pnl = (entry - _ep) * qty
-                _net = _raw_pnl - fee
-                notify.trade_closed(symbol, direction, _net, reason)
-                continue
+                    actual_qty = abs(actual_amt)
 
-            # ── 情況 2: 部分平倉（TP1 觸發）──────────────────────
-            qty_diff = expected_remaining - actual_qty
-            if qty_diff > 0.0005:
-                # 有一部分被平掉了（很可能是 TP1）
-                log.info(
-                    f"[{symbol}] #{trade_id} 偵測到部分平倉："
-                    f"預期剩餘={expected_remaining:.4f} "
-                    f"實際={actual_qty:.4f} 差異={qty_diff:.4f}"
-                )
-                # 估算平倉價格（用 TP1 價格）
-                exit_price = trade["tp1"] or self._get_last_trade_price(symbol)
-                fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+                expected_remaining = qty - qty_closed
 
-                self.db.close_trade(
-                    trade_id     = trade_id,
-                    exit_price   = exit_price or entry,
-                    fee          = fee,
-                    partial      = True,
-                    closed_qty   = qty_diff,
-                    close_reason = "TP1",
-                )
+                # ── 情況 1: 完全平倉 ────────────────────────────────
+                if actual_qty <= 0 or abs(actual_qty) < 0.0001:
+                    log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
 
-                # 觸發 Breakeven Stop（如果還沒移過）
-                if not trade["breakeven"]:
-                    self.executor.move_to_breakeven(
-                        symbol      = symbol,
-                        trade_id    = trade_id,
-                        entry_price = entry,
-                        direction   = direction,
+                    # 先清殘留掛單（reduceOnly TP/SL 不會自動取消）
+                    # 放最前面：即使後續 close_trade/notify 丟例外，
+                    # 孤兒單已經被清掉
+                    try:
+                        self.client.futures_cancel_all_open_orders(symbol=symbol)
+                        log.info(f"[{symbol}] 已清除平倉後殘留掛單")
+                    except Exception as ce:
+                        log.warning(f"[{symbol}] 清除殘留掛單失敗: {ce}")
+
+                    exit_price = self._get_last_trade_price(symbol)
+                    fee = self._get_recent_fee(symbol, qty)
+
+                    # 判斷平倉原因
+                    reason = self._detect_close_reason(trade, exit_price or entry)
+
+                    self.db.close_trade(
+                        trade_id     = trade_id,
+                        exit_price   = exit_price or entry,
+                        fee          = fee,
+                        partial      = False,
+                        close_reason = reason,
+                    )
+                    # 計算淨盈虧通知
+                    _ep = exit_price or entry
+                    if direction == "LONG":
+                        _raw_pnl = (_ep - entry) * qty
+                    else:
+                        _raw_pnl = (entry - _ep) * qty
+                    _net = _raw_pnl - fee
+                    notify.trade_closed(symbol, direction, _net, reason)
+                    continue
+
+                # ── 情況 2: 部分平倉（TP1 觸發）──────────────────────
+                qty_diff = expected_remaining - actual_qty
+                if qty_diff > 0.0005:
+                    # 有一部分被平掉了（很可能是 TP1）
+                    log.info(
+                        f"[{symbol}] #{trade_id} 偵測到部分平倉："
+                        f"預期剩餘={expected_remaining:.4f} "
+                        f"實際={actual_qty:.4f} 差異={qty_diff:.4f}"
+                    )
+                    # 估算平倉價格（用 TP1 價格）
+                    exit_price = trade["tp1"] or self._get_last_trade_price(symbol)
+                    fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+
+                    self.db.close_trade(
+                        trade_id     = trade_id,
+                        exit_price   = exit_price or entry,
+                        fee          = fee,
+                        partial      = True,
+                        closed_qty   = qty_diff,
+                        close_reason = "TP1",
                     )
 
-                # TP1 後自動啟用追蹤止盈（所有策略通用）
-                if Config.TRAILING_ACTIVATE_AFTER_TP1 and \
-                        not trade.get("use_trailing"):
-                    atr_val = self._get_current_atr(
-                        symbol, trade.get("timeframe", "15m")
-                    )
-                    if atr_val and atr_val > 0:
-                        self.db.enable_trailing(trade_id, atr_val)
-                        log.info(
-                            f"[{symbol}] TP1 後啟用追蹤止盈"
-                            f"（ATR={atr_val:.4f}，"
-                            f"距離={Config.TRAILING_ATR_MULT}×ATR）"
-                        )
+                    # 觸發 Breakeven Stop（如果還沒移過）
+                    if not trade["breakeven"]:
+                        try:
+                            self.executor.move_to_breakeven(
+                                symbol      = symbol,
+                                trade_id    = trade_id,
+                                entry_price = entry,
+                                direction   = direction,
+                            )
+                        except Exception as be:
+                            log.error(f"[{symbol}] #{trade_id} move_to_breakeven 失敗: {be}")
 
-            # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
-            if trade.get("use_trailing"):
-                self._update_trailing(trade)
+                    # TP1 後自動啟用追蹤止盈（需總開關開啟）
+                    if Config.TRAILING_ENABLED and \
+                            Config.TRAILING_ACTIVATE_AFTER_TP1 and \
+                            not trade.get("use_trailing"):
+                        try:
+                            atr_val = self._get_current_atr(
+                                symbol, trade.get("timeframe", "15m")
+                            )
+                            if atr_val and atr_val > 0:
+                                self.db.enable_trailing(trade_id, atr_val)
+                                log.info(
+                                    f"[{symbol}] TP1 後啟用追蹤止盈"
+                                    f"（ATR={atr_val:.4f}，"
+                                    f"距離={Config.TRAILING_ATR_MULT}×ATR）"
+                                )
+                        except Exception as te:
+                            log.error(f"[{symbol}] #{trade_id} 啟用追蹤止盈失敗: {te}")
+
+                # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
+                # 總開關關閉時直接略過，即使 DB 既有紀錄 use_trailing=True
+                if Config.TRAILING_ENABLED and trade.get("use_trailing"):
+                    try:
+                        self._update_trailing(trade)
+                    except Exception as ute:
+                        log.error(f"[{symbol}] #{trade_id} _update_trailing 失敗: {ute}")
+
+            except Exception as e:
+                log.error(
+                    f"[{trade.get('symbol', '?')}] "
+                    f"#{trade.get('id', '?')} 同步處理失敗，跳過此筆: {e}"
+                )
+
+    # ── 孤兒單掃蕩 ───────────────────────────────────────────────
+    def _sweep_orphan_orders(self):
+        """
+        清除孤兒單：幣安上有掛單、但 DB 中沒有對應 open/partial trade
+        且幣安實際持倉為 0 的 symbol，全部取消。
+
+        產生孤兒的情境：
+          - TP2 觸發全平後，殘留的 reduceOnly SL / TP1 不會自動取消
+          - 歷史上因重複下單產生的冗餘訂單
+          - 手動在幣安 APP 平倉後未同步
+        """
+        try:
+            all_open = retry_api(self.client.futures_get_open_orders)
+        except Exception as e:
+            log.warning(f"取得全站掛單失敗: {e}")
+            return
+
+        if not all_open:
+            return
+
+        # 幣安上有實際持倉的 symbols
+        try:
+            positions = retry_api(self.client.futures_position_information)
+            has_pos = {
+                p["symbol"] for p in positions
+                if abs(float(p.get("positionAmt", 0))) > 0
+            }
+        except Exception as e:
+            log.warning(f"取得持倉資訊失敗: {e}")
+            return
+
+        # DB 中仍 open/partial 的 symbols
+        open_trades = self.db.get_open_trades()
+        db_symbols = {t["symbol"] for t in open_trades}
+
+        # 按 symbol 分組，找出「有掛單但無持倉 且 DB 無紀錄」的孤兒
+        symbols_in_orders: dict[str, int] = {}
+        for o in all_open:
+            sym = o["symbol"]
+            symbols_in_orders[sym] = symbols_in_orders.get(sym, 0) + 1
+
+        cleaned_total = 0
+        for sym, cnt in symbols_in_orders.items():
+            if sym in has_pos:
+                continue  # 有持倉，不動
+            if sym in db_symbols:
+                continue  # DB 還認為是 open，先不動（避免誤刪正常待觸發單）
+            # 孤兒 symbol：無持倉 + DB 無紀錄 → 全清
+            try:
+                self.client.futures_cancel_all_open_orders(symbol=sym)
+                cleaned_total += cnt
+                log.warning(f"[{sym}] 孤兒單掃蕩：取消 {cnt} 筆")
+            except Exception as e:
+                log.warning(f"[{sym}] 取消孤兒單失敗: {e}")
+
+        if cleaned_total:
+            log.warning(f"孤兒單掃蕩完成，共清除 {cleaned_total} 筆")
 
     # ── 追蹤止盈邏輯 ─────────────────────────────────────────────
     def _update_trailing(self, trade: dict):
@@ -245,28 +300,45 @@ class PositionSyncer:
 
         trail_dist = Config.TRAILING_ATR_MULT * atr
 
+        # 最小推進步長：SL 必須比現值前進 >= min_step 才換單
+        # 避免 peak 微幅上移（0.01%）也觸發 → 每 30 秒重複下單
+        min_step = Config.TRAILING_MIN_STEP_ATR * atr
+
+        # Breakeven 下限（含來回手續費 + 0.02% buffer ≈ 0.1%）
+        # 讓 trailing 至少鎖住「真實保本」價，避免 SL 觸發後還輸手續費
+        be_buffer = 0.001  # 0.1%
+
         if direction == "LONG":
             peak = latest.get("highest_price") or price
-            new_sl = peak - trail_dist
-            # 止損只能往上推，且不低於入場價
-            if new_sl > entry and (sl is None or new_sl > sl):
+            breakeven_price = entry * (1 + be_buffer)
+            # TP1 後 trailing 下限 = breakeven；未 TP1 時下限 = entry
+            floor_price = breakeven_price if is_partial else entry
+            new_sl = max(peak - trail_dist, floor_price)
+            # 止損只能往上推，且需大於最小步長
+            advance = new_sl - sl if sl is not None else new_sl - floor_price
+            if new_sl > floor_price and advance >= min_step:
                 self.executor.move_trailing_sl(
                     symbol, trade_id, new_sl, direction
                 )
-                log.debug(
+                log.info(
                     f"[{symbol}] LONG trailing: peak={peak:.4f} "
-                    f"new_sl={new_sl:.4f} (dist={trail_dist:.4f})"
+                    f"new_sl={new_sl:.4f} floor={floor_price:.4f} "
+                    f"advance={advance:.4f} (min={min_step:.4f})"
                 )
         else:
             trough = latest.get("lowest_price") or price
-            new_sl = trough + trail_dist
-            if new_sl < entry and (sl is None or new_sl < sl):
+            breakeven_price = entry * (1 - be_buffer)
+            floor_price = breakeven_price if is_partial else entry
+            new_sl = min(trough + trail_dist, floor_price)
+            advance = sl - new_sl if sl is not None else floor_price - new_sl
+            if new_sl < floor_price and advance >= min_step:
                 self.executor.move_trailing_sl(
                     symbol, trade_id, new_sl, direction
                 )
-                log.debug(
+                log.info(
                     f"[{symbol}] SHORT trailing: trough={trough:.4f} "
-                    f"new_sl={new_sl:.4f} (dist={trail_dist:.4f})"
+                    f"new_sl={new_sl:.4f} floor={floor_price:.4f} "
+                    f"advance={advance:.4f} (min={min_step:.4f})"
                 )
 
     # ── 即時 ATR 取得（追蹤止盈用）────────────────────────────────
@@ -349,7 +421,8 @@ class PositionSyncer:
     def _get_last_trade_price(self, symbol: str) -> Optional[float]:
         """取得最近一筆成交價格"""
         try:
-            trades = self.client.futures_account_trades(
+            trades = retry_api(
+                self.client.futures_account_trades,
                 symbol=symbol, limit=5
             )
             if trades:
@@ -361,7 +434,8 @@ class PositionSyncer:
     def _get_recent_fee(self, symbol: str, qty: float) -> float:
         """取得最近交易的實際手續費"""
         try:
-            trades = self.client.futures_account_trades(
+            trades = retry_api(
+                self.client.futures_account_trades,
                 symbol=symbol, limit=10
             )
             total_fee = 0.0

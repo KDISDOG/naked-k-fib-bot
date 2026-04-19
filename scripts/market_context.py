@@ -18,13 +18,21 @@ import json
 
 log = logging.getLogger("market_ctx")
 
-_TTL_SEC = 3600  # 1 小時快取
+_TTL_SEC = 3600  # 1 小時快取（長期：BTC dom / weekly / correlation / OI）
+
+# K 線 cache 的 TTL 對應 timeframe（約為 timeframe 的一半，避免跨 K 棒取到舊資料）
+_KLINE_TTL_MAP = {
+    "1m": 20, "3m": 60, "5m": 90,
+    "15m": 240, "30m": 480,
+    "1h": 900, "2h": 1800, "4h": 3600,
+}
 
 
 class MarketContext:
     def __init__(self, client):
         self.client = client
         self._cache: dict = {}
+        self._kline_cache: dict = {}  # key = (symbol, interval, limit)
 
     # ── 快取輔助 ─────────────────────────────────────────────────
     def _get_cached(self, key: str):
@@ -35,6 +43,40 @@ class MarketContext:
 
     def _set_cached(self, key: str, value):
         self._cache[key] = {"ts": time.time(), "value": value}
+
+    # ── K 線共用 cache（所有策略/選幣器共用，避免重複 API）────────
+    def get_klines(self, symbol: str, interval: str = "15m",
+                   limit: int = 200):
+        """
+        取得 K 線 DataFrame（帶 TTL cache）。
+        所有策略/選幣器應優先呼叫此方法，避免同一 K 線被重複抓取。
+        回傳 pd.DataFrame，失敗時拋出例外（由呼叫方處理）。
+        """
+        key = (symbol, interval, limit)
+        ttl = _KLINE_TTL_MAP.get(interval, 60)
+        entry = self._kline_cache.get(key)
+        if entry and (time.time() - entry["ts"]) < ttl:
+            # 回傳 copy，避免呼叫方修改 cached DataFrame
+            return entry["df"].copy()
+
+        raw = self.client.futures_klines(
+            symbol=symbol, interval=interval, limit=limit
+        )
+        df = pd.DataFrame(raw, columns=[
+            "time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbav", "tbqv", "ignore"
+        ])
+        for col in ["open", "high", "low", "close", "volume", "qav"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+        df = df.reset_index(drop=True)
+        self._kline_cache[key] = {"ts": time.time(), "df": df}
+        return df.copy()
+
+    def clear_kline_cache(self):
+        """選幣/訊號大循環後可選擇清空，避免 memory 持續長大"""
+        self._kline_cache.clear()
 
     # ── BTC Dominance ────────────────────────────────────────────
     def btc_dominance(self) -> float:
