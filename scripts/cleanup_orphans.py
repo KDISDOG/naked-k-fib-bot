@@ -36,10 +36,29 @@ def main():
     )
     db = StateManager(Config.DB_PATH)
 
+    # 顯示 API key 前 6 碼讓使用者確認是正確帳號
+    key_preview = (Config.BINANCE_API_KEY or "")[:6] + "..." \
+        if Config.BINANCE_API_KEY else "(未設定)"
     log.info(
         f"連線：{'TESTNET' if Config.BINANCE_TESTNET else 'MAINNET'} / "
+        f"API key: {key_preview} / "
         f"模式：{'APPLY (實際取消)' if apply else 'DRY-RUN (只顯示)'}"
     )
+    log.info(
+        "※ testnet 與 mainnet 是獨立帳號，"
+        "若 UI 上看到的訂單不在此網域，這裡不會顯示"
+    )
+
+    # 先驗證連線：抓帳號資訊
+    try:
+        acct = client.futures_account()
+        log.info(
+            f"帳號驗證 OK，總餘額={acct.get('totalWalletBalance', 'N/A')} "
+            f"可用={acct.get('availableBalance', 'N/A')}"
+        )
+    except Exception as e:
+        log.error(f"帳號驗證失敗（API key 或網路問題）: {e}")
+        return 1
 
     # 1. 取所有未成交掛單
     try:
@@ -48,8 +67,10 @@ def main():
         log.error(f"取得全站掛單失敗: {e}")
         return 1
 
+    log.info(f"futures_get_open_orders 回傳 {len(all_open)} 筆掛單")
+
     if not all_open:
-        log.info("幣安上沒有任何掛單")
+        log.info("本帳號在此網域上沒有任何掛單")
         return 0
 
     # 2. 取所有持倉
