@@ -12,7 +12,7 @@ import math
 from typing import Optional
 from binance.client import Client
 from binance.enums import *
-from api_retry import retry_api
+from api_retry import retry_api, create_order_safe
 from notifier import notify
 
 log = logging.getLogger("executor")
@@ -132,10 +132,9 @@ class OrderExecutor:
             side       = SIDE_BUY if direction == "LONG" else SIDE_SELL
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
 
-            # 3. 市價開倉
-            order = retry_api(
-                self.client.futures_create_order,
-                symbol   = symbol,
+            # 3. 市價開倉（冪等下單，避免網路超時時重複開倉）
+            order = create_order_safe(
+                self.client, symbol,
                 side     = side,
                 type     = ORDER_TYPE_MARKET,
                 quantity = qty,
@@ -181,9 +180,8 @@ class OrderExecutor:
             # 4. 止損單（全倉 closePosition）— 失敗則緊急平倉
             sl_order_id = ""
             try:
-                sl_order = retry_api(
-                    self.client.futures_create_order,
-                    symbol        = symbol,
+                sl_order = create_order_safe(
+                    self.client, symbol,
                     side          = close_side,
                     type          = FUTURE_ORDER_TYPE_STOP_MARKET,
                     stopPrice     = sl,
@@ -195,9 +193,8 @@ class OrderExecutor:
                 notify.sl_placement_failed(symbol, direction)
                 # 緊急平倉保護資金
                 try:
-                    retry_api(
-                        self.client.futures_create_order,
-                        symbol     = symbol,
+                    create_order_safe(
+                        self.client, symbol,
                         side       = close_side,
                         type       = ORDER_TYPE_MARKET,
                         quantity   = qty,
@@ -212,9 +209,8 @@ class OrderExecutor:
             tp1_order_id = ""
             if qty_tp1 > 0:
                 try:
-                    tp1_order = retry_api(
-                        self.client.futures_create_order,
-                        symbol     = symbol,
+                    tp1_order = create_order_safe(
+                        self.client, symbol,
                         side       = close_side,
                         type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                         stopPrice  = tp1,
@@ -229,9 +225,8 @@ class OrderExecutor:
             tp2_order_id = ""
             if qty_tp2 > 0:
                 try:
-                    tp2_order = retry_api(
-                        self.client.futures_create_order,
-                        symbol     = symbol,
+                    tp2_order = create_order_safe(
+                        self.client, symbol,
                         side       = close_side,
                         type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                         stopPrice  = tp2,
@@ -354,9 +349,9 @@ class OrderExecutor:
             if remaining <= 0:
                 return True
 
-            # 下新止損
-            new_sl_order = self.client.futures_create_order(
-                symbol     = symbol,
+            # 下新止損（冪等下單）
+            new_sl_order = create_order_safe(
+                self.client, symbol,
                 side       = close_side,
                 type       = FUTURE_ORDER_TYPE_STOP_MARKET,
                 stopPrice  = new_sl,
@@ -411,8 +406,8 @@ class OrderExecutor:
             if remaining <= 0:
                 return True
 
-            new_sl_order = self.client.futures_create_order(
-                symbol     = symbol,
+            new_sl_order = create_order_safe(
+                self.client, symbol,
                 side       = close_side,
                 type       = FUTURE_ORDER_TYPE_STOP_MARKET,
                 stopPrice  = new_sl,
@@ -462,8 +457,8 @@ class OrderExecutor:
                 symbol = pos["symbol"]
                 side   = SIDE_SELL if qty > 0 else SIDE_BUY
                 abs_qty = self._round_qty(symbol, abs(qty))
-                self.client.futures_create_order(
-                    symbol     = symbol,
+                create_order_safe(
+                    self.client, symbol,
                     side       = side,
                     type       = ORDER_TYPE_MARKET,
                     quantity   = abs_qty,
@@ -493,8 +488,8 @@ class OrderExecutor:
             side = SIDE_SELL if qty > 0 else SIDE_BUY
             abs_qty = self._round_qty(symbol, abs(qty))
 
-            order = self.client.futures_create_order(
-                symbol     = symbol,
+            order = create_order_safe(
+                self.client, symbol,
                 side       = side,
                 type       = ORDER_TYPE_MARKET,
                 quantity   = abs_qty,
