@@ -2,8 +2,9 @@
 cleanup_orphans.py — 一次性孤兒單清理工具
 
 用法：
-  python scripts/cleanup_orphans.py           # dry-run：只列出不取消
-  python scripts/cleanup_orphans.py --apply   # 實際取消
+  python scripts/cleanup_orphans.py                    # dry-run：列出所有孤兒
+  python scripts/cleanup_orphans.py --apply            # 實際取消
+  python scripts/cleanup_orphans.py --symbol BTCUSDT   # 只查單一 symbol（診斷用）
 
 判定「孤兒單」條件（需全部成立）：
   1. 幣安上該 symbol 有 open order
@@ -28,6 +29,13 @@ log = logging.getLogger("cleanup")
 
 def main():
     apply = "--apply" in sys.argv
+
+    # 可選 --symbol 過濾（診斷用）
+    target_symbol = None
+    if "--symbol" in sys.argv:
+        idx = sys.argv.index("--symbol")
+        if idx + 1 < len(sys.argv):
+            target_symbol = sys.argv[idx + 1].upper()
 
     client = Client(
         Config.BINANCE_API_KEY,
@@ -62,7 +70,22 @@ def main():
 
     # 1. 取所有未成交掛單
     try:
-        all_open = client.futures_get_open_orders()
+        if target_symbol:
+            all_open = client.futures_get_open_orders(symbol=target_symbol)
+            log.info(
+                f"[診斷模式] 查詢 symbol={target_symbol} → {len(all_open)} 筆"
+            )
+            for o in all_open:
+                log.info(
+                    f"  - type={o['type']} side={o['side']} "
+                    f"stopPrice={o.get('stopPrice')} "
+                    f"origQty={o.get('origQty')} "
+                    f"status={o.get('status')} orderId={o['orderId']}"
+                )
+            if not apply:
+                return 0
+        else:
+            all_open = client.futures_get_open_orders()
     except Exception as e:
         log.error(f"取得全站掛單失敗: {e}")
         return 1
