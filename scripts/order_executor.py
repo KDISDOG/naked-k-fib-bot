@@ -177,15 +177,20 @@ class OrderExecutor:
                 f"[{symbol}] 開倉成功：{direction} qty={qty} @ {fill_price}"
             )
 
-            # 4. 止損單（全倉 closePosition）— 失敗則緊急平倉
+            # 4. 止損單（reduceOnly + qty）— 失敗則緊急平倉
+            # 注意：不用 closePosition=True，那是「Position-level TP/SL」
+            # 特殊 slot，不會出現在 futures_get_open_orders，bot 無法枚舉/管理。
+            # 改用 reduceOnly=True + quantity，SL 就是標準訂單，所有查詢端點
+            # 都看得到，cancel/枚舉邏輯正常運作。
             sl_order_id = ""
             try:
                 sl_order = create_order_safe(
                     self.client, symbol,
-                    side          = close_side,
-                    type          = FUTURE_ORDER_TYPE_STOP_MARKET,
-                    stopPrice     = sl,
-                    closePosition = True,
+                    side       = close_side,
+                    type       = FUTURE_ORDER_TYPE_STOP_MARKET,
+                    stopPrice  = sl,
+                    quantity   = qty,
+                    reduceOnly = True,
                 )
                 sl_order_id = str(sl_order.get("orderId", ""))
             except Exception as e:
