@@ -167,6 +167,15 @@ class MomentumLongStrategy(BaseStrategy):
         if len(gaps) > 0 and float(gaps.max()) > 0.05:
             return 0
 
+        # BTC Dominance > 55% → 山寨做多環境惡化（資金集中 BTC），ML 扣 2 分
+        # ML 靠突破動能，BTC 獨強時山寨會被吸乾流動性、假突破率升高
+        if self._market_ctx and symbol != "BTCUSDT":
+            try:
+                if self._market_ctx.is_high_btc_dominance(threshold=55.0):
+                    score -= 2
+            except Exception:
+                pass
+
         return score
 
     def _find_swing_highs(self, df: pd.DataFrame,
@@ -423,6 +432,15 @@ class MomentumLongStrategy(BaseStrategy):
           TP2 = swing_high + diff * 0.618 (1.618 extension)
           SL  = resistance - ML_SL_ATR_MULT * ATR
         """
+        # 先算 SL（TP RR 保底要用到 SL 距離）
+        # SL：突破點下方 - ATR 緩衝
+        sl = resistance - Config.ML_SL_ATR_MULT * atr_val
+        # SL 下限：不低於入場價 - 5%
+        sl = max(sl, entry * 0.95)
+        # SL 上限：至少在入場價下方 0.5%（避免被一根 K 棒的雜訊影線掃出場）
+        sl = min(sl, entry * 0.995)
+        sl_dist = entry - sl  # LONG: sl < entry → sl_dist > 0
+
         swing_highs = self._find_swing_highs(df, left=10, right=10)
         swing_lows = self._find_swing_lows(df, left=10, right=10)
 
@@ -442,16 +460,10 @@ class MomentumLongStrategy(BaseStrategy):
             tp1 = sh + diff * 0.272  # 1.272 extension
             tp2 = sh + diff * 0.618  # 1.618 extension
         else:
-            # fallback: ATR-based 目標
-            tp1 = entry + atr_val * 1.5
-            tp2 = entry + atr_val * 3.0
-
-        # SL：突破點下方 - ATR 緩衝
-        sl = resistance - Config.ML_SL_ATR_MULT * atr_val
-        # SL 下限：不低於入場價 - 5%
-        sl = max(sl, entry * 0.95)
-        # SL 上限：至少在入場價下方 0.5%（避免被一根 K 棒的雜訊影線掃出場）
-        sl = min(sl, entry * 0.995)
+            # fallback：ATR 目標，加 RR 保底（TP1≥1.5R、TP2≥2.5R）
+            # 避免震盪盤 ATR 小時 RR 撐不起最低 1.2 門檻
+            tp1 = entry + max(atr_val * 1.5, sl_dist * 1.5)
+            tp2 = entry + max(atr_val * 3.0, sl_dist * 2.5)
 
         # TP 合理性保護
         if tp1 <= entry:

@@ -108,16 +108,26 @@ def scan_coins():
     log.info("=" * 40)
     log.info("選幣掃描開始")
 
-    # 先取得全市場 USDT 合約列表（MR/BD/ML 使用）
+    # 先取得全市場 USDT 合約列表（所有策略共用）
+    # 統一過濾：黑名單 + 30 天新幣（新幣流動性差、MM 操縱風險高）
     try:
         info = client.futures_exchange_info()
+        now_ms = int(time.time() * 1000)
+        thirty_days_ms = 30 * 24 * 60 * 60 * 1000
         all_symbols = [
             s["symbol"] for s in info["symbols"]
             if s["quoteAsset"] == "USDT"
             and s["status"] == "TRADING"
             and not s["symbol"].endswith("_PERP")
             and not Config.is_excluded_symbol(s["symbol"])
+            and not (
+                s.get("onboardDate", 0)
+                and (now_ms - s["onboardDate"]) < thirty_days_ms
+            )
         ]
+        log.info(
+            f"全市場候選池：{len(all_symbols)} 支（已排除黑名單 + 30 天新幣）"
+        )
     except Exception as e:
         log.error(f"取得全市場 symbol 失敗: {e}")
         all_symbols = []

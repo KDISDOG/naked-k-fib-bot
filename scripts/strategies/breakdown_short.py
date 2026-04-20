@@ -176,6 +176,14 @@ class BreakdownShortStrategy(BaseStrategy):
         if len(gaps) > 0 and float(gaps.max()) > 0.05:
             return 0
 
+        # BTC Dominance > 55% → 山寨流動性被吸乾（即使做空也易遇假突破反殺），扣 1 分
+        if self._market_ctx and symbol != "BTCUSDT":
+            try:
+                if self._market_ctx.is_high_btc_dominance(threshold=55.0):
+                    score -= 1
+            except Exception:
+                pass
+
         return score
 
     def _find_swing_highs(self, df: pd.DataFrame,
@@ -433,6 +441,15 @@ class BreakdownShortStrategy(BaseStrategy):
           TP2 = swing_low - diff * 0.618 (1.618 extension)
           SL  = support + BD_SL_ATR_MULT * ATR
         """
+        # 先算 SL（TP RR 保底要用到 SL 距離）
+        # SL：突破點上方 + ATR 緩衝
+        sl = support + Config.BD_SL_ATR_MULT * atr_val
+        # SL 上限：不超過入場價 + 5%
+        sl = min(sl, entry * 1.05)
+        # SL 下限：至少在入場價上方 0.5%（避免被一根 K 棒的雜訊影線掃出場）
+        sl = max(sl, entry * 1.005)
+        sl_dist = sl - entry  # SHORT: sl > entry → sl_dist > 0
+
         # 找最近的 swing high 和 swing low
         swing_highs = self._find_swing_highs(df, left=10, right=10)
         swing_lows = self._find_swing_lows(df, left=10, right=10)
@@ -454,16 +471,10 @@ class BreakdownShortStrategy(BaseStrategy):
             tp1 = sl_swing - diff * 0.272  # 1.272 extension
             tp2 = sl_swing - diff * 0.618  # 1.618 extension
         else:
-            # fallback: ATR-based 目標
-            tp1 = entry - atr_val * 1.5
-            tp2 = entry - atr_val * 3.0
-
-        # SL：突破點上方 + ATR 緩衝
-        sl = support + Config.BD_SL_ATR_MULT * atr_val
-        # SL 上限：不超過入場價 + 5%
-        sl = min(sl, entry * 1.05)
-        # SL 下限：至少在入場價上方 0.5%（避免被一根 K 棒的雜訊影線掃出場）
-        sl = max(sl, entry * 1.005)
+            # fallback：ATR 目標，加 RR 保底（TP1≥1.5R、TP2≥2.5R）
+            # 避免震盪盤 ATR 小時 RR 撐不起最低 1.2 門檻
+            tp1 = entry - max(atr_val * 1.5, sl_dist * 1.5)
+            tp2 = entry - max(atr_val * 3.0, sl_dist * 2.5)
 
         # TP 合理性保護
         if tp1 >= entry:

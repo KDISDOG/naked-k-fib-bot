@@ -94,6 +94,16 @@ class CoinScreener:
         except Exception:
             pass
 
+        # 極端 funding（|fr| > 0.15%/8h = 年化 >160%）→ 直接排除：
+        # 持倉成本過高，且代表市場已過度擠壓一方，技術面容易被 funding 反噬
+        if abs(fr_raw) > 0.0015:
+            details = {
+                "vol_24h_m":    round(vol_24h / 1_000_000, 1),
+                "funding_rate": round(fr_raw * 100, 4),
+                "funding_reject": True,
+            }
+            return 0, details
+
         if abs(fr_raw) < 0.0005:          # 中性
             score += 1
         elif fr_raw > 0.0005 and swing_trend == "down":
@@ -101,7 +111,7 @@ class CoinScreener:
         elif fr_raw < -0.0005 and swing_trend == "up":
             score += 1                     # 空方擠壓 + 做多 → 有利
         elif abs(fr_raw) > 0.001:
-            score -= 1                     # 極端且方向不利 → 扣分
+            score -= 1                     # 偏高但還沒到排除門檻 → 扣分
 
         details = {
             "vol_24h_m": round(vol_24h / 1_000_000, 1),
@@ -353,6 +363,12 @@ class CoinScreener:
         swing_trend = self._detect_swing_trend(df)
 
         s1, d1 = self._score_liquidity(df, symbol, swing_trend=swing_trend)
+        # Funding 極端（>0.15%/8h）→ 整支幣直接排除
+        if d1.get("funding_reject"):
+            log.debug(
+                f"{symbol} funding {d1.get('funding_rate')}%/8h 極端，排除"
+            )
+            return 0, d1
         s2, d2 = self._score_trend_structure(df, swing_trend=swing_trend)
         s3, d3 = self._score_candle_quality(df)
         s4, d4 = self._score_fib_respect(df)
@@ -378,37 +394,47 @@ class CoinScreener:
 
     # ── 掃描入口 ─────────────────────────────────────────────────
 
-    def scan(self, top: int = 20, min_score: int | None = None) -> list[str]:
+    def scan(self, top: int = 20, min_score: int | None = None,
+             symbols_override: list[str] | None = None) -> list[str]:
+        """
+        掃描市場並回傳評分最高的幣種清單。
+        symbols_override：若提供，則只在此清單內打分（由 bot_main 傳入統一候選池，
+                          避免各策略重複掃全市場 + 新幣/黑名單各自判斷不一致）。
+        """
         if min_score is None:
             min_score = self.screen_min_score
-        """掃描全市場，回傳評分最高的幣種清單"""
-        log.info("開始全市場掃描（裸K+Fib 專用選幣）...")
 
         from config import Config
-        info = retry_api(self.client.futures_exchange_info)
-        symbols = [
-            s["symbol"] for s in info["symbols"]
-            if s["quoteAsset"] == "USDT"
-            and s["status"] == "TRADING"
-            and not s["symbol"].endswith("_PERP")
-            and not Config.is_excluded_symbol(s["symbol"])
-        ]
-
-        # 排除新上線（onboardDate 30 天內）的幣
-        now_ms = pd.Timestamp.utcnow().timestamp() * 1000
-        thirty_days_ms = 30 * 24 * 60 * 60 * 1000
-        filtered = []
-        for s in info["symbols"]:
-            if s["symbol"] not in symbols:
-                continue
-            onboard = s.get("onboardDate", 0)
-            if onboard and (now_ms - onboard) < thirty_days_ms:
-                log.debug(f"跳過新幣：{s['symbol']}")
-                continue
-            filtered.append(s["symbol"])
-        symbols = filtered
-
-        log.info(f"共 {len(symbols)} 個 USDT 合約（已排除新幣）")
+        if symbols_override is not None:
+            # 尊重外部候選池（已由 bot_main 過濾黑名單 + 新幣）
+            symbols = list(symbols_override)
+            log.info(
+                f"開始打分（裸K+Fib 專用）：候選 {len(symbols)} 支（外部候選池）"
+            )
+        else:
+            # 全市場掃描：保留原有黑名單 + 30 天新幣過濾
+            log.info("開始全市場掃描（裸K+Fib 專用選幣）...")
+            info = retry_api(self.client.futures_exchange_info)
+            base_symbols = [
+                s["symbol"] for s in info["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+                and not s["symbol"].endswith("_PERP")
+                and not Config.is_excluded_symbol(s["symbol"])
+            ]
+            now_ms = pd.Timestamp.utcnow().timestamp() * 1000
+            thirty_days_ms = 30 * 24 * 60 * 60 * 1000
+            filtered = []
+            for s in info["symbols"]:
+                if s["symbol"] not in base_symbols:
+                    continue
+                onboard = s.get("onboardDate", 0)
+                if onboard and (now_ms - onboard) < thirty_days_ms:
+                    log.debug(f"跳過新幣：{s['symbol']}")
+                    continue
+                filtered.append(s["symbol"])
+            symbols = filtered
+            log.info(f"共 {len(symbols)} 個 USDT 合約（已排除新幣）")
 
         results = []
         for i, sym in enumerate(symbols):

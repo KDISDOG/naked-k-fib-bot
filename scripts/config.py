@@ -30,7 +30,13 @@ class Config:
 
     # ── 策略專屬 R:R 門檻（per-strategy）────────────────────────
     NKF_MIN_RR = float(os.getenv("NKF_MIN_RR", 1.2))
-    MR_MIN_RR  = float(os.getenv("MR_MIN_RR", 1.05))
+    # MR 從 1.05 提到 1.2：1.05 毛 RR 扣完 round-trip 手續費後 net ≈ 1，
+    # 長期勝率要 >55% 才不賠。用 1.2 維持合理安全邊際。
+    MR_MIN_RR  = float(os.getenv("MR_MIN_RR", 1.2))
+
+    # ── 手續費率（VIP 等級不同可自訂，留 env override）──────────
+    TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", 0.0004))  # 0.04%
+    MAKER_FEE_RATE = float(os.getenv("MAKER_FEE_RATE", 0.0002))  # 0.02%
 
     # ── 排程 ─────────────────────────────────────────────────────
     RESCAN_MIN       = int(os.getenv("RESCAN_MIN", 15))
@@ -70,7 +76,7 @@ class Config:
     MR_TIMEFRAME     = os.getenv("MR_TIMEFRAME", "15m")
     MR_TP_PCT        = float(os.getenv("MR_TP_PCT", 0.05))    # 5% 止盈
     MR_SL_PCT        = float(os.getenv("MR_SL_PCT", 0.025))   # 2.5% 止損
-    MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 3))
+    MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 4))   # 3→4：確保加分條件達 1 個以上，非只基礎分
     MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 0.9))   # 均值回歸：要求縮量確認（賣盤衰竭），避免放量急跌時接刀
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
 
@@ -110,7 +116,9 @@ class Config:
     ML_MAX_POSITIONS = int(os.getenv("ML_MAX_POSITIONS", 2))      # 最大持倉數
 
     # ── OI 異常過濾 ──────────────────────────────────────────────
-    OI_CHANGE_MAX = float(os.getenv("OI_CHANGE_MAX", 20.0))      # OI 24h 變動 > N% 視為異常
+    # OI 24h 變動 > N% 視為異常（大戶佈局，技術面易失效）
+    # 20%→30%：小市值幣天然 OI 波動大，20% 容易誤殺；30% 是更合理的「明顯大戶動作」門檻
+    OI_CHANGE_MAX = float(os.getenv("OI_CHANGE_MAX", 30.0))
 
     # ── Symbol 黑名單：穩定幣 / 包裝幣 / 指數類（避免誤開倉）────
     EXCLUDED_SYMBOLS = {

@@ -21,9 +21,9 @@ from api_retry import retry_api
 
 log = logging.getLogger("risk")
 
-# 幣安合約手續費（taker）
-TAKER_FEE_RATE = 0.0004   # 0.04%
-MAKER_FEE_RATE = 0.0002   # 0.02%
+# 幣安合約手續費（taker）— 從 Config 取得，支援 .env 覆蓋（VIP 階級不同可調）
+TAKER_FEE_RATE = Config.TAKER_FEE_RATE
+MAKER_FEE_RATE = Config.MAKER_FEE_RATE
 
 
 class RiskManager:

@@ -161,6 +161,14 @@ class MeanReversionStrategy(BaseStrategy):
         if max_gap > 0.05:
             return 0
 
+        # BTC Dominance > 55% → 山寨震盪環境差（資金集中在 BTC），MR 扣 1 分
+        if self._market_ctx and symbol != "BTCUSDT":
+            try:
+                if self._market_ctx.is_high_btc_dominance(threshold=55.0):
+                    score -= 1
+            except Exception:
+                pass
+
         return score
 
     # ── 訊號偵測 ─────────────────────────────────────────────────
@@ -179,6 +187,19 @@ class MeanReversionStrategy(BaseStrategy):
         # 使用倒數第二根（已收盤確認）
         df_a = df.iloc[:-1].copy().reset_index(drop=True)
         latest = df_a.iloc[-1]
+
+        # Gap filter（signal 時再檢查一次）：screening 到 signal 間隔可能
+        # 發生大事件跳空；且跳空後 RSI 極端特別容易觸發，避免被事件單套牢
+        recent_20 = df_a.tail(21)
+        gaps = (
+            (recent_20["open"] - recent_20["close"].shift(1)).abs()
+            / recent_20["close"].shift(1)
+        ).dropna()
+        if len(gaps) > 0 and float(gaps.max()) > 0.03:
+            log.debug(
+                f"[{symbol}] MR 近 20 根偵測到 >3% 跳空（{float(gaps.max())*100:.1f}%），跳過"
+            )
+            return None
 
         # ── 計算指標 ─────────────────────────────────────────────
         rsi = ta.rsi(df_a["close"], length=Config.MR_RSI_PERIOD)
@@ -422,7 +443,9 @@ class MeanReversionStrategy(BaseStrategy):
         # TP1：ATR-based 短目標（高勝率）
         mid_dist = abs(bb_mid - entry)
         tp1_dist = min(atr_val * 1.2, mid_dist) if mid_dist > atr_val * 0.5 else atr_val * 1.0
-        tp1_dist = max(tp1_dist, entry * 0.005)  # 最少 0.5%
+        # 最少 1.2%：0.5% 扣 round-trip taker fee 0.08% 後淨利僅 0.42%，
+        # 勝率要 >70% 才能撐期望值；用 1.2% 保留合理淨利空間
+        tp1_dist = max(tp1_dist, entry * 0.012)
 
         if side == "LONG":
             tp1 = entry + tp1_dist

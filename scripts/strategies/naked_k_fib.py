@@ -46,14 +46,19 @@ class NakedKFibStrategy(BaseStrategy):
 
     def screen_coins(self, candidates: List[str]) -> List[str]:
         """
-        使用原有 CoinScreener 邏輯選幣。
-        candidates 參數在此策略中被忽略（screener 自行掃描全市場）。
+        使用 CoinScreener 為 candidates 打分、取前 N 支。
+        candidates 由 bot_main 統一產生（已過濾黑名單 + 新幣），
+        避免各策略各自掃全市場造成重複 API 呼叫與過濾邏輯漂移。
         """
         from config import Config
+        if not candidates:
+            log.warning("NKF 收到空 candidates，略過選幣")
+            return []
         try:
             return self._screener.scan(
                 top=20,
                 min_score=Config.SCREEN_MIN_SCORE,
+                symbols_override=candidates,
             )
         except Exception as e:
             log.error(f"NKF 選幣失敗: {e}")
