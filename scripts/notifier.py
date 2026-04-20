@@ -123,6 +123,75 @@ class TelegramNotifier:
             f"勝率: {win_rate:.1f}%  目前持倉: {open_count}"
         )
 
+    # ── 持倉小時報（每 1 小時）──────────────────────────────────
+    def positions_report(self, items: list[dict]):
+        """
+        每小時推送所有開倉的即時成效。
+        items 每筆含：
+          symbol, direction, strategy, entry, current, tp1, tp2, sl,
+          qty, margin, unrealized_pnl, price_pct, roe_pct
+        訊息太長自動分頁（Telegram 單則 4096 字元上限）。
+        """
+        if not items:
+            self._send(
+                "📊 <b>持倉小時報</b>\n目前無開倉。"
+            )
+            return
+
+        total_pnl = sum(float(it.get("unrealized_pnl", 0) or 0) for it in items)
+        header = (
+            f"📊 <b>持倉小時報</b>  持倉 {len(items)} 筆\n"
+            f"未實現總計: <b>{'+' if total_pnl >= 0 else ''}"
+            f"{total_pnl:.2f} USDT</b>\n"
+            f"───────────────"
+        )
+
+        blocks: list[str] = []
+        for it in items:
+            direction = it.get("direction", "")
+            dir_icon  = "🟢" if direction == "LONG" else "🔴"
+            strat     = it.get("strategy", "") or "-"
+            symbol    = it.get("symbol", "")
+            entry     = float(it.get("entry", 0) or 0)
+            current   = float(it.get("current", 0) or 0)
+            tp1       = float(it.get("tp1", 0) or 0)
+            tp2       = float(it.get("tp2", 0) or 0)
+            sl        = float(it.get("sl", 0) or 0)
+            pnl       = float(it.get("unrealized_pnl", 0) or 0)
+            price_pct = float(it.get("price_pct", 0) or 0)
+            roe_pct   = float(it.get("roe_pct", 0) or 0)
+            pnl_icon  = "🟩" if pnl >= 0 else "🟥"
+            sign_pct  = "+" if price_pct >= 0 else ""
+            sign_roe  = "+" if roe_pct   >= 0 else ""
+            sign_pnl  = "+" if pnl       >= 0 else ""
+
+            blocks.append(
+                f"{dir_icon} <b>{symbol}</b> {direction} "
+                f"[<i>{strat}</i>]\n"
+                f"  入場 <code>{entry:g}</code> → 現價 "
+                f"<code>{current:g}</code>  "
+                f"({sign_pct}{price_pct:.2f}%)\n"
+                f"  TP1 <code>{tp1:g}</code>  TP2 <code>{tp2:g}</code>  "
+                f"SL <code>{sl:g}</code>\n"
+                f"  {pnl_icon} ROE <b>{sign_roe}{roe_pct:.2f}%</b>  "
+                f"PnL {sign_pnl}{pnl:.2f} USDT"
+            )
+
+        # 分頁（Telegram 4096 字元上限，保險抓 3500）
+        MAX = 3500
+        chunks: list[str] = []
+        buf = header
+        for b in blocks:
+            piece = "\n" + b
+            if len(buf) + len(piece) > MAX:
+                chunks.append(buf)
+                buf = b
+            else:
+                buf += piece
+        chunks.append(buf)
+        for c in chunks:
+            self._send(c)
+
 
 # 全局單例
 notify = TelegramNotifier()

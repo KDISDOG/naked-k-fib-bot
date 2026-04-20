@@ -392,6 +392,65 @@ def send_daily_summary():
         log.error(f"每日總結發送失敗: {e}")
 
 
+# ── 持倉小時報 ─────────────────────────────────────────────────
+def send_positions_report():
+    """每小時推送所有開倉的即時成效（當前價/TP/SL/ROE/方向/策略）"""
+    try:
+        trades = db.get_open_trades()
+        if not trades:
+            notify.positions_report([])
+            return
+
+        # 一次抓全市場 mark price（單次 API call）
+        price_map: dict[str, float] = {}
+        try:
+            all_prices = client.futures_mark_price()
+            price_map = {
+                p["symbol"]: float(p["markPrice"]) for p in all_prices
+            }
+        except Exception as e:
+            log.warning(f"取得 mark price 失敗: {e}")
+
+        items = []
+        for t in trades:
+            symbol    = t.get("symbol", "")
+            direction = t.get("direction", "LONG")
+            entry     = float(t.get("entry") or 0)
+            qty_total = float(t.get("qty") or 0)
+            qty_done  = float(t.get("qty_closed") or 0)
+            qty_open  = max(qty_total - qty_done, 0)
+            margin    = float(t.get("margin") or 0)
+            current   = price_map.get(symbol, entry)
+
+            if direction == "LONG":
+                pnl = (current - entry) * qty_open
+                price_pct = ((current - entry) / entry * 100) if entry else 0
+            else:
+                pnl = (entry - current) * qty_open
+                price_pct = ((entry - current) / entry * 100) if entry else 0
+            roe_pct = (pnl / margin * 100) if margin else 0
+
+            items.append({
+                "symbol":         symbol,
+                "direction":      direction,
+                "strategy":       t.get("strategy", "") or "",
+                "entry":          entry,
+                "current":        current,
+                "tp1":            float(t.get("tp1") or 0),
+                "tp2":            float(t.get("tp2") or 0),
+                "sl":             float(t.get("sl") or 0),
+                "qty":            qty_open,
+                "margin":         margin,
+                "unrealized_pnl": pnl,
+                "price_pct":      price_pct,
+                "roe_pct":        roe_pct,
+            })
+
+        notify.positions_report(items)
+    except Exception as e:
+        log.error(f"持倉小時報發送失敗: {e}")
+
+
 # ── K 棒收盤對齊 ────────────────────────────────────────────────
 def wait_for_candle_close():
     now = datetime.now()
@@ -444,9 +503,10 @@ def setup_schedule():
     schedule.every(Config.SIGNAL_CHECK_MIN).minutes.do(check_signals)
     schedule.every(Config.SYNC_SEC).seconds.do(sync_positions)
     schedule.every().day.at("23:55").do(send_daily_summary)
+    schedule.every().hour.do(send_positions_report)
     log.info(
         f"排程設定：掃幣={Config.RESCAN_MIN}分 訊號={Config.SIGNAL_CHECK_MIN}分 "
-        f"同步={Config.SYNC_SEC}秒 每日總結=23:55"
+        f"同步={Config.SYNC_SEC}秒 每日總結=23:55 持倉小時報=每 1 小時"
     )
 
 
