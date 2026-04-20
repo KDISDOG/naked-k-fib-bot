@@ -305,7 +305,9 @@ class BreakdownShortStrategy(BaseStrategy):
             strategy_name = self.name,
             timeframe     = self.default_timeframe,
             pattern       = "BD_BREAKDOWN",
-            use_trailing  = adx_val > 35,  # 強趨勢時啟用追蹤
+            # 追蹤止盈：需 TRAILING_ENABLED=true 才生效；否則維持靜態 SL/TP1/TP2
+            # 避免 UI 顯示「啟用追蹤」但後台根本沒推進的誤導情況
+            use_trailing  = Config.TRAILING_ENABLED and adx_val > 35,
             trailing_atr  = atr_val,
             btc_corr      = btc_corr,
             metadata      = {
@@ -460,8 +462,8 @@ class BreakdownShortStrategy(BaseStrategy):
         sl = support + Config.BD_SL_ATR_MULT * atr_val
         # SL 上限：不超過入場價 + 5%
         sl = min(sl, entry * 1.05)
-        # SL 下限：至少在入場價上方 0.3%
-        sl = max(sl, entry * 1.003)
+        # SL 下限：至少在入場價上方 0.5%（避免被一根 K 棒的雜訊影線掃出場）
+        sl = max(sl, entry * 1.005)
 
         # TP 合理性保護
         if tp1 >= entry:

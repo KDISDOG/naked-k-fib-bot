@@ -180,6 +180,33 @@ class OrderExecutor:
                 f"[{symbol}] 開倉成功：{direction} qty={qty} @ {fill_price}"
             )
 
+            # 3.5 實際成交價偏離訊號預期 → 按相同百分比距離重算 SL/TP
+            # 背景：市價單在薄市可能滑價 0.3%~2%；若仍用訊號 entry 算的 SL/TP
+            #   絕對值，會讓實際 RR 失真（SL 變近/遠、TP 變遠/近）。
+            # 作法：保留原本 (SL/TP 相對 entry 的百分比距離)，套到 fill_price。
+            # 門檻：偏離 > 0.1% 才重算（微小誤差沒必要動）。
+            if fill_price > 0 and entry > 0 and \
+                    abs(fill_price - entry) / entry > 0.001:
+                sl_pct  = abs(entry - sl)  / entry
+                tp1_pct = abs(tp1 - entry) / entry if tp1 else 0
+                tp2_pct = abs(tp2 - entry) / entry if tp2 else 0
+                if direction == "LONG":
+                    new_sl  = fill_price * (1 - sl_pct)
+                    new_tp1 = fill_price * (1 + tp1_pct) if tp1_pct else tp1
+                    new_tp2 = fill_price * (1 + tp2_pct) if tp2_pct else tp2
+                else:  # SHORT
+                    new_sl  = fill_price * (1 + sl_pct)
+                    new_tp1 = fill_price * (1 - tp1_pct) if tp1_pct else tp1
+                    new_tp2 = fill_price * (1 - tp2_pct) if tp2_pct else tp2
+                sl  = self._round_price(symbol, new_sl)
+                tp1 = self._round_price(symbol, new_tp1)
+                tp2 = self._round_price(symbol, new_tp2)
+                log.info(
+                    f"[{symbol}] 成交價 {fill_price} 偏離訊號 {entry} "
+                    f"({(fill_price - entry) / entry * 100:+.2f}%)，"
+                    f"重算 SL={sl} TP1={tp1} TP2={tp2}（保持原 RR）"
+                )
+
             # 4. 止損單（reduceOnly + qty）— 失敗則緊急平倉
             # 注意：不用 closePosition=True，那是「Position-level TP/SL」
             # 特殊 slot，不會出現在 futures_get_open_orders，bot 無法枚舉/管理。

@@ -16,10 +16,17 @@ class Config:
 
     # ── 通用風控 ─────────────────────────────────────────────────
     MAX_LEVERAGE      = int(os.getenv("MAX_LEVERAGE", 3))      # 固定 3x
-    MARGIN_USDT       = float(os.getenv("MARGIN_USDT", 50.0))  # 每筆固定保證金（USDT），不足就不開單
+    MARGIN_USDT       = float(os.getenv("MARGIN_USDT", 50.0))  # 單筆保證金上限（USDT），實際保證金由 RISK_PCT 決定
     MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", 6))     # 同時最多 6 倉
+    MAX_LONGS         = int(os.getenv("MAX_LONGS", 4))         # 單邊上限：做多最多 4 倉
+    MAX_SHORTS        = int(os.getenv("MAX_SHORTS", 4))        # 單邊上限：做空最多 4 倉
     COOLDOWN_BARS     = int(os.getenv("COOLDOWN_BARS", 6))
     MAX_DAILY_LOSS    = float(os.getenv("MAX_DAILY_LOSS", 0.08))
+
+    # Risk-based sizing：每筆最多虧損「總餘額 × RISK_PCT_PER_TRADE」
+    # 反推 qty → 高波動幣種 SL 距離大 → 倉位自動變小；MARGIN_USDT 做為上限。
+    # 設 0 則退回舊的固定保證金邏輯。
+    RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", 0.01))
 
     # ── 策略專屬 R:R 門檻（per-strategy）────────────────────────
     NKF_MIN_RR = float(os.getenv("NKF_MIN_RR", 1.2))
@@ -64,7 +71,7 @@ class Config:
     MR_TP_PCT        = float(os.getenv("MR_TP_PCT", 0.05))    # 5% 止盈
     MR_SL_PCT        = float(os.getenv("MR_SL_PCT", 0.025))   # 2.5% 止損
     MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 3))
-    MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 1.2))   # 均值回歸：不要求極端縮量，允許小幅放量
+    MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 0.9))   # 均值回歸：要求縮量確認（賣盤衰竭），避免放量急跌時接刀
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
 
     # ── 追蹤止盈（Trailing Stop）────────────────────────────────

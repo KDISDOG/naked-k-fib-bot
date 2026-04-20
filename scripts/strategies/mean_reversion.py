@@ -230,13 +230,16 @@ class MeanReversionStrategy(BaseStrategy):
         if side is None:
             return None
 
-        # ── BTC 週線多頭過濾（MR LONG 不逆大盤）────────────────
-        if side == "LONG" and self._market_ctx:
+        # ── BTC 週線趨勢過濾（MR 兩邊都不逆大盤）────────────────
+        # LONG 被週線空頭過濾、SHORT 被週線多頭過濾，避免小週期反轉訊號
+        # 跟大週期方向硬碰硬（牛市急拉時 RSI>75 的山寨做空常被掃）
+        if self._market_ctx:
             btc_bull = self._market_ctx.btc_weekly_bullish()
-            if btc_bull is False:
-                log.debug(
-                    f"[{symbol}] MR LONG 被 BTC 週線空頭過濾"
-                )
+            if side == "LONG" and btc_bull is False:
+                log.debug(f"[{symbol}] MR LONG 被 BTC 週線空頭過濾")
+                return None
+            if side == "SHORT" and btc_bull is True:
+                log.debug(f"[{symbol}] MR SHORT 被 BTC 週線多頭過濾")
                 return None
 
         # ── 訊號評分 ─────────────────────────────────────────────

@@ -281,6 +281,10 @@ def check_signals():
                 f"{sig.pattern} 方向={sig.side} 強度={sig.score}"
             )
 
+            # 單邊倉位上限：避免 MAX_POSITIONS=6 全押同向（MAX_LONGS/MAX_SHORTS）
+            if not risk.can_open_more_in_direction(sig.side):
+                continue
+
             # 相關性控管（兩策略都需要，避免同向累積曝險）
             if not risk.can_open_direction(symbol, sig.side):
                 continue

@@ -294,7 +294,9 @@ class MomentumLongStrategy(BaseStrategy):
             strategy_name = self.name,
             timeframe     = self.default_timeframe,
             pattern       = "ML_BREAKOUT",
-            use_trailing  = adx_val > 35,  # 強趨勢時啟用追蹤
+            # 追蹤止盈：需 TRAILING_ENABLED=true 才生效；否則維持靜態 SL/TP1/TP2
+            # 避免 UI 顯示「啟用追蹤」但後台根本沒推進的誤導情況
+            use_trailing  = Config.TRAILING_ENABLED and adx_val > 35,
             trailing_atr  = atr_val,
             btc_corr      = btc_corr,
             metadata      = {
@@ -448,8 +450,8 @@ class MomentumLongStrategy(BaseStrategy):
         sl = resistance - Config.ML_SL_ATR_MULT * atr_val
         # SL 下限：不低於入場價 - 5%
         sl = max(sl, entry * 0.95)
-        # SL 上限：至少在入場價下方 0.3%
-        sl = min(sl, entry * 0.997)
+        # SL 上限：至少在入場價下方 0.5%（避免被一根 K 棒的雜訊影線掃出場）
+        sl = min(sl, entry * 0.995)
 
         # TP 合理性保護
         if tp1 <= entry:
