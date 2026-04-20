@@ -193,34 +193,36 @@ class RiskManager:
             log.warning(f"止損幅度過大 ({sl_pct:.2%})，略過")
             return None
 
-        # ── 倉位計算：Risk-based sizing ──────────────────────────
-        # 以「每筆最多虧損總餘額的 RISK_PCT%」反推 qty：
-        #   target_risk = total_balance × RISK_PCT_PER_TRADE
+        # ── 倉位計算：Risk-based sizing（base = 固定保證金）──────
+        # 每筆最多虧損 = MARGIN_USDT × RISK_PCT_PER_TRADE
         #   qty = target_risk / abs(entry - sl)
         # 高波動幣種 SL 距離大 → qty 自動變小；低波動幣種反之。
-        # MARGIN_USDT 做為單筆最大保證金上限（避免單倉曝險過大）。
-        # 設 RISK_PCT_PER_TRADE=0 則退回舊的固定保證金邏輯。
-        total_balance = self._get_total_balance()
+        # MARGIN_USDT 同時做為「單筆保證金上限」(qty×entry/leverage ≤ MARGIN_USDT)，
+        # 避免 SL 極小時 qty 爆炸、實際保證金超過用戶設定。
+        # 設 RISK_PCT_PER_TRADE=0 則退回固定保證金邏輯。
         risk_pct = Config.RISK_PCT_PER_TRADE
-        if total_balance > 0 and risk_pct > 0:
-            target_risk_usdt = total_balance * risk_pct
+        if risk_pct > 0:
+            target_risk_usdt = self.margin_usdt * risk_pct
             qty_by_risk      = target_risk_usdt / abs(entry - stop_loss)
             notional_by_risk = qty_by_risk * entry
             margin_by_risk   = notional_by_risk / self.leverage
-            # 保證金上限 = MARGIN_USDT
+            # 上限：不超過固定 MARGIN_USDT
             margin = min(margin_by_risk, self.margin_usdt)
             log.debug(
-                f"Risk-based sizing: bal={total_balance:.2f} "
-                f"target_risk={target_risk_usdt:.2f} "
-                f"margin_by_risk={margin_by_risk:.2f} "
-                f"→ 取 min({margin_by_risk:.2f}, {self.margin_usdt})={margin:.2f}"
+                f"Risk-based sizing: MARGIN_USDT={self.margin_usdt} "
+                f"× RISK_PCT={risk_pct:.0%} = target_risk={target_risk_usdt:.2f} "
+                f"→ margin_by_risk={margin_by_risk:.2f} "
+                f"→ 取 min(×, {self.margin_usdt})={margin:.2f}"
             )
         else:
             margin = self.margin_usdt
 
-        # 可用餘額 / 極小保證金守門：至少 5 USDT，低於則不值得下
-        if margin < 5:
-            log.warning(f"計算保證金 {margin:.2f} USDT 過小，略過")
+        # 極小保證金守門：小於 MARGIN_USDT × 10% 時不值得下（訊號邊緣雜訊）
+        if margin < self.margin_usdt * 0.1:
+            log.warning(
+                f"計算保證金 {margin:.2f} < MARGIN_USDT×10% "
+                f"({self.margin_usdt*0.1:.2f})，倉位過小，略過"
+            )
             return None
         if balance < margin:
             log.warning(f"可用餘額 {balance:.2f} < 每筆保證金 {margin:.2f} USDT，略過")

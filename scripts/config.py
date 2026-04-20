@@ -23,10 +23,11 @@ class Config:
     COOLDOWN_BARS     = int(os.getenv("COOLDOWN_BARS", 6))
     MAX_DAILY_LOSS    = float(os.getenv("MAX_DAILY_LOSS", 0.08))
 
-    # Risk-based sizing：每筆最多虧損「總餘額 × RISK_PCT_PER_TRADE」
+    # Risk-based sizing：每筆最多虧損「MARGIN_USDT × RISK_PCT_PER_TRADE」
+    # 用固定保證金的百分比作 base（非總餘額），因為用戶保證金是固定的。
     # 反推 qty → 高波動幣種 SL 距離大 → 倉位自動變小；MARGIN_USDT 做為上限。
-    # 設 0 則退回舊的固定保證金邏輯。
-    RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", 0.01))
+    # 預設 10% = MARGIN_USDT × 0.10 為每筆最大損失；設 0 則退回純固定保證金邏輯。
+    RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", 0.10))
 
     # ── 策略專屬 R:R 門檻（per-strategy）────────────────────────
     NKF_MIN_RR = float(os.getenv("NKF_MIN_RR", 1.2))
