@@ -77,7 +77,9 @@ class Config:
     MR_TIMEFRAME     = os.getenv("MR_TIMEFRAME", "15m")
     MR_TP_PCT        = float(os.getenv("MR_TP_PCT", 0.05))    # 5% 止盈
     MR_SL_PCT        = float(os.getenv("MR_SL_PCT", 0.025))   # 2.5% 止損
-    MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 4))   # 3→4：確保加分條件達 1 個以上，非只基礎分
+    MR_MIN_SCORE     = int(os.getenv("MR_MIN_SCORE", 2))   # 2 為實務運作門檻：_score_signal 的 RSI bonus 門檻(≤15/≥85)配
+                                                            # OVERSOLD=30/OVERBOUGHT=70 時永遠摸不到，score 實際只會落在 2-3，
+                                                            # 拉到 4 會直接把 MR 關掉；DB 證據 score=2 期望值為正 (+8.84/單)
     MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 0.9))   # 均值回歸：要求縮量確認（賣盤衰竭），避免放量急跌時接刀
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
 
