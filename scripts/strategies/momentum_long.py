@@ -337,17 +337,26 @@ class MomentumLongStrategy(BaseStrategy):
                       avg_vol: float, last_vol: float,
                       Config) -> int:
         """
-        Momentum Long 訊號評分（基礎分 1，滿分 5）
+        Momentum Long 訊號評分（基礎分 1，範圍 1-5）
 
-        +1 基礎（已通過突破 + 放量條件）
-        +1 ADX 強趨勢（> 30）
-        +1 巨量突破（> 2x 均量）
-        +1 多頭 K 棒形態確認
-        +1 BTC 週線多頭（大盤配合）
-        +1 MACD 多頭確認
+        加分項：
+          +1 基礎（已通過突破 + 放量條件）
+          +1 ADX 強趨勢（> 30）
+          +1 巨量突破（> 2x 均量）
+          +1 多頭 K 棒形態確認
+          +1 BTC 週線多頭（大盤配合）
+          +1 MACD 多頭確認
+
+        扣分項（exhaustion / 追高懲罰，修正 DB 觀察到的
+        score=5 反而勝率最差的問題：score=5 = 全部加分觸發 =
+        典型 blowoff 追高，常被 fade）：
+          -1 價格離 EMA20 過遠（> 3%，追高溢價）
+          -1 突破幅度過大（> 2%，gap-past-resistance，FOMO 追單）
+          -1 RSI 過熱（> 75，已超買）
         """
         score = 1  # 基礎分
 
+        # ── 加分項 ───────────────────────────────────────
         # ADX 強趨勢
         if adx_val > 30:
             score += 1
@@ -378,7 +387,27 @@ class MomentumLongStrategy(BaseStrategy):
         except Exception:
             pass
 
-        return min(score, 5)
+        # ── 扣分項：exhaustion / 追高懲罰 ────────────────
+        # 離 EMA20 過遠（chase premium）
+        if ema20 > 0 and (price - ema20) / ema20 > 0.03:
+            score -= 1
+
+        # 突破幅度過大（FOMO gap，往往是 1 根暴拉、隨後套頂）
+        if resistance > 0 and (price - resistance) / resistance > 0.02:
+            score -= 1
+
+        # RSI 過熱（已超買，追單風險高）
+        try:
+            rsi_s = ta.rsi(df["close"], length=14)
+            if rsi_s is not None and not rsi_s.empty:
+                rsi_val = float(rsi_s.iloc[-1])
+                if rsi_val > 75:
+                    score -= 1
+        except Exception:
+            pass
+
+        # 範圍限制：[1, 5]（扣分不讓它變 0 避免所有訊號被排除）
+        return max(1, min(score, 5))
 
     def _has_bullish_candle(self, df: pd.DataFrame) -> bool:
         """偵測多頭 K 棒形態"""

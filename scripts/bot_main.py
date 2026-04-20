@@ -307,12 +307,18 @@ def check_signals():
                 "momentum_long":   Config.ML_MIN_RR,
             }
             min_rr = min_rr_map.get(strategy.name, 1.2)
-            # MR 用 70/30 分倉（快出鎖利），其他策略 50/50
+            # 分倉策略（TP1 成交比例）：
+            #   MR 0.7：快速反轉、TP2 鮮少觸及，先鎖利
+            #   BD/ML/NKF 0.3：DB 證據顯示 9 筆 TP2 貢獻 +486（總盈利 68%），
+            #     極端 fat-tail 分佈下保留 70% 跑尾比 50/50 期望值高
             tp1_split_map = {
                 "mean_reversion": 0.7,
+                "breakdown_short": 0.3,
+                "momentum_long":   0.3,
+                "naked_k_fib":     0.3,
             }
-            tp1_split = tp1_split_map.get(strategy.name, 0.5)
-            # 風控計算
+            tp1_split = tp1_split_map.get(strategy.name, 0.3)
+            # 風控計算（傳入 score 供 SL 災區過濾使用）
             pos = risk.calc_position(
                 entry     = sig.entry_price,
                 stop_loss = sig.stop_loss,
@@ -320,6 +326,7 @@ def check_signals():
                 tp2       = sig.take_profit_2,
                 min_rr    = min_rr,
                 tp1_split_pct = tp1_split,
+                signal_score  = sig.score,
             )
             if not pos:
                 log.warning(f"[{symbol}] 風控拒絕")

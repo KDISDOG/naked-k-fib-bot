@@ -161,10 +161,12 @@ class RiskManager:
         tp2:       float,
         min_rr:    float = 1.2,
         tp1_split_pct: float = 0.5,
+        signal_score: Optional[int] = None,
     ) -> Optional[dict]:
         """
         計算倉位大小（考慮手續費）
         分批止盈：tp1_split_pct 在 TP1，其余在 TP2
+        signal_score: 訊號分數（供 SL 災區過濾使用，None 則不啟用）
 
         回傳:
             {
@@ -191,6 +193,18 @@ class RiskManager:
             return None
         if sl_pct > 0.12:
             log.warning(f"止損幅度過大 ({sl_pct:.2%})，略過")
+            return None
+
+        # SL 1.5-3% 災區過濾：DB 證據顯示此區間 30 單勝率 26.7%、虧 -300 USDT
+        # （最大虧損單一 bucket），不夠近不會被雜訊掃、不夠遠沒耐心跑。
+        # 此區間只放行 score ≥ 4 的高強度訊號；低分訊號在此 SL 範圍是純虧。
+        if (signal_score is not None
+                and 0.015 <= sl_pct <= 0.03
+                and signal_score < 4):
+            log.warning(
+                f"SL 落在災區 {sl_pct:.2%}（1.5-3%）且訊號分數 "
+                f"{signal_score} < 4，略過（此 bucket 歷史勝率僅 26.7%）"
+            )
             return None
 
         # ── 倉位計算：Risk-based sizing（base = 固定保證金）──────
