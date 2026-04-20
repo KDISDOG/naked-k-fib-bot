@@ -214,6 +214,14 @@ class OrderExecutor:
             # 都看得到，cancel/枚舉邏輯正常運作。
             # workingType=MARK_PRICE：用標記價觸發而非最後成交價，
             # 避免薄市「尾價瞬時 spike」導致 -2021 Order would immediately trigger。
+
+            # 4.0 防禦性清理：清掉此 symbol 的殘留 reduceOnly STOP/TP 掛單
+            # 幣安每 symbol STOP/TP 上限 10 張，殘留會導致 -4045
+            # Reach max stop order limit → SL 掛單失敗 → 緊急平倉燒手續費。
+            # 已由 has_open_position 擋住同 symbol 重複開倉，此處撈到的都是
+            # 前次 trade 殘留 / bot crash 遺留的孤兒，清掉是安全的。
+            self._cleanup_residual_reduce_only(symbol)
+
             sl_order_id = ""
             try:
                 sl_order = create_order_safe(
@@ -227,21 +235,60 @@ class OrderExecutor:
                 )
                 sl_order_id, _ = extract_id(sl_order)
             except Exception as e:
-                log.error(f"[{symbol}] SL 掛單失敗，緊急平倉: {e}")
-                notify.sl_placement_failed(symbol, direction)
-                # 緊急平倉保護資金
-                try:
-                    create_order_safe(
-                        self.client, symbol,
-                        side       = close_side,
-                        type       = ORDER_TYPE_MARKET,
-                        quantity   = qty,
-                        reduceOnly = True,
+                err_s = str(e)
+                # 4.1 -4045 stop 限額重試：先 cancel_all_for_symbol 強清
+                #     整個 symbol 的掛單（含 Algo），再試一次 SL。
+                #     第 4.0 的清理只處理 list_open_orders 能枚舉到的，
+                #     有些歷史 Algo 訂單可能枚舉不到但占用限額，需硬清。
+                retried_ok = False
+                if "-4045" in err_s or "max stop order" in err_s.lower():
+                    log.warning(
+                        f"[{symbol}] SL 掛單遇 -4045 限額，強清殘留後重試一次"
                     )
-                except Exception as e2:
-                    log.error(f"[{symbol}] 緊急平倉也失敗: {e2}")
-                    notify.error("緊急平倉失敗", f"{symbol}: {e2}")
-                return None
+                    try:
+                        cancel_all_for_symbol(self.client, symbol)
+                    except Exception as ce:
+                        log.warning(f"[{symbol}] cancel_all 失敗: {ce}")
+                    try:
+                        sl_order = create_order_safe(
+                            self.client, symbol,
+                            side        = close_side,
+                            type        = FUTURE_ORDER_TYPE_STOP_MARKET,
+                            stopPrice   = sl,
+                            quantity    = qty,
+                            reduceOnly  = True,
+                            workingType = "MARK_PRICE",
+                        )
+                        sl_order_id, _ = extract_id(sl_order)
+                        retried_ok = True
+                        log.info(f"[{symbol}] -4045 強清後重試成功")
+                    except Exception as e2:
+                        log.error(f"[{symbol}] -4045 重試仍失敗: {e2}")
+
+                if not retried_ok:
+                    log.error(f"[{symbol}] SL 掛單失敗，緊急平倉: {e}")
+                    notify.sl_placement_failed(symbol, direction)
+                    # 緊急平倉保護資金
+                    try:
+                        create_order_safe(
+                            self.client, symbol,
+                            side       = close_side,
+                            type       = ORDER_TYPE_MARKET,
+                            quantity   = qty,
+                            reduceOnly = True,
+                        )
+                        # 4.2 緊急平倉後清掉此 symbol 所有殘留掛單，
+                        # 避免下次開同 symbol 又撞 -4045 燒手續費迴圈
+                        try:
+                            cancel_all_for_symbol(self.client, symbol)
+                        except Exception as ce2:
+                            log.warning(
+                                f"[{symbol}] 緊急平倉後清殘失敗: {ce2}"
+                            )
+                    except Exception as e2:
+                        log.error(f"[{symbol}] 緊急平倉也失敗: {e2}")
+                        notify.error("緊急平倉失敗", f"{symbol}: {e2}")
+                    return None
 
             # 5. TP1 止盈（部分平倉）
             tp1_order_id = ""
@@ -316,6 +363,36 @@ class OrderExecutor:
         except Exception as e:
             log.error(f"[{symbol}] 開倉失敗: {e}")
             return None
+
+    # ── 清理殘留 reduceOnly 掛單（避免 -4045 限額）──────────────
+
+    def _cleanup_residual_reduce_only(self, symbol: str) -> int:
+        """
+        清掉此 symbol 目前所有 reduceOnly STOP_MARKET / TAKE_PROFIT_MARKET
+        掛單。呼叫時機：新倉 MARKET 成交後、SL 建立前。
+
+        背景：幣安 USDT-M 合約每 symbol 的 STOP/TP 掛單上限 10 張。
+        前次 trade 關閉後若殘留 SL/TP（TP2 觸發平倉但 SL/TP1 未自動取消，
+        或 bot crash 遺留）會占用額度，導致本次 SL 掛單 -4045 失敗 →
+        被迫緊急平倉 → 燒手續費迴圈。
+        """
+        cancelled = 0
+        try:
+            existing = list_open_orders(self.client, symbol=symbol)
+        except Exception as e:
+            log.warning(f"[{symbol}] 查殘留掛單失敗: {e}")
+            return 0
+        for o in existing:
+            if (o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+                    and o.get("reduceOnly")):
+                if cancel_order(self.client, symbol, o):
+                    cancelled += 1
+        if cancelled:
+            log.info(
+                f"[{symbol}] 開倉前清掉殘留 reduceOnly STOP/TP 掛單 "
+                f"{cancelled} 筆（防 -4045 限額）"
+            )
+        return cancelled
 
     # ── 清理既有 SL 掛單（避免重複堆疊）─────────────────────────
 
