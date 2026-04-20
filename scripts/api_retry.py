@@ -57,6 +57,25 @@ def gen_client_order_id(prefix: str = "nkf") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
 
 
+class OrderRejectedError(Exception):
+    """
+    幣安回了 200 但 body 寫 REJECTED 時拋出。
+    舊版 bot 不看 response 狀態，REJECTED 也當成功存 algoId，
+    下次啟動才發現根本沒掛上（裸倉 bug）。
+    """
+    def __init__(self, symbol: str, response: dict):
+        self.symbol = symbol
+        self.response = response
+        status = response.get("algoStatus") or response.get("status") or "?"
+        reason = (response.get("failReason")
+                  or response.get("rejectReason")
+                  or response.get("msg") or "")
+        msg = f"[{symbol}] order rejected by exchange: status={status}"
+        if reason:
+            msg += f" reason={reason}"
+        super().__init__(msg)
+
+
 def create_order_safe(client, symbol: str, max_retries: int = 2,
                       base_delay: float = 1.0, **params):
     """
@@ -69,10 +88,16 @@ def create_order_safe(client, symbol: str, max_retries: int = 2,
          - 若存在 → 直接回傳既有訂單資訊（不重複下單）
          - 若不存在 → 才進入下一輪重試
       4. 全部失敗則 raise 最後一次例外
+      5. 成功回傳前驗證 algoStatus / status 必須是 live 狀態，
+         否則 raise OrderRejectedError（幣安對 algo order 會出現
+         200 + algoStatus=REJECTED 的 silent failure，必須主動偵測）
 
     比 retry_api 安全：
       retry_api 會盲目重下 → 同一張單下 2、3 次（200-order limit 爆掉）
     """
+    # 延後 import 避免循環（binance_orders 目前未 import 本模組，但留保險）
+    from binance_orders import is_order_live
+
     # 呼叫端未指定 clientOrderId 才自動產生
     coid = params.pop("newClientOrderId", None) or gen_client_order_id()
     params["newClientOrderId"] = coid
@@ -80,7 +105,14 @@ def create_order_safe(client, symbol: str, max_retries: int = 2,
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
-            return client.futures_create_order(symbol=symbol, **params)
+            resp = client.futures_create_order(symbol=symbol, **params)
+            # 下單「成功」但 body 回 REJECTED / EXPIRED → 當作失敗
+            if not is_order_live(resp):
+                raise OrderRejectedError(symbol, resp)
+            return resp
+        except OrderRejectedError:
+            # 交易所拒絕不該重試（重試只會再被拒），直接往外拋
+            raise
         except Exception as e:
             last_exc = e
             # 關鍵：先查幣安是否已經收了這張單
@@ -89,7 +121,7 @@ def create_order_safe(client, symbol: str, max_retries: int = 2,
                     symbol=symbol, origClientOrderId=coid
                 )
                 if existing and existing.get("status") not in (
-                    None, "", "EXPIRED", "CANCELED"
+                    None, "", "EXPIRED", "CANCELED", "REJECTED"
                 ):
                     log.warning(
                         f"[{symbol}] 下單疑似網路超時但已存在 "

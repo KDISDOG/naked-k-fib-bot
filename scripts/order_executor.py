@@ -185,15 +185,18 @@ class OrderExecutor:
             # 特殊 slot，不會出現在 futures_get_open_orders，bot 無法枚舉/管理。
             # 改用 reduceOnly=True + quantity，SL 就是標準訂單，所有查詢端點
             # 都看得到，cancel/枚舉邏輯正常運作。
+            # workingType=MARK_PRICE：用標記價觸發而非最後成交價，
+            # 避免薄市「尾價瞬時 spike」導致 -2021 Order would immediately trigger。
             sl_order_id = ""
             try:
                 sl_order = create_order_safe(
                     self.client, symbol,
-                    side       = close_side,
-                    type       = FUTURE_ORDER_TYPE_STOP_MARKET,
-                    stopPrice  = sl,
-                    quantity   = qty,
-                    reduceOnly = True,
+                    side        = close_side,
+                    type        = FUTURE_ORDER_TYPE_STOP_MARKET,
+                    stopPrice   = sl,
+                    quantity    = qty,
+                    reduceOnly  = True,
+                    workingType = "MARK_PRICE",
                 )
                 sl_order_id, _ = extract_id(sl_order)
             except Exception as e:
@@ -219,11 +222,12 @@ class OrderExecutor:
                 try:
                     tp1_order = create_order_safe(
                         self.client, symbol,
-                        side       = close_side,
-                        type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                        stopPrice  = tp1,
-                        quantity   = qty_tp1,
-                        reduceOnly = True,
+                        side        = close_side,
+                        type        = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                        stopPrice   = tp1,
+                        quantity    = qty_tp1,
+                        reduceOnly  = True,
+                        workingType = "MARK_PRICE",
                     )
                     tp1_order_id, _ = extract_id(tp1_order)
                 except Exception as e:
@@ -235,11 +239,12 @@ class OrderExecutor:
                 try:
                     tp2_order = create_order_safe(
                         self.client, symbol,
-                        side       = close_side,
-                        type       = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                        stopPrice  = tp2,
-                        quantity   = qty_tp2,
-                        reduceOnly = True,
+                        side        = close_side,
+                        type        = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                        stopPrice   = tp2,
+                        quantity    = qty_tp2,
+                        reduceOnly  = True,
+                        workingType = "MARK_PRICE",
                     )
                     tp2_order_id, _ = extract_id(tp2_order)
                 except Exception as e:
@@ -352,11 +357,12 @@ class OrderExecutor:
             # 下新止損（冪等下單）
             new_sl_order = create_order_safe(
                 self.client, symbol,
-                side       = close_side,
-                type       = FUTURE_ORDER_TYPE_STOP_MARKET,
-                stopPrice  = new_sl,
-                quantity   = remaining,
-                reduceOnly = True,
+                side        = close_side,
+                type        = FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice   = new_sl,
+                quantity    = remaining,
+                reduceOnly  = True,
+                workingType = "MARK_PRICE",
             )
             new_sl_id, _ = extract_id(new_sl_order)
 
@@ -408,11 +414,12 @@ class OrderExecutor:
 
             new_sl_order = create_order_safe(
                 self.client, symbol,
-                side       = close_side,
-                type       = FUTURE_ORDER_TYPE_STOP_MARKET,
-                stopPrice  = new_sl,
-                quantity   = remaining,
-                reduceOnly = True,
+                side        = close_side,
+                type        = FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice   = new_sl,
+                quantity    = remaining,
+                reduceOnly  = True,
+                workingType = "MARK_PRICE",
             )
             new_sl_id, _ = extract_id(new_sl_order)
             self.db.update_sl(trade_id, new_sl=new_sl, sl_order_id=new_sl_id)

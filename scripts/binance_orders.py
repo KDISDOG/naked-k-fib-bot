@@ -131,3 +131,39 @@ def extract_id(response: dict) -> Tuple[str, bool]:
         return str(response["algoId"]), True
     oid = response.get("orderId")
     return (str(oid), False) if oid else ("", False)
+
+
+# Algo 訂單「活著」的狀態
+_LIVE_ALGO_STATUSES = {"NEW", "WORKING"}
+# 標準訂單「活著」的狀態（FILLED 也算成功，雖然少見）
+_LIVE_STD_STATUSES  = {"NEW", "PARTIALLY_FILLED", "FILLED"}
+
+
+def is_order_live(response: dict) -> bool:
+    """
+    判斷 create_order 回傳的訂單是否真的「活著」。
+
+    背景：Binance 有時對 algo order（STOP_MARKET / TP_MARKET）
+    回 HTTP 200 但 body 是 algoStatus=REJECTED / EXPIRED。
+    python-binance 不會把這視為 exception，呼叫端若只看 id 會
+    誤以為下單成功 → 裸倉。此函式統一判定。
+    """
+    if not response:
+        return False
+    if response.get("algoId"):
+        return response.get("algoStatus") in _LIVE_ALGO_STATUSES
+    if response.get("orderId"):
+        return response.get("status") in _LIVE_STD_STATUSES
+    return False
+
+
+def describe_reject(response: dict) -> str:
+    """取出 reject 原因字串，供 log / notify 使用"""
+    if not response:
+        return "empty response"
+    status = response.get("algoStatus") or response.get("status") or "?"
+    reason = (response.get("failReason")
+              or response.get("rejectReason")
+              or response.get("msg")
+              or "")
+    return f"status={status} reason={reason}" if reason else f"status={status}"
