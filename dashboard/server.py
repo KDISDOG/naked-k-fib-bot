@@ -127,35 +127,79 @@ async def api_dashboard_kpis():
 
 @app.get("/api/open_positions")
 async def api_open_positions():
-    """回傳當前開倉 + 即時價格 + 未實現損益"""
+    """
+    回傳當前開倉 + 即時價格 + 未實現損益。
+
+    以 Binance 實時 position_information 為真實來源：
+      - entryPrice（加權平均成交價）
+      - positionAmt（實際持倉）
+      - markPrice（標記價格）
+      - unRealizedProfit（未實現損益）
+    DB 的 entry / qty 可能因 avgPrice fallback、分批加倉、
+    或重複下單造成漂移，用來對齊會出現 Dashboard 與幣安百分比
+    符號相反的問題。Binance 抓不到時才 fallback 到 DB 計算。
+    """
     trades = db.get_open_trades()
+    # 一次取全部持倉（避免每筆都打一次 API）
+    bn_positions: dict = {}
+    try:
+        for p in client.futures_position_information():
+            if abs(float(p.get("positionAmt", 0))) > 0:
+                bn_positions[p["symbol"]] = p
+    except Exception as e:
+        log.warning(f"取得持倉資訊失敗: {e}")
+
+    leverage = int(os.getenv("MAX_LEVERAGE", 3))
     result = []
     for t in trades:
-        current_price = None
-        try:
-            ticker = client.futures_symbol_ticker(symbol=t["symbol"])
-            current_price = round(float(ticker["price"]), 4)
-        except Exception:
-            pass
+        sym = t["symbol"]
+        bn = bn_positions.get(sym)
 
-        remaining_qty = (t["qty"] or 0) - (t["qty_closed"] or 0)
-        unrealized_pnl = None
-        rr = None
-        if current_price is not None and t.get("entry"):
-            if t["direction"] == "LONG":
-                unrealized_pnl = round((current_price - t["entry"]) * remaining_qty, 2)
+        # 以 Binance 為真：entry / qty / mark / unrealized_pnl
+        if bn:
+            entry_price   = float(bn["entryPrice"])
+            remaining_qty = abs(float(bn["positionAmt"]))
+            current_price = round(float(bn.get("markPrice") or 0), 6) or None
+            unrealized_pnl = round(float(bn.get("unRealizedProfit") or 0), 2)
+        else:
+            # Fallback：幣安查不到就用 DB（可能是 partial 或剛平倉）
+            entry_price   = t.get("entry")
+            remaining_qty = (t["qty"] or 0) - (t["qty_closed"] or 0)
+            current_price = None
+            try:
+                ticker = client.futures_symbol_ticker(symbol=sym)
+                current_price = round(float(ticker["price"]), 6)
+            except Exception:
+                pass
+            if current_price is not None and entry_price:
+                if t["direction"] == "LONG":
+                    unrealized_pnl = round((current_price - entry_price) * remaining_qty, 2)
+                else:
+                    unrealized_pnl = round((entry_price - current_price) * remaining_qty, 2)
             else:
-                unrealized_pnl = round((t["entry"] - current_price) * remaining_qty, 2)
-            if t.get("sl") and t["entry"]:
-                risk = abs(t["entry"] - t["sl"]) * remaining_qty
-                rr = round(unrealized_pnl / risk, 2) if risk > 0 else 0
+                unrealized_pnl = None
 
-        leverage = int(os.getenv("MAX_LEVERAGE", 3))
-        margin = round((t["qty"] or 0) * (t["entry"] or 0) / leverage, 2)
-        pnl_pct = round(unrealized_pnl / margin * 100, 2) if (margin and margin > 0 and unrealized_pnl is not None) else None
-        result.append({**t, "current_price": current_price,
-                       "unrealized_pnl": unrealized_pnl, "rr": rr,
-                       "margin": margin, "pnl_pct": pnl_pct})
+        # R:R（以目前 entry / SL 距離算風險）
+        rr = None
+        if t.get("sl") and entry_price and unrealized_pnl is not None:
+            risk = abs(entry_price - t["sl"]) * remaining_qty
+            rr = round(unrealized_pnl / risk, 2) if risk > 0 else 0
+
+        # 保證金與百分比（都以「目前剩餘倉 × 實際成交價」為基準）
+        margin = round(remaining_qty * entry_price / leverage, 2) \
+            if (entry_price and remaining_qty) else 0
+        pnl_pct = round(unrealized_pnl / margin * 100, 2) \
+            if (margin and margin > 0 and unrealized_pnl is not None) else None
+
+        result.append({
+            **t,
+            "entry":          entry_price,   # 覆寫為 Binance 實際成交價
+            "current_price":  current_price,
+            "unrealized_pnl": unrealized_pnl,
+            "rr":             rr,
+            "margin":         margin,
+            "pnl_pct":        pnl_pct,
+        })
     return result
 
 @app.post("/api/close_position/{trade_id}")
