@@ -481,7 +481,7 @@ class MomentumLongStrategy(BaseStrategy):
         使用 Fib extension 計算做多目標：
           找最近的 swing low → swing high
           TP1 = swing_high + diff * 0.272 (1.272 extension)
-          TP2 = swing_high + diff * 0.618 (1.618 extension)
+          TP2 = swing_high + diff * ML_TP2_FIB_MULT (預設 1.382)
           SL  = resistance - ML_SL_ATR_MULT * ATR
         """
         # 先算 SL（TP RR 保底要用到 SL 距離）
@@ -510,7 +510,7 @@ class MomentumLongStrategy(BaseStrategy):
         if valid_fib:
             diff = sh - sl_swing
             tp1 = sh + diff * 0.272  # 1.272 extension
-            tp2 = sh + diff * 0.618  # 1.618 extension
+            tp2 = sh + diff * Config.ML_TP2_FIB_MULT  # 預設 1.382
         else:
             # fallback：ATR 目標，加 RR 保底（TP1≥1.5R、TP2≥2.5R）
             # 避免震盪盤 ATR 小時 RR 撐不起最低 1.2 門檻

@@ -122,6 +122,11 @@ class Config:
     BD_TIMEOUT_BARS  = int(os.getenv("BD_TIMEOUT_BARS", 24))     # 超時平倉根數（15m×24=6h）
     BD_MIN_RR        = float(os.getenv("BD_MIN_RR", 1.2))        # 最低 R:R
     BD_MAX_POSITIONS = int(os.getenv("BD_MAX_POSITIONS", 2))      # 最大持倉數
+    # TP2 Fib extension 延伸倍率（相對 swing diff）：
+    #   0.272 → 1.272 extension（保守，命中率最高）
+    #   0.382 → 1.382 extension（平衡，預設）
+    #   0.618 → 1.618 extension（激進，教科書目標但命中率 30-40%）
+    BD_TP2_FIB_MULT  = float(os.getenv("BD_TP2_FIB_MULT", 0.382))
 
     # ── Momentum Breakout Long 策略（牛市做多）───────────────────
     ML_TIMEFRAME     = os.getenv("ML_TIMEFRAME", "1h")
@@ -134,6 +139,11 @@ class Config:
     ML_TIMEOUT_BARS  = int(os.getenv("ML_TIMEOUT_BARS", 24))     # 超時平倉根數（15m×24=6h）
     ML_MIN_RR        = float(os.getenv("ML_MIN_RR", 1.2))        # 最低 R:R
     ML_MAX_POSITIONS = int(os.getenv("ML_MAX_POSITIONS", 2))      # 最大持倉數
+    # TP2 Fib extension 延伸倍率（相對 swing diff）：
+    #   0.272 → 1.272 extension（保守，命中率最高）
+    #   0.382 → 1.382 extension（平衡，預設）
+    #   0.618 → 1.618 extension（激進，教科書目標但命中率 30-40%）
+    ML_TP2_FIB_MULT  = float(os.getenv("ML_TP2_FIB_MULT", 0.382))
 
     # ── OI 異常過濾 ──────────────────────────────────────────────
     # OI 24h 變動 > N% 視為異常（大戶佈局，技術面易失效）
