@@ -707,6 +707,25 @@ class OrderExecutor:
             log.warning(
                 f"[{symbol}] 市價平倉（{close_reason}）：qty={abs_qty} @ {exit_price}"
             )
+
+            # Telegram 通知（TIMEOUT/MANUAL 這類由 bot 主動發起的平倉，
+            # syncer 看不到倉位變化 → 這裡自己發，避免用戶以為 bot 沒動作）
+            try:
+                tr = self.db.get_trade_by_id(trade_id)
+                if tr:
+                    entry = float(tr.get("entry") or 0)
+                    direction = tr.get("direction", "")
+                    qty_total = float(tr.get("qty") or 0)
+                    if direction == "LONG":
+                        raw_pnl = (exit_price - entry) * qty_total
+                    else:
+                        raw_pnl = (entry - exit_price) * qty_total
+                    net = raw_pnl - float(tr.get("fee") or 0)
+                    notify.trade_closed(
+                        symbol, direction, net, close_reason
+                    )
+            except Exception as ne:
+                log.debug(f"[{symbol}] 平倉通知失敗: {ne}")
         except Exception as e:
             log.error(f"[{symbol}] 市價平倉失敗: {e}")
 

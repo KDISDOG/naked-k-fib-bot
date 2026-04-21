@@ -446,8 +446,10 @@ class PositionSyncer:
         was_partial = trade.get("status") == "partial"
         is_be       = trade.get("breakeven", False)
 
-        # 容差：價格的 0.3%（避免滑價造成誤判）
-        tol = entry * 0.003 if entry > 0 else 0
+        # 容差：價格的 1.0%（比對 TP/SL/BE 時的滑價保護）
+        # 從 0.3% 放寬至 1%：快速行情下 TP/SL 可能偏離 stopPrice 0.5~0.8%，
+        # 太緊會誤判為 UNKNOWN。SL/TP 之間的間距通常 ≥2%，不會撞在一起
+        tol = entry * 0.01 if entry > 0 else 0
 
         # ── 1. BREAKEVEN 先判斷（SL 已移至 BE 價，必須優先於 SL 比對）──
         if is_be and sl > 0 and abs(exit_price - sl) <= tol:
