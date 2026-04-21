@@ -184,6 +184,7 @@ def check_strategy_timeout():
     for cfg in timeout_configs:
         tf_min = tf_map.get(cfg["timeframe"], 15)
         timeout_sec = cfg["timeout_bars"] * tf_min * 60
+        half_sec    = timeout_sec * 0.5
         trades = db.get_open_by_strategy(cfg["strategy"])
 
         for t in trades:
@@ -196,6 +197,8 @@ def check_strategy_timeout():
             except Exception:
                 continue
             elapsed = (now - opened).total_seconds()
+
+            # ── 全時：強制市價平倉 ───────────────────────────
             if elapsed >= timeout_sec:
                 bars = int(elapsed / 60 / tf_min)
                 log.warning(
@@ -210,6 +213,36 @@ def check_strategy_timeout():
                     log.error(
                         f"[{t['symbol']}] {cfg['strategy']} "
                         f"超時平倉失敗: {e}"
+                    )
+                continue
+
+            # ── 半時：砍半倉 + 移 SL 到保本（未觸發過才做）────
+            # 用 breakeven 旗標當 idempotent 保險；
+            # status=='partial' 代表 TP1 已打到，已經縮過倉，略過階段止損
+            if elapsed >= half_sec \
+                    and t["status"] == "open" \
+                    and not t.get("breakeven"):
+                bars = int(elapsed / 60 / tf_min)
+                log.warning(
+                    f"[{t['symbol']}] {cfg['strategy']} 半時砍半+保本"
+                    f"（已持倉 {bars} 根 {cfg['timeframe']} K 棒，"
+                    f"半時 {cfg['timeout_bars']//2} 根）"
+                )
+                try:
+                    ok = executor.partial_close_market(
+                        t["symbol"], t["id"], pct=0.5,
+                        close_reason="PARTIAL_TIMEOUT",
+                    )
+                    if ok:
+                        executor.move_to_breakeven(
+                            t["symbol"], t["id"],
+                            entry_price=t.get("entry", 0),
+                            direction=t.get("direction", ""),
+                        )
+                except Exception as e:
+                    log.error(
+                        f"[{t['symbol']}] {cfg['strategy']} "
+                        f"半時階段止損失敗: {e}"
                     )
 
 

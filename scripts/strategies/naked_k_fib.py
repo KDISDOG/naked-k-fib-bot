@@ -76,6 +76,20 @@ class NakedKFibStrategy(BaseStrategy):
         if raw is None:
             return None
 
+        # Funding rate 方向性加分（順擠壓 +1、逆擠壓 -1、中性 0）
+        adjusted_score = raw.score
+        try:
+            from funding_bias import funding_bonus
+            fb = funding_bonus(self._client, raw.symbol, raw.direction)
+            if fb != 0:
+                log.debug(
+                    f"[{raw.symbol}] NKF funding bonus={fb:+d} "
+                    f"(side={raw.direction})"
+                )
+            adjusted_score = max(1, min(raw.score + fb, 5))
+        except Exception:
+            pass
+
         # 轉換 SignalEngine 的 Signal → 共用 Signal dataclass
         sig = Signal(
             symbol        = raw.symbol,
@@ -84,7 +98,7 @@ class NakedKFibStrategy(BaseStrategy):
             stop_loss     = raw.sl,
             take_profit_1 = raw.tp1,
             take_profit_2 = raw.tp2,
-            score         = raw.score,
+            score         = adjusted_score,
             strategy_name = self.name,
             timeframe     = raw.timeframe,
             fib_level     = raw.fib_level,

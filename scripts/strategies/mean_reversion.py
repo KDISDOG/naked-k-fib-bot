@@ -175,6 +175,18 @@ class MeanReversionStrategy(BaseStrategy):
 
     def check_signal(self, symbol: str) -> Optional[Signal]:
         from config import Config
+        # ── Regime gate：MR 只在 RANGE 放行 ────────────────────
+        if self._market_ctx and getattr(Config, "REGIME_GATE_ENABLED", True):
+            try:
+                if not self._market_ctx.regime_allows("mean_reversion"):
+                    log.debug(
+                        f"[{symbol}] MR 被 regime "
+                        f"{self._market_ctx.current_regime()} 阻擋"
+                    )
+                    return None
+            except Exception:
+                pass
+
         try:
             df = self._get_klines(symbol, self.default_timeframe, limit=200)
         except Exception as e:
@@ -266,6 +278,15 @@ class MeanReversionStrategy(BaseStrategy):
         # ── 訊號評分 ─────────────────────────────────────────────
         score = self._score_signal(df_a, side, rsi_val, bb_upper,
                                    bb_lower, bb_mid, Config)
+        # Funding rate 方向性加分（順擠壓 +1、逆擠壓 -1、中性 0）
+        try:
+            from funding_bias import funding_bonus
+            fb = funding_bonus(self._client, symbol, side)
+            if fb != 0:
+                log.debug(f"[{symbol}] MR funding bonus={fb:+d} (side={side})")
+            score = max(1, min(score + fb, 5))
+        except Exception:
+            pass
         if score < Config.MR_MIN_SCORE:
             log.debug(f"[{symbol}] MR 訊號強度 {score} < {Config.MR_MIN_SCORE}")
             return None
@@ -380,10 +401,17 @@ class MeanReversionStrategy(BaseStrategy):
                       Config) -> int:
         score = 1  # 基礎分（已通過 RSI + BB + K 棒條件）
 
-        # RSI 極端度
-        if (side == "LONG" and rsi_val <= 15) or \
-           (side == "SHORT" and rsi_val >= 85):
-            score += 1
+        # RSI 極端度（階層化）
+        if side == "LONG":
+            if rsi_val <= 15:
+                score += 2
+            elif rsi_val <= 20:
+                score += 1
+        elif side == "SHORT":
+            if rsi_val >= 85:
+                score += 2
+            elif rsi_val >= 80:
+                score += 1
 
         # BB 超出範圍（超出 1 個標準差以上）
         bb_width = bb_upper - bb_lower

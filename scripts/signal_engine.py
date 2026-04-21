@@ -556,7 +556,11 @@ class SignalEngine:
             length=14
         )
         adx_val = float(adx_df["ADX_14"].iloc[-1]) if adx_df is not None else 0
-        use_trailing = adx_val > 35
+        # NKF 追蹤止盈：除了 ADX>35，還需 TRAILING_ENABLED + TRAILING_NKF_ENABLED
+        from config import Config as _Cfg
+        use_trailing = (_Cfg.TRAILING_ENABLED
+                        and _Cfg.TRAILING_NKF_ENABLED
+                        and adx_val > 35)
 
         # ATR（追蹤止盈用）
         atr_series = ta.atr(

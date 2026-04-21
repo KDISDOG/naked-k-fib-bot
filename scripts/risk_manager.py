@@ -214,22 +214,36 @@ class RiskManager:
         # MARGIN_USDT 同時做為「單筆保證金上限」(qty×entry/leverage ≤ MARGIN_USDT)，
         # 避免 SL 極小時 qty 爆炸、實際保證金超過用戶設定。
         # 設 RISK_PCT_PER_TRADE=0 則退回固定保證金邏輯。
+        # 信心分層倉位：score 越高，敢壓越多（平均值不變）
+        #   score ≤ 3 → 0.7× （邊緣訊號，縮小暴險）
+        #   score = 4 → 1.0× （基準）
+        #   score ≥ 5 → 1.3× （高信心，集中火力）
+        # 錢集中在期望值大的訊號，低分訊號只是試單。
+        score_mult = 1.0
+        if signal_score is not None:
+            if signal_score <= 3:
+                score_mult = 0.7
+            elif signal_score >= 5:
+                score_mult = 1.3
+
         risk_pct = Config.RISK_PCT_PER_TRADE
         if risk_pct > 0:
-            target_risk_usdt = self.margin_usdt * risk_pct
+            target_risk_usdt = self.margin_usdt * risk_pct * score_mult
             qty_by_risk      = target_risk_usdt / abs(entry - stop_loss)
             notional_by_risk = qty_by_risk * entry
             margin_by_risk   = notional_by_risk / self.leverage
-            # 上限：不超過固定 MARGIN_USDT
-            margin = min(margin_by_risk, self.margin_usdt)
+            # 上限：不超過固定 MARGIN_USDT × score_mult
+            #   高分訊號允許放大到 1.3×MARGIN_USDT；低分縮到 0.7×
+            margin = min(margin_by_risk, self.margin_usdt * score_mult)
             log.debug(
                 f"Risk-based sizing: MARGIN_USDT={self.margin_usdt} "
-                f"× RISK_PCT={risk_pct:.0%} = target_risk={target_risk_usdt:.2f} "
+                f"× RISK_PCT={risk_pct:.0%} × score_mult={score_mult} "
+                f"= target_risk={target_risk_usdt:.2f} "
                 f"→ margin_by_risk={margin_by_risk:.2f} "
-                f"→ 取 min(×, {self.margin_usdt})={margin:.2f}"
+                f"→ margin={margin:.2f}"
             )
         else:
-            margin = self.margin_usdt
+            margin = self.margin_usdt * score_mult
 
         # 極小保證金守門：小於 MARGIN_USDT × 10% 時不值得下（訊號邊緣雜訊）
         if margin < self.margin_usdt * 0.1:

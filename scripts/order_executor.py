@@ -710,3 +710,61 @@ class OrderExecutor:
         except Exception as e:
             log.error(f"[{symbol}] 市價平倉失敗: {e}")
 
+    def partial_close_market(self, symbol: str, trade_id: int,
+                             pct: float = 0.5,
+                             close_reason: str = "PARTIAL_TIMEOUT") -> bool:
+        """
+        市價部分平倉 —— 依剩餘倉位的 pct 比例（0~1）reduceOnly 市價出場。
+        用於階段性時間止損（50% 時點先砍一半並移 SL 到保本）。
+        """
+        try:
+            trade = self.db.get_trade_by_id(trade_id)
+            if not trade:
+                return False
+            remaining = float(trade.get("qty", 0)) - float(trade.get("qty_closed", 0))
+            if remaining <= 0:
+                return False
+
+            part_qty = self._round_qty(symbol, remaining * pct)
+            if part_qty <= 0:
+                return False
+
+            direction = trade.get("direction", "")
+            side = SIDE_SELL if direction == "LONG" else SIDE_BUY
+
+            order = create_order_safe(
+                self.client, symbol,
+                side       = side,
+                type       = ORDER_TYPE_MARKET,
+                quantity   = part_qty,
+                reduceOnly = True,
+            )
+            exit_price = float(order.get("avgPrice") or 0)
+            if exit_price <= 0:
+                try:
+                    filled = self.client.futures_get_order(
+                        symbol=symbol, orderId=order.get("orderId")
+                    )
+                    exit_price = float(filled.get("avgPrice") or 0)
+                except Exception:
+                    pass
+            if exit_price <= 0:
+                exit_price = float(trade.get("entry") or 0)
+
+            # 寫入 DB（partial）
+            self.db.close_trade(
+                trade_id,
+                exit_price   = exit_price,
+                partial      = True,
+                closed_qty   = part_qty,
+                close_reason = close_reason,
+            )
+            log.warning(
+                f"[{symbol}] 階段時間止損部分平倉 {int(pct*100)}%："
+                f"qty={part_qty} @ {exit_price}"
+            )
+            return True
+        except Exception as e:
+            log.error(f"[{symbol}] 部分平倉失敗: {e}")
+            return False
+

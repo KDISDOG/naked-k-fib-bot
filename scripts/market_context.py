@@ -179,6 +179,88 @@ class MarketContext:
             return False
         return abs(corr) >= threshold
 
+    # ── 市場型態（Regime）──────────────────────────────────────
+    def current_regime(self) -> str:
+        """
+        回傳 BTC 目前市場型態：
+            "TREND_UP"   — 4h ADX>=20 且日線收盤 > MA50
+            "TREND_DOWN" — 4h ADX>=20 且日線收盤 < MA50
+            "RANGE"      — 4h ADX<20 且日線靠 MA50（±3%）
+            "CHOPPY"     — 其它（不明朗）
+        失敗或資料不足時回傳 "CHOPPY"。
+        """
+        cached = self._get_cached("btc_regime")
+        if cached is not None:
+            return cached
+        try:
+            # 4h ADX
+            raw4h = self.client.futures_klines(
+                symbol="BTCUSDT", interval="4h", limit=60
+            )
+            if len(raw4h) < 30:
+                return "CHOPPY"
+            import pandas as pd
+            import pandas_ta as ta
+            df4 = pd.DataFrame(raw4h, columns=[
+                "time", "open", "high", "low", "close", "volume",
+                "close_time", "qav", "trades", "tbav", "tbqv", "ignore"
+            ])
+            for c in ["high", "low", "close"]:
+                df4[c] = df4[c].astype(float)
+            adx_df = ta.adx(df4["high"], df4["low"], df4["close"], length=14)
+            adx_val = float(adx_df["ADX_14"].iloc[-1]) if adx_df is not None else 0.0
+
+            # 日線 MA50
+            rawD = self.client.futures_klines(
+                symbol="BTCUSDT", interval="1d", limit=60
+            )
+            if len(rawD) < 50:
+                return "CHOPPY"
+            closes = [float(k[4]) for k in rawD]
+            ma50   = sum(closes[-50:]) / 50
+            last   = closes[-1]
+            above_ma = last > ma50
+            dist_pct = abs(last - ma50) / ma50 if ma50 > 0 else 0
+
+            if adx_val >= 20:
+                regime = "TREND_UP" if above_ma else "TREND_DOWN"
+            else:
+                if dist_pct <= 0.03:
+                    regime = "RANGE"
+                else:
+                    regime = "CHOPPY"
+
+            self._set_cached("btc_regime", regime)
+            log.info(
+                f"BTC Regime = {regime} (4h ADX={adx_val:.1f} "
+                f"last={last:.0f} MA50={ma50:.0f} dist={dist_pct:.1%})"
+            )
+            return regime
+        except Exception as e:
+            log.warning(f"BTC regime 判定失敗: {e}")
+            return "CHOPPY"
+
+    def regime_allows(self, strategy: str) -> bool:
+        """
+        根據目前 BTC regime 判斷策略是否可進場。
+            TREND_UP   → momentum_long, naked_k_fib（LONG 側）
+            TREND_DOWN → breakdown_short, naked_k_fib（SHORT 側）
+            RANGE      → mean_reversion
+            CHOPPY     → naked_k_fib 仍允許（裸K+Fib 本身不限型態），其它阻擋
+        對 naked_k_fib 永遠回 True，由 NKF 內部自有多空過濾。
+        """
+        regime = self.current_regime()
+        if strategy == "naked_k_fib":
+            return True
+        if regime == "TREND_UP":
+            return strategy == "momentum_long"
+        if regime == "TREND_DOWN":
+            return strategy == "breakdown_short"
+        if regime == "RANGE":
+            return strategy == "mean_reversion"
+        # CHOPPY → 全擋
+        return False
+
     # ── Open Interest 異常偵測 ───────────────────────────────────
     def oi_change_pct(self, symbol: str) -> Optional[float]:
         """

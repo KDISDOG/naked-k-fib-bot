@@ -216,6 +216,18 @@ class BreakdownShortStrategy(BaseStrategy):
 
     def check_signal(self, symbol: str) -> Optional[Signal]:
         from config import Config
+        # ── Regime gate：BD 只在 TREND_DOWN 放行 ───────────────
+        if self._market_ctx and getattr(Config, "REGIME_GATE_ENABLED", True):
+            try:
+                if not self._market_ctx.regime_allows("breakdown_short"):
+                    log.debug(
+                        f"[{symbol}] BD 被 regime "
+                        f"{self._market_ctx.current_regime()} 阻擋"
+                    )
+                    return None
+            except Exception:
+                pass
+
         try:
             df = self._get_klines(symbol, self.default_timeframe, limit=200)
         except Exception as e:
@@ -284,6 +296,16 @@ class BreakdownShortStrategy(BaseStrategy):
             ema20_val, ema50_val, avg_vol, last_vol, Config
         )
 
+        # Funding rate 方向性加分（BD 永遠 SHORT）
+        try:
+            from funding_bias import funding_bonus
+            fb = funding_bonus(self._client, symbol, "SHORT")
+            if fb != 0:
+                log.debug(f"[{symbol}] BD funding bonus={fb:+d}")
+            score = max(1, min(score + fb, 5))
+        except Exception:
+            pass
+
         if score < Config.BD_MIN_SCORE:
             log.debug(
                 f"[{symbol}] BD 訊號強度 {score} < {Config.BD_MIN_SCORE}"
@@ -313,9 +335,10 @@ class BreakdownShortStrategy(BaseStrategy):
             strategy_name = self.name,
             timeframe     = self.default_timeframe,
             pattern       = "BD_BREAKDOWN",
-            # 追蹤止盈：需 TRAILING_ENABLED=true 才生效；否則維持靜態 SL/TP1/TP2
-            # 避免 UI 顯示「啟用追蹤」但後台根本沒推進的誤導情況
-            use_trailing  = Config.TRAILING_ENABLED and adx_val > 35,
+            # 追蹤止盈：需總開關 + BD 專屬開關 + ADX>35 才啟用
+            use_trailing  = (Config.TRAILING_ENABLED
+                             and Config.TRAILING_BD_ENABLED
+                             and adx_val > 35),
             trailing_atr  = atr_val,
             btc_corr      = btc_corr,
             metadata      = {

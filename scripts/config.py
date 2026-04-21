@@ -83,10 +83,27 @@ class Config:
     MR_VOL_MULT      = float(os.getenv("MR_VOL_MULT", 0.9))   # 均值回歸：要求縮量確認（賣盤衰竭），避免放量急跌時接刀
     MR_TIMEOUT_BARS  = int(os.getenv("MR_TIMEOUT_BARS", 20))  # 超時 K 棒數
 
+    # ── Market Regime Gate ─────────────────────────────────────
+    # BTC 4h ADX + 日線 MA50 判斷大盤型態（TREND_UP / TREND_DOWN /
+    # RANGE / CHOPPY），讓策略只在合適型態下放行：
+    #   TREND_UP   → momentum_long
+    #   TREND_DOWN → breakdown_short
+    #   RANGE      → mean_reversion
+    #   CHOPPY     → 三者全擋；naked_k_fib 不受影響（內部自有多空過濾）
+    REGIME_GATE_ENABLED = os.getenv("REGIME_GATE_ENABLED", "true").lower() == "true"
+
     # ── 追蹤止盈（Trailing Stop）────────────────────────────────
     # 總開關：關閉後純靠 SL/TP1/TP2 + 保本一次性移動。避免 30 秒推進
-    # 造成孤兒單累積 / 掛單爆量。預設 false 保守運行。
-    TRAILING_ENABLED = os.getenv("TRAILING_ENABLED", "false").lower() == "true"
+    # 造成孤兒單累積 / 掛單爆量。
+    # 預設 true：ML/BD 這類強趨勢突破策略能吃到完整波段；
+    # 各策略仍有 per-strategy 旗標，可個別關閉。
+    TRAILING_ENABLED = os.getenv("TRAILING_ENABLED", "true").lower() == "true"
+
+    # Per-strategy 追蹤止盈開關（需 TRAILING_ENABLED=true 才生效）
+    TRAILING_ML_ENABLED  = os.getenv("TRAILING_ML_ENABLED",  "true").lower()  == "true"
+    TRAILING_BD_ENABLED  = os.getenv("TRAILING_BD_ENABLED",  "true").lower()  == "true"
+    TRAILING_NKF_ENABLED = os.getenv("TRAILING_NKF_ENABLED", "false").lower() == "true"
+    TRAILING_MR_ENABLED  = os.getenv("TRAILING_MR_ENABLED",  "false").lower() == "true"
     TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", 1.5))  # 追蹤距離 = N × ATR
     TRAILING_ACTIVATE_AFTER_TP1 = os.getenv(
         "TRAILING_ACTIVATE_AFTER_TP1", "true"
