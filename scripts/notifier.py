@@ -236,7 +236,8 @@ class TelegramNotifier:
         chunks: list[str] = []
         buf = header
         for b in blocks:
-            piece = "\n" + b
+            # 幣與幣之間空一行分隔
+            piece = "\n\n" + b
             if len(buf) + len(piece) > MAX:
                 chunks.append(buf)
                 buf = b
