@@ -349,6 +349,57 @@ class StateManager:
             ).scalar()
             return float(result or 0.0)
 
+    def get_today_stats_by_strategy(self) -> dict:
+        """
+        依策略分組今日已完全平倉統計：
+            {
+              "naked_k_fib": {
+                 "trades": 5, "wins": 3, "net_pnl": 8.10,
+                 "avg": 1.62, "win_rate": 60.0
+              }, ...
+            }
+        另回傳 __open__ 代表目前仍開倉筆數（不分策略）。
+        """
+        today = datetime.now().date()
+        with self.Session() as session:
+            closed = session.query(Trade).filter(
+                func.date(Trade.closed_at) == today,
+                Trade.status == "closed",
+            ).all()
+            open_cnt_by_strat: dict[str, int] = {}
+            for t in session.query(Trade).filter(
+                Trade.status.in_(["open", "partial"])
+            ).all():
+                s = t.strategy or "naked_k_fib"
+                open_cnt_by_strat[s] = open_cnt_by_strat.get(s, 0) + 1
+
+        grouped: dict[str, dict] = {}
+        for t in closed:
+            s = t.strategy or "naked_k_fib"
+            g = grouped.setdefault(s, {
+                "trades": 0, "wins": 0, "net_pnl": 0.0,
+            })
+            g["trades"] += 1
+            if (t.net_pnl or 0) > 0:
+                g["wins"] += 1
+            g["net_pnl"] += float(t.net_pnl or 0)
+
+        for s, g in grouped.items():
+            n = max(g["trades"], 1)
+            g["avg"]      = round(g["net_pnl"] / n, 2)
+            g["win_rate"] = round(g["wins"] / n * 100, 1)
+            g["net_pnl"]  = round(g["net_pnl"], 2)
+            g["open"]     = open_cnt_by_strat.get(s, 0)
+
+        # 仍有開倉但今日尚未平倉的策略也列出（open 計數用）
+        for s, cnt in open_cnt_by_strat.items():
+            if s not in grouped:
+                grouped[s] = {
+                    "trades": 0, "wins": 0, "net_pnl": 0.0,
+                    "avg": 0.0, "win_rate": 0.0, "open": cnt,
+                }
+        return grouped
+
     def get_all_trades(self, limit=100) -> list:
         with self.Session() as session:
             trades = (

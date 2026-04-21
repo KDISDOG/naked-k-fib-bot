@@ -84,6 +84,27 @@ shutdown_event = threading.Event()
 # CLI 覆蓋策略（由 --strategy 參數設定）
 _active_strategy_override: str | None = None
 
+# Regime 變化追蹤（啟動時填入、每次 check_signals 比對）
+_last_regime_state: dict = {"value": ""}
+
+
+def check_regime_change():
+    """偵測 BTC regime 變化，切換時透過 Telegram 推播一次"""
+    try:
+        new = market_ctx.current_regime()
+    except Exception as e:
+        log.debug(f"regime 取得失敗: {e}")
+        return
+    old = _last_regime_state.get("value", "")
+    if new and old and new != old:
+        log.warning(f"BTC Regime 變化：{old} → {new}")
+        try:
+            notify.regime_changed(old, new)
+        except Exception as e:
+            log.debug(f"regime 通知失敗: {e}")
+    if new:
+        _last_regime_state["value"] = new
+
 
 # ── 策略載入 ─────────────────────────────────────────────────────
 def load_strategies() -> list:
@@ -253,6 +274,13 @@ def check_signals():
         log.warning("機器人已暫停，跳過訊號檢查")
         return
 
+    # Regime 變化偵測（切換時 Telegram 推一次）— 放在最前面，
+    # 即使後續 daily_loss 觸發 return 也已經更新過 regime 狀態
+    try:
+        check_regime_change()
+    except Exception as _e:
+        log.debug(f"regime 檢查失敗: {_e}")
+
     # 每日虧損檢查
     if risk.daily_loss_exceeded():
         bot_paused = True
@@ -415,11 +443,26 @@ def send_daily_summary():
         today_pnl = db.get_today_pnl()
         stats = db.get_stats()
         open_count = db.count_open_positions()
+        # 分策略統計
+        per_strat = {}
+        try:
+            per_strat = db.get_today_stats_by_strategy()
+        except Exception as se:
+            log.warning(f"取得分策略統計失敗: {se}")
+        # 當前 regime
+        regime = ""
+        try:
+            if market_ctx:
+                regime = market_ctx.current_regime()
+        except Exception:
+            pass
         notify.daily_summary(
             today_pnl=today_pnl,
             total_pnl=stats.get("net_pnl", 0),
             win_rate=stats.get("win_rate", 0),
             open_count=open_count,
+            per_strategy=per_strat,
+            regime=regime,
         )
     except Exception as e:
         log.error(f"每日總結發送失敗: {e}")
@@ -479,7 +522,13 @@ def send_positions_report():
                 "roe_pct":        roe_pct,
             })
 
-        notify.positions_report(items)
+        # 附帶目前 regime（讓用戶一眼看出 bot 為何擋/放行）
+        regime = ""
+        try:
+            regime = market_ctx.current_regime()
+        except Exception:
+            pass
+        notify.positions_report(items, regime=regime)
     except Exception as e:
         log.error(f"持倉小時報發送失敗: {e}")
 
@@ -584,7 +633,14 @@ def main():
     if not args.no_dashboard:
         start_dashboard(args.port)
 
-    notify.bot_started()
+    # 啟動時告知當前 regime（CHOPPY 會擋掉 MR/ML/BD，避免用戶以為 bot 壞了）
+    _initial_regime = ""
+    try:
+        _initial_regime = market_ctx.current_regime()
+        _last_regime_state["value"] = _initial_regime
+    except Exception as _e:
+        log.warning(f"啟動時 regime 判定失敗: {_e}")
+    notify.bot_started(regime=_initial_regime)
     setup_schedule()
 
     # 啟動時清理幣安上殘留的孤兒掛單（SL/TP 未被撤銷的殘留）

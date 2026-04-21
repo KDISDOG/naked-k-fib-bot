@@ -107,40 +107,94 @@ class TelegramNotifier:
             text += f"\n<code>{extra}</code>"
         self._send(text)
 
-    def bot_started(self):
-        self._send("🤖 <b>機器人已啟動</b>")
+    def bot_started(self, regime: str = ""):
+        txt = "🤖 <b>機器人已啟動</b>"
+        if regime:
+            txt += f"\nBTC Regime: <b>{regime}</b>"
+        self._send(txt)
 
     def bot_stopped(self):
         self._send("🛑 <b>機器人已停止</b>")
 
-    def daily_summary(self, today_pnl: float, total_pnl: float,
-                      win_rate: float, open_count: int):
-        sign = "+" if today_pnl >= 0 else ""
+    def regime_changed(self, old: str, new: str):
         self._send(
-            f"📊 <b>每日總結</b>\n"
-            f"今日: {sign}{today_pnl:.2f} USDT\n"
-            f"累計: {'+' if total_pnl >= 0 else ''}{total_pnl:.2f} USDT\n"
-            f"勝率: {win_rate:.1f}%  目前持倉: {open_count}"
+            f"🌤 <b>BTC Regime 變化</b>\n"
+            f"<code>{old}</code> → <b>{new}</b>"
         )
 
+    def daily_summary(self, today_pnl: float, total_pnl: float,
+                      win_rate: float, open_count: int,
+                      per_strategy: dict | None = None,
+                      regime: str = ""):
+        sign = "+" if today_pnl >= 0 else ""
+        lines = [
+            "📊 <b>每日總結</b>",
+            f"今日: <b>{sign}{today_pnl:.2f} USDT</b>",
+            f"累計: {'+' if total_pnl >= 0 else ''}{total_pnl:.2f} USDT",
+            f"勝率: {win_rate:.1f}%  目前持倉: {open_count}",
+        ]
+        if regime:
+            lines.append(f"BTC Regime: <b>{regime}</b>")
+
+        if per_strategy:
+            lines.append("───────────────")
+            # 排序：先有交易的（net_pnl 絕對值大）、再沒交易的
+            def _key(item):
+                _s, g = item
+                traded = g.get("trades", 0) > 0
+                return (0 if traded else 1, -abs(g.get("net_pnl", 0)))
+
+            short_map = {
+                "naked_k_fib": "NKF",
+                "mean_reversion": "MR",
+                "momentum_long": "ML",
+                "breakdown_short": "BD",
+            }
+            for strat, g in sorted(per_strategy.items(), key=_key):
+                label   = short_map.get(strat, strat[:4].upper())
+                trades  = g.get("trades", 0)
+                wins    = g.get("wins", 0)
+                losses  = trades - wins
+                netp    = g.get("net_pnl", 0.0)
+                avg     = g.get("avg", 0.0)
+                wr      = g.get("win_rate", 0.0)
+                open_n  = g.get("open", 0)
+                sgn_p   = "+" if netp >= 0 else ""
+                sgn_a   = "+" if avg  >= 0 else ""
+                if trades == 0:
+                    lines.append(
+                        f"<b>{label}</b>  無平倉  持倉 {open_n}"
+                    )
+                else:
+                    lines.append(
+                        f"<b>{label}</b>  {sgn_p}{netp:.2f}  "
+                        f"{trades}戰{wins}勝{losses}負 "
+                        f"WR {wr:.0f}%  avg {sgn_a}{avg:.2f}  "
+                        f"持倉 {open_n}"
+                    )
+
+        self._send("\n".join(lines))
+
     # ── 持倉小時報（每 1 小時）──────────────────────────────────
-    def positions_report(self, items: list[dict]):
+    def positions_report(self, items: list[dict], regime: str = ""):
         """
         每小時推送所有開倉的即時成效。
         items 每筆含：
           symbol, direction, strategy, entry, current, tp1, tp2, sl,
           qty, margin, unrealized_pnl, price_pct, roe_pct
+        regime: 可選 BTC 市場型態標籤（會印在 header）
         訊息太長自動分頁（Telegram 單則 4096 字元上限）。
         """
+        regime_tag = f"  Regime: <b>{regime}</b>" if regime else ""
         if not items:
             self._send(
-                "📊 <b>持倉小時報</b>\n目前無開倉。"
+                f"📊 <b>持倉小時報</b>{regime_tag}\n目前無開倉。"
             )
             return
 
         total_pnl = sum(float(it.get("unrealized_pnl", 0) or 0) for it in items)
         header = (
-            f"📊 <b>持倉小時報</b>  持倉 {len(items)} 筆\n"
+            f"📊 <b>持倉小時報</b>  持倉 {len(items)} 筆{regime_tag}\n"
             f"未實現總計: <b>{'+' if total_pnl >= 0 else ''}"
             f"{total_pnl:.2f} USDT</b>\n"
             f"───────────────"

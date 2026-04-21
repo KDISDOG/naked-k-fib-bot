@@ -476,6 +476,26 @@ class PositionSyncer:
         if trade.get("use_trailing"):
             return "TP1+TRAILING" if was_partial else "TRAILING"
 
+        # ── 4. Fallback：對不上任何結構化目標 ─────────────────────
+        # 常見情境：
+        #   (a) 使用者在 Binance App 手動市價平倉
+        #   (b) 清算 / 風控強平（但倉位已歸零）
+        #   (c) TP1/TP2 掛單失敗（僅留 SL），實際被市場波動 wick 掃掉
+        #   (d) exit_price 取樣偏離（快速行情下 fallback 到 entry）
+        # 至少依盈虧方向 + 是否已 TP1 過給出可讀標籤，並輸出診斷 log
+        log.warning(
+            f"[{trade.get('symbol')}] #{trade.get('id')} 平倉原因無法對應："
+            f"dir={direction} exit={exit_price} entry={entry} "
+            f"tp1={tp1} tp2={tp2} sl={sl} be={is_be} partial={was_partial}"
+        )
+        if entry > 0:
+            if direction == "LONG":
+                win = exit_price > entry
+            else:
+                win = exit_price < entry
+            base = "EXT_WIN" if win else "EXT_LOSS"
+            return f"TP1+{base}" if was_partial else base
+
         return "UNKNOWN"
 
     # ── 輔助方法 ─────────────────────────────────────────────────
