@@ -16,6 +16,7 @@ Position Syncer — 倉位同步模組
     4. 若 TP1 已觸發（qty 減半）→ 觸發 breakeven stop
 """
 import logging
+from datetime import datetime
 from typing import Optional
 import pandas_ta as ta
 from binance.client import Client
@@ -106,26 +107,49 @@ class PositionSyncer:
                     except Exception as ce:
                         log.warning(f"[{symbol}] 清除殘留掛單失敗: {ce}")
 
-                    exit_price = self._get_last_trade_price(symbol)
-                    fee = self._get_recent_fee(symbol, qty)
+                    # 優先取 Binance 實際平倉 fills：
+                    #   exit_price = 加權均價（不是 DB 的 tp1/tp2）
+                    #   fee        = 真實平倉手續費
+                    #   realized   = 真實 realizedPnl（判定勝負最準）
+                    start_ms = self._opened_at_ms(trade)
+                    close_info = self._get_recent_close_fills(
+                        symbol, target_qty=expected_remaining, start_ms=start_ms
+                    )
+                    if close_info.get("vwap"):
+                        exit_price = close_info["vwap"]
+                        fee = close_info.get("fee", 0.0)
+                        realized_hint = close_info.get("realized")
+                        log.info(
+                            f"[{symbol}] #{trade_id} 平倉 VWAP={exit_price:.6f} "
+                            f"realized={realized_hint:+.4f} fee={fee:.4f}"
+                        )
+                    else:
+                        # fallback：取不到 fills 時退回舊邏輯
+                        exit_price = self._get_last_trade_price(symbol) or entry
+                        fee = self._get_recent_fee(symbol, qty)
+                        realized_hint = None
 
-                    # 判斷平倉原因
-                    reason = self._detect_close_reason(trade, exit_price or entry)
+                    # 判斷平倉原因（優先用 realized 正負號）
+                    reason = self._detect_close_reason(
+                        trade, exit_price, realized_hint=realized_hint
+                    )
 
                     self.db.close_trade(
                         trade_id     = trade_id,
-                        exit_price   = exit_price or entry,
+                        exit_price   = exit_price,
                         fee          = fee,
                         partial      = False,
                         close_reason = reason,
                     )
-                    # 計算淨盈虧通知
-                    _ep = exit_price or entry
-                    if direction == "LONG":
-                        _raw_pnl = (_ep - entry) * qty
+                    # 通知淨盈虧：有 realized 就直接用（最準），否則重算
+                    if realized_hint is not None:
+                        _net = realized_hint - fee
                     else:
-                        _raw_pnl = (entry - _ep) * qty
-                    _net = _raw_pnl - fee
+                        if direction == "LONG":
+                            _raw_pnl = (exit_price - entry) * qty
+                        else:
+                            _raw_pnl = (entry - exit_price) * qty
+                        _net = _raw_pnl - fee
                     notify.trade_closed(symbol, direction, _net, reason)
                     continue
 
@@ -165,12 +189,22 @@ class PositionSyncer:
                     )
 
                     if is_tp2_fired:
-                        # TP2 已觸發：用 TP2 價紀錄、把剩餘倉市價平掉、關閉交易
-                        exit_price = trade["tp2"] or self._get_last_trade_price(symbol)
-                        fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+                        # TP2 已觸發：優先用 Binance 真實成交 VWAP，
+                        # 而非 DB 的 trade["tp2"]（可能與實際成交有偏差）
+                        start_ms = self._opened_at_ms(trade)
+                        tp2_info = self._get_recent_close_fills(
+                            symbol, target_qty=qty_diff, start_ms=start_ms
+                        )
+                        if tp2_info.get("vwap"):
+                            exit_price = tp2_info["vwap"]
+                            fee = tp2_info.get("fee", 0.0)
+                        else:
+                            exit_price = trade["tp2"] or \
+                                self._get_last_trade_price(symbol) or entry
+                            fee = RiskManager.estimate_fee(qty_diff, exit_price)
                         self.db.close_trade(
                             trade_id     = trade_id,
-                            exit_price   = exit_price or entry,
+                            exit_price   = exit_price,
                             fee          = fee,
                             partial      = True,
                             closed_qty   = qty_diff,
@@ -203,16 +237,44 @@ class PositionSyncer:
                         continue
 
                     # 走到這裡 = TP1 觸發（或無法判定、保守走 TP1 路徑）
-                    exit_price = trade["tp1"] or self._get_last_trade_price(symbol)
-                    fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+                    # 優先用 Binance 真實成交 VWAP 當 exit_price，
+                    # 而非 DB 的 trade["tp1"] — 這是 AAVE #2 這類案例的根源修正
+                    start_ms = self._opened_at_ms(trade)
+                    tp1_info = self._get_recent_close_fills(
+                        symbol, target_qty=qty_diff, start_ms=start_ms
+                    )
+                    if tp1_info.get("vwap"):
+                        exit_price = tp1_info["vwap"]
+                        fee = tp1_info.get("fee", 0.0)
+                        realized_hint = tp1_info.get("realized")
+                        # partial 即使 realized < 0（例如 SL 提早打到）也要誠實記錄
+                        # 避免把虧損 tick 寫成 TP1 獲利
+                        if realized_hint is not None and realized_hint < 0:
+                            # 這種情況其實不是 TP1，是 SL 或 BE 先打到
+                            # 讓 reason 反映事實
+                            if trade.get("breakeven"):
+                                tp1_reason = "TP1+BE"  # 之前已 TP1，現在 BE 補刀
+                            else:
+                                tp1_reason = "SL"
+                            log.warning(
+                                f"[{symbol}] #{trade_id} 「部分減倉」realized={realized_hint:+.4f} "
+                                f"< 0 → 更正為 {tp1_reason}（非 TP1）"
+                            )
+                        else:
+                            tp1_reason = "TP1"
+                    else:
+                        exit_price = trade["tp1"] or \
+                            self._get_last_trade_price(symbol) or entry
+                        fee = RiskManager.estimate_fee(qty_diff, exit_price)
+                        tp1_reason = "TP1"
 
                     self.db.close_trade(
                         trade_id     = trade_id,
-                        exit_price   = exit_price or entry,
+                        exit_price   = exit_price,
                         fee          = fee,
                         partial      = True,
                         closed_qty   = qty_diff,
-                        close_reason = "TP1",
+                        close_reason = tp1_reason,
                     )
 
                     # 觸發 Breakeven Stop（如果還沒移過）
@@ -427,10 +489,21 @@ class PositionSyncer:
         return None
 
     # ── 平倉原因判斷 ─────────────────────────────────────────────
-    def _detect_close_reason(self, trade: dict, exit_price: float) -> str:
+    def _detect_close_reason(
+        self,
+        trade: dict,
+        exit_price: float,
+        realized_hint: Optional[float] = None,
+    ) -> str:
         """
-        根據平倉價格與 TP/SL 比較，推斷平倉原因。
-        已走過 partial（TP1）的單，完全平倉時加上 TP1+ 前綴方便辨識。
+        根據平倉價格 + realizedPnl hint，推斷平倉原因。
+
+        判定優先順序：
+          1. BREAKEVEN（SL 已移至 entry 附近；可能 realized 略負於手續費）
+          2. 若有 realized_hint：
+             - realized > 0  → 找最近的獲利目標 (TP2 / TP1 / TRAILING / WIN)
+             - realized < 0 → 優先判 SL（對不上則 EXT_LOSS）
+          3. 無 realized_hint：退回舊邏輯（純價格比對）
 
         注意：move_to_breakeven 後 DB 的 sl 欄位已更新為保本價，
         因此必須在 SL 比對之前先判斷 BREAKEVEN，否則會被誤判為 SL。
@@ -446,24 +519,54 @@ class PositionSyncer:
         was_partial = trade.get("status") == "partial"
         is_be       = trade.get("breakeven", False)
 
-        # 容差：價格的 1.0%（比對 TP/SL/BE 時的滑價保護）
-        # 從 0.3% 放寬至 1%：快速行情下 TP/SL 可能偏離 stopPrice 0.5~0.8%，
-        # 太緊會誤判為 UNKNOWN。SL/TP 之間的間距通常 ≥2%，不會撞在一起
+        # 容差：價格的 1.0%（滑價保護）
         tol = entry * 0.01 if entry > 0 else 0
 
-        # ── 1. BREAKEVEN 先判斷（SL 已移至 BE 價，必須優先於 SL 比對）──
+        # ── 1. BREAKEVEN 最優先 ───────────────────────────────────
         if is_be and sl > 0 and abs(exit_price - sl) <= tol:
-            # TP1 一定已觸發才會有 breakeven，固定前綴 TP1+
             return "TP1+BE"
 
-        # ── 2. TP2（最優先）──────────────────────────────────────
+        # ── 2. 有 realized hint：按勝負分流 ───────────────────────
+        if realized_hint is not None:
+            if realized_hint > 0:
+                # 獲利分支：找最近的正向目標
+                if direction == "LONG":
+                    if tp2 > 0 and exit_price >= tp2 - tol:
+                        return "TP2"
+                    if tp1 > 0 and not was_partial and exit_price >= tp1 - tol:
+                        return "TP1"
+                else:
+                    if tp2 > 0 and exit_price <= tp2 + tol:
+                        return "TP2"
+                    if tp1 > 0 and not was_partial and exit_price <= tp1 + tol:
+                        return "TP1"
+                if trade.get("use_trailing"):
+                    return "TP1+TRAILING" if was_partial else "TRAILING"
+                # 賺但對不上明確 TP（例如手動停單獲利、trailing 未標記）
+                return "TP1+WIN" if was_partial else "WIN"
+            else:
+                # 虧損分支：優先判 SL
+                if direction == "LONG":
+                    if sl > 0 and exit_price <= sl + tol:
+                        return "TP1+SL" if was_partial else "SL"
+                else:
+                    if sl > 0 and exit_price >= sl - tol:
+                        return "TP1+SL" if was_partial else "SL"
+                if trade.get("use_trailing"):
+                    return "TP1+TRAILING" if was_partial else "TRAILING"
+                log.warning(
+                    f"[{trade.get('symbol')}] #{trade.get('id')} "
+                    f"虧損但對不上 SL: dir={direction} exit={exit_price:.6f} "
+                    f"entry={entry:.6f} sl={sl} realized={realized_hint:+.4f}"
+                )
+                return "TP1+EXT_LOSS" if was_partial else "EXT_LOSS"
+
+        # ── 3. 無 realized hint：退回舊邏輯（純價格比對） ─────────
         if direction == "LONG":
             if tp2 > 0 and exit_price >= tp2 - tol:
                 return "TP2"
-            # TP1 全倉（未曾 partial）
             if tp1 > 0 and not was_partial and exit_price >= tp1 - tol:
                 return "TP1"
-            # SL
             if sl > 0 and exit_price <= sl + tol:
                 return "TP1+SL" if was_partial else "SL"
         else:  # SHORT
@@ -474,17 +577,10 @@ class PositionSyncer:
             if sl > 0 and exit_price >= sl - tol:
                 return "TP1+SL" if was_partial else "SL"
 
-        # ── 3. 追蹤止盈 ───────────────────────────────────────────
         if trade.get("use_trailing"):
             return "TP1+TRAILING" if was_partial else "TRAILING"
 
-        # ── 4. Fallback：對不上任何結構化目標 ─────────────────────
-        # 常見情境：
-        #   (a) 使用者在 Binance App 手動市價平倉
-        #   (b) 清算 / 風控強平（但倉位已歸零）
-        #   (c) TP1/TP2 掛單失敗（僅留 SL），實際被市場波動 wick 掃掉
-        #   (d) exit_price 取樣偏離（快速行情下 fallback 到 entry）
-        # 至少依盈虧方向 + 是否已 TP1 過給出可讀標籤，並輸出診斷 log
+        # Fallback：對不上任何結構化目標（無 realized hint 可用）
         log.warning(
             f"[{trade.get('symbol')}] #{trade.get('id')} 平倉原因無法對應："
             f"dir={direction} exit={exit_price} entry={entry} "
@@ -499,6 +595,91 @@ class PositionSyncer:
             return f"TP1+{base}" if was_partial else base
 
         return "UNKNOWN"
+
+    # ── 平倉成交 VWAP / realizedPnl 取得 ─────────────────────────
+    @staticmethod
+    def _opened_at_ms(trade: dict) -> Optional[int]:
+        """把 trade.opened_at (ISO) 轉成 epoch ms；用於過濾 Binance fills"""
+        opened_at = trade.get("opened_at")
+        if not opened_at:
+            return None
+        try:
+            dt = datetime.fromisoformat(opened_at)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    def _get_recent_close_fills(
+        self,
+        symbol: str,
+        target_qty: Optional[float] = None,
+        start_ms: Optional[int] = None,
+    ) -> dict:
+        """
+        抓最近的「平倉」成交（realizedPnl != 0）並聚合：
+          {
+            "vwap":       加權均價,
+            "total_qty":  累積成交量,
+            "realized":   總 realizedPnl,
+            "fee":        總 commission（正值）,
+            "ts_latest":  最新成交時間 (ms),
+          }
+
+        若 target_qty 給定，由新到舊累積到達 target_qty 為止；
+        若 start_ms 給定，只取該時間後的成交（避免誤抓舊的 fills）。
+        拿不到或無平倉成交時回傳 {}。
+        """
+        try:
+            params = {"symbol": symbol, "limit": 50}
+            if start_ms:
+                params["startTime"] = start_ms
+            trades = retry_api(
+                self.client.futures_account_trades, **params
+            )
+        except Exception as e:
+            log.warning(f"取得 {symbol} 平倉成交失敗: {e}")
+            return {}
+
+        if not trades:
+            return {}
+
+        # 只要 realizedPnl 非 0（表示這筆是「平倉」方向的成交）
+        closing = [
+            t for t in trades
+            if abs(float(t.get("realizedPnl", 0) or 0)) > 1e-12
+        ]
+        if not closing:
+            return {}
+        # 由新到舊排序
+        closing.sort(key=lambda x: int(x.get("time", 0)), reverse=True)
+
+        tot_qty = 0.0
+        tot_notional = 0.0
+        realized = 0.0
+        fee = 0.0
+        ts_latest = int(closing[0].get("time", 0))
+        for tr in closing:
+            q = float(tr.get("qty", 0) or 0)
+            p = float(tr.get("price", 0) or 0)
+            if q <= 0 or p <= 0:
+                continue
+            tot_qty += q
+            tot_notional += q * p
+            realized += float(tr.get("realizedPnl", 0) or 0)
+            fee += float(tr.get("commission", 0) or 0)
+            if target_qty is not None and tot_qty >= target_qty - 1e-9:
+                break
+
+        if tot_qty <= 0:
+            return {}
+        vwap = tot_notional / tot_qty
+        return {
+            "vwap":       vwap,
+            "total_qty":  tot_qty,
+            "realized":   realized,
+            "fee":        fee,
+            "ts_latest":  ts_latest,
+        }
 
     # ── 輔助方法 ─────────────────────────────────────────────────
 
