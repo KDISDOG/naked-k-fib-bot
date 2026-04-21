@@ -180,6 +180,39 @@ class OrderExecutor:
                 f"[{symbol}] 開倉成功：{direction} qty={qty} @ {fill_price}"
             )
 
+            # 3.4 成交價偏離過大 → 緊急平倉止損
+            # 背景：訊號到成交之間若市場急拉 / 急跌 >3%，
+            #   原本 SL/TP 結構已失真（例：SHORT 訊號 87→成交 99，
+            #   TP1/TP2 全數被 mark 越過 → Binance -2021 immediate trigger，
+            #   留下裸倉）。遇此狀況直接平倉放棄，不入 DB。
+            MAX_SLIP = 0.03   # 3%
+            if fill_price > 0 and entry > 0 and \
+                    abs(fill_price - entry) / entry > MAX_SLIP:
+                slip_pct = (fill_price - entry) / entry * 100
+                log.error(
+                    f"[{symbol}] 成交價 {fill_price} 偏離訊號 {entry} "
+                    f"({slip_pct:+.2f}%) 超過 {MAX_SLIP:.0%} 門檻，"
+                    f"緊急平倉放棄此單"
+                )
+                try:
+                    create_order_safe(
+                        self.client, symbol,
+                        side       = close_side,
+                        type       = ORDER_TYPE_MARKET,
+                        quantity   = qty,
+                        reduceOnly = True,
+                    )
+                    cancel_all_for_symbol(self.client, symbol)
+                except Exception as e2:
+                    log.error(f"[{symbol}] 滑價緊急平倉失敗: {e2}")
+                    notify.error("滑價緊急平倉失敗", f"{symbol}: {e2}")
+                notify.error(
+                    "成交價偏離過大，已放棄開倉",
+                    f"{symbol} {direction} 訊號={entry} 成交={fill_price} "
+                    f"偏離={slip_pct:+.2f}%"
+                )
+                return None
+
             # 3.5 實際成交價偏離訊號預期 → 按相同百分比距離重算 SL/TP
             # 背景：市價單在薄市可能滑價 0.3%~2%；若仍用訊號 entry 算的 SL/TP
             #   絕對值，會讓實際 RR 失真（SL 變近/遠、TP 變遠/近）。
@@ -290,39 +323,72 @@ class OrderExecutor:
                         notify.error("緊急平倉失敗", f"{symbol}: {e2}")
                     return None
 
-            # 5. TP1 止盈（部分平倉）
+            # 5-6. TP 止盈（先驗證 stopPrice 相對 mark 方向安全，再下單）
+            # 防 -2021 Order would immediately trigger：
+            #   LONG TP (SELL close)：stopPrice 必須 > mark * (1 + buffer)
+            #   SHORT TP (BUY  close)：stopPrice 必須 < mark * (1 - buffer)
+            # 若不滿足則跳過，避免 3 次 retry 浪費約 6 秒，也避免寫入不存在的 id
+            try:
+                mark_now = float(
+                    self.client.futures_mark_price(symbol=symbol)["markPrice"]
+                )
+            except Exception:
+                mark_now = fill_price  # fallback
+            BUF = 0.002  # 0.2%
+
+            def _tp_ok(px):
+                if px <= 0:
+                    return False
+                if direction == "LONG":
+                    return px > mark_now * (1 + BUF)
+                else:
+                    return px < mark_now * (1 - BUF)
+
+            # TP1
             tp1_order_id = ""
             if qty_tp1 > 0:
-                try:
-                    tp1_order = create_order_safe(
-                        self.client, symbol,
-                        side        = close_side,
-                        type        = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                        stopPrice   = tp1,
-                        quantity    = qty_tp1,
-                        reduceOnly  = True,
-                        workingType = "MARK_PRICE",
+                if not _tp_ok(tp1):
+                    log.warning(
+                        f"[{symbol}] TP1={tp1} 相對 mark={mark_now} 已越過或太近，"
+                        f"跳過 TP1 掛單（避免 -2021）"
                     )
-                    tp1_order_id, _ = extract_id(tp1_order)
-                except Exception as e:
-                    log.warning(f"[{symbol}] TP1 掛單失敗: {e}")
+                else:
+                    try:
+                        tp1_order = create_order_safe(
+                            self.client, symbol,
+                            side        = close_side,
+                            type        = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                            stopPrice   = tp1,
+                            quantity    = qty_tp1,
+                            reduceOnly  = True,
+                            workingType = "MARK_PRICE",
+                        )
+                        tp1_order_id, _ = extract_id(tp1_order)
+                    except Exception as e:
+                        log.warning(f"[{symbol}] TP1 掛單失敗: {e}")
 
-            # 6. TP2 止盈（剩餘平倉）
+            # TP2
             tp2_order_id = ""
             if qty_tp2 > 0:
-                try:
-                    tp2_order = create_order_safe(
-                        self.client, symbol,
-                        side        = close_side,
-                        type        = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                        stopPrice   = tp2,
-                        quantity    = qty_tp2,
-                        reduceOnly  = True,
-                        workingType = "MARK_PRICE",
+                if not _tp_ok(tp2):
+                    log.warning(
+                        f"[{symbol}] TP2={tp2} 相對 mark={mark_now} 已越過或太近，"
+                        f"跳過 TP2 掛單（避免 -2021）"
                     )
-                    tp2_order_id, _ = extract_id(tp2_order)
-                except Exception as e:
-                    log.warning(f"[{symbol}] TP2 掛單失敗: {e}")
+                else:
+                    try:
+                        tp2_order = create_order_safe(
+                            self.client, symbol,
+                            side        = close_side,
+                            type        = FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                            stopPrice   = tp2,
+                            quantity    = qty_tp2,
+                            reduceOnly  = True,
+                            workingType = "MARK_PRICE",
+                        )
+                        tp2_order_id, _ = extract_id(tp2_order)
+                    except Exception as e:
+                        log.warning(f"[{symbol}] TP2 掛單失敗: {e}")
 
             # 7. 計算保證金（實際成交價 × 數量 / 槓桿）
             margin = round(fill_price * qty / leverage, 2)

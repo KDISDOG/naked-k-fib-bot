@@ -129,16 +129,80 @@ class PositionSyncer:
                     notify.trade_closed(symbol, direction, _net, reason)
                     continue
 
-                # ── 情況 2: 部分平倉（TP1 觸發）──────────────────────
+                # ── 情況 2: 部分平倉 — 判斷 TP1 / TP2 ─────────────────
                 qty_diff = expected_remaining - actual_qty
                 if qty_diff > 0.0005:
-                    # 有一部分被平掉了（很可能是 TP1）
+                    # 判斷觸發的是 TP1 還是 TP2：查當前 Binance 掛單
+                    #   若 tp2_order_id 仍在掛 → TP1 先觸發（正常流程）
+                    #   若 tp2_order_id 不在了 → TP2 剛觸發（TP1 可能已失敗未掛）
+                    #                             剩餘部位應直接平倉，而非移到保本
+                    tp2_id = str(trade.get("tp2_order_id") or "")
+                    tp1_id = str(trade.get("tp1_order_id") or "")
+                    tp2_alive = False
+                    tp1_alive = False
+                    try:
+                        open_o = list_open_orders(self.client, symbol=symbol)
+                        alive_ids = {str(o.get("orderId")) for o in open_o}
+                        if tp2_id and tp2_id in alive_ids:
+                            tp2_alive = True
+                        if tp1_id and tp1_id in alive_ids:
+                            tp1_alive = True
+                    except Exception as oe:
+                        log.warning(f"[{symbol}] 查掛單判定 TP 失敗: {oe}")
+
+                    # 若 tp1 也已不在、tp2 也已不在 → TP2 觸發（或兩張都沒掛成）
+                    # 若 tp2 仍在 → 一定是 TP1 觸發
+                    is_tp2_fired = (not tp2_alive) and (tp2_id != "")
+                    # 保守：沒有 tp2_order_id 記錄且 tp1_order_id 也沒 → 無法判定，
+                    # 仍當成 TP1 處理（維持舊行為）
+
                     log.info(
                         f"[{symbol}] #{trade_id} 偵測到部分平倉："
                         f"預期剩餘={expected_remaining:.4f} "
-                        f"實際={actual_qty:.4f} 差異={qty_diff:.4f}"
+                        f"實際={actual_qty:.4f} 差異={qty_diff:.4f} "
+                        f"(tp1_alive={tp1_alive} tp2_alive={tp2_alive} "
+                        f"→ {'TP2 觸發' if is_tp2_fired else 'TP1 觸發'})"
                     )
-                    # 估算平倉價格（用 TP1 價格）
+
+                    if is_tp2_fired:
+                        # TP2 已觸發：用 TP2 價紀錄、把剩餘倉市價平掉、關閉交易
+                        exit_price = trade["tp2"] or self._get_last_trade_price(symbol)
+                        fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
+                        self.db.close_trade(
+                            trade_id     = trade_id,
+                            exit_price   = exit_price or entry,
+                            fee          = fee,
+                            partial      = True,
+                            closed_qty   = qty_diff,
+                            close_reason = "TP2",
+                        )
+                        # 把剩餘 actual_qty 市價平掉，避免裸倉
+                        try:
+                            from binance.enums import (
+                                ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
+                            )
+                            close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
+                            self.client.futures_create_order(
+                                symbol     = symbol,
+                                side       = close_side,
+                                type       = ORDER_TYPE_MARKET,
+                                quantity   = actual_qty,
+                                reduceOnly = True,
+                            )
+                            log.info(
+                                f"[{symbol}] TP2 後剩餘 {actual_qty} 單市價平掉"
+                            )
+                        except Exception as me:
+                            log.error(f"[{symbol}] TP2 後殘倉平倉失敗: {me}")
+                            notify.error("TP2 後殘倉平倉失敗", f"{symbol}: {me}")
+                        # 清掉剩餘 reduceOnly 掛單
+                        try:
+                            cancel_all_for_symbol(self.client, symbol)
+                        except Exception:
+                            pass
+                        continue
+
+                    # 走到這裡 = TP1 觸發（或無法判定、保守走 TP1 路徑）
                     exit_price = trade["tp1"] or self._get_last_trade_price(symbol)
                     fee = RiskManager.estimate_fee(qty_diff, exit_price or entry)
 
