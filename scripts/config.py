@@ -71,6 +71,22 @@ class Config:
         os.getenv("SCREEN_REL_STRENGTH_MIN_DIFF", 1.0)  # % 單位
     )
 
+    # ── 選幣後相關性去重（v3 新增）─────────────────────────────
+    # 候選幣 1h 收盤相關係數 > SCREEN_CORR_THRESHOLD 時，保留排序較前者，
+    # 後位的同板塊幣剔除，避免 top 清單全部押同一風險因子。
+    SCREEN_CORR_DEDUPE_ENABLED = os.getenv(
+        "SCREEN_CORR_DEDUPE_ENABLED", "true"
+    ).lower() == "true"
+    SCREEN_CORR_THRESHOLD      = float(os.getenv("SCREEN_CORR_THRESHOLD", 0.85))
+
+    # ── 進場前快檢查（v3 新增）─────────────────────────────────
+    # 選幣→進場之間可能隔數分鐘到十幾分鐘，進場前用輕量 API 再查：
+    #   - funding rate 沒飆極端（|fr| > 0.15%/8h）
+    #   - 相對強弱方向仍與進場方向匹配
+    PRE_ENTRY_RECHECK_ENABLED = os.getenv(
+        "PRE_ENTRY_RECHECK_ENABLED", "true"
+    ).lower() == "true"
+
     # ── 裸K+Fib 入場參數（signal_engine）────────────────────────
     NKF_MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))
     NKF_FIB_TOL          = float(os.getenv("SIGNAL_FIB_TOL", 0.005))
@@ -127,6 +143,9 @@ class Config:
     BD_TIMEFRAME     = os.getenv("BD_TIMEFRAME", "1h")
     BD_ADX_MIN       = float(os.getenv("BD_ADX_MIN", 25))
     BD_ADX_MAX       = float(os.getenv("BD_ADX_MAX", 50))
+    # BD_ADX_EXTREME：25-50 是 2 分甜蜜區、50-EXTREME 降為 1 分但不淘汰
+    # 做空在強下跌動能（ADX 50-65）反而受益，不應被 Screener 一刀排除
+    BD_ADX_EXTREME   = float(os.getenv("BD_ADX_EXTREME", 65))
     BD_LOOKBACK_BARS = int(os.getenv("BD_LOOKBACK_BARS", 20))    # 支撐突破回看根數
     BD_VOL_MULT      = float(os.getenv("BD_VOL_MULT", 1.3))     # 突破量確認倍數
     BD_SL_ATR_MULT   = float(os.getenv("BD_SL_ATR_MULT", 1.0))  # SL = 突破點 + N×ATR
@@ -144,6 +163,9 @@ class Config:
     ML_TIMEFRAME     = os.getenv("ML_TIMEFRAME", "1h")
     ML_ADX_MIN       = float(os.getenv("ML_ADX_MIN", 25))
     ML_ADX_MAX       = float(os.getenv("ML_ADX_MAX", 50))
+    # ML_ADX_EXTREME：25-50 是 2 分甜蜜區、50-EXTREME 降為 1 分但不淘汰
+    # 做多在強動能突破（ADX 50-65）仍可做，但過熱不再加到 2 分
+    ML_ADX_EXTREME   = float(os.getenv("ML_ADX_EXTREME", 65))
     ML_LOOKBACK_BARS = int(os.getenv("ML_LOOKBACK_BARS", 20))    # 阻力突破回看根數
     ML_VOL_MULT      = float(os.getenv("ML_VOL_MULT", 1.3))     # 突破量確認倍數
     ML_SL_ATR_MULT   = float(os.getenv("ML_SL_ATR_MULT", 1.0))  # SL = 突破點 - N×ATR

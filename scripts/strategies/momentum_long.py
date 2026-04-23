@@ -134,11 +134,13 @@ class MomentumLongStrategy(BaseStrategy):
         adx_val = float(adx_df["ADX_14"].iloc[-1])
 
         if Config.ML_ADX_MIN <= adx_val <= Config.ML_ADX_MAX:
-            score += 2
+            score += 2  # 25-50 甜蜜區
         elif 20 <= adx_val < Config.ML_ADX_MIN:
-            score += 1
+            score += 1  # 20-25 弱但有方向
+        elif Config.ML_ADX_MAX < adx_val <= Config.ML_ADX_EXTREME:
+            score += 1  # 50-65 強動能（突破類仍可做，但過熱不加 2 分）
         else:
-            return 0
+            return 0  # ADX <20 或 >65
 
         # 4. 上升波段：近期 swing low 遞升
         swings_l = self._find_swing_lows(df, left=10, right=10)
@@ -195,6 +197,21 @@ class MomentumLongStrategy(BaseStrategy):
                         score -= 1
             except Exception:
                 pass
+
+        # 量能趨勢：近 6 根 vs 前 18 根均量
+        # 放量 ≥1.2x → +1（突破/上漲放量確認）；縮量 ≤0.7x → -1
+        try:
+            if len(df) >= 24:
+                recent_qav = float(df["qav"].tail(6).mean())
+                prev_qav = float(df["qav"].iloc[-24:-6].mean())
+                if prev_qav > 0:
+                    vratio = recent_qav / prev_qav
+                    if vratio >= 1.2:
+                        score += 1
+                    elif vratio <= 0.7:
+                        score -= 1
+        except Exception:
+            pass
 
         return score
 

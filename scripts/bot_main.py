@@ -21,6 +21,7 @@ import logging
 import argparse
 import threading
 import schedule
+import numpy as np
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from binance.client import Client
@@ -123,6 +124,62 @@ def load_strategies() -> list:
         raise ValueError(f"未知策略: {active}")
 
 
+# ── 選幣後：相關性去重 ─────────────────────────────────────────
+def _dedupe_correlated_symbols(symbols: list[str],
+                               threshold: float = 0.85,
+                               interval: str = "1h",
+                               limit: int = 100) -> list[str]:
+    """
+    依序遍歷候選清單，將與「已保留」幣種 1h 收盤相關係數 > threshold
+    的後位幣剔除（保留分數高 / 早出現的那支）。
+    避免同一板塊 4~5 支同向押注造成曝險集中。
+    """
+    if not symbols or len(symbols) <= 1:
+        return symbols
+    if not getattr(Config, "SCREEN_CORR_DEDUPE_ENABLED", True):
+        return symbols
+
+    kept: list[str] = []
+    kept_closes: dict[str, np.ndarray] = {}
+    dropped_pairs: list[str] = []
+
+    for sym in symbols:
+        try:
+            df = market_ctx.get_klines(sym, interval, limit)
+            close = df["close"].to_numpy()
+        except Exception:
+            # 抓不到 K 線就保守放行（不因 API 失敗而誤殺候選）
+            kept.append(sym)
+            continue
+
+        skip = False
+        for k in kept:
+            k_close = kept_closes.get(k)
+            if k_close is None or len(k_close) != len(close) or len(close) < 20:
+                continue
+            try:
+                corr = float(np.corrcoef(close, k_close)[0, 1])
+            except Exception:
+                continue
+            if np.isnan(corr):
+                continue
+            if corr > threshold:
+                dropped_pairs.append(f"{sym}~{k}({corr:.2f})")
+                skip = True
+                break
+
+        if not skip:
+            kept.append(sym)
+            kept_closes[sym] = close
+
+    if dropped_pairs:
+        log.info(
+            f"相關性去重：{len(symbols)} → {len(kept)}，"
+            f"剔除 {dropped_pairs[:5]}{'...' if len(dropped_pairs) > 5 else ''}"
+        )
+    return kept
+
+
 # ── 選幣任務（每 RESCAN_MIN 分鐘）──────────────────────────────
 def scan_coins():
     global candidate_symbols
@@ -156,6 +213,9 @@ def scan_coins():
     for strategy in load_strategies():
         try:
             symbols = strategy.screen_coins(all_symbols)
+            # 相關性去重（使用 cache 中的 1h K 線，不額外 API 成本）
+            corr_thr = getattr(Config, "SCREEN_CORR_THRESHOLD", 0.85)
+            symbols = _dedupe_correlated_symbols(symbols, threshold=corr_thr)
             candidate_symbols[strategy.name] = symbols
             log.info(
                 f"[{strategy.name}] 候選幣種（{len(symbols)} 支）：{symbols}"
@@ -265,6 +325,60 @@ def check_strategy_timeout():
                         f"[{t['symbol']}] {cfg['strategy']} "
                         f"半時階段止損失敗: {e}"
                     )
+
+
+# ── 進場前快檢查 ────────────────────────────────────────────────
+def _entry_still_valid(symbol: str, side: str) -> bool:
+    """
+    選幣到進場之間可能隔數分鐘～十幾分鐘，期間市場條件會變。
+    進場前快查兩項最敏感的濾網，避免選幣當下適合、進場時已不適合：
+      1. funding rate 沒飆極端（|fr| > 0.15%/8h 直接擋）
+      2. 相對 BTC 強弱方向仍匹配（LONG 沒跑輸 BTC 太多 / SHORT 沒跑贏太多）
+    任一項失敗回 False。API 失敗時 fail-open（不阻斷正常交易流程）。
+    """
+    if not getattr(Config, "PRE_ENTRY_RECHECK_ENABLED", True):
+        return True
+
+    # 1. Funding rate 極端檢查（共用 CoinScreener 同門檻 0.15%/8h）
+    try:
+        fr_data = client.futures_funding_rate(symbol=symbol, limit=1)
+        if fr_data:
+            fr = float(fr_data[-1]["fundingRate"])
+            if abs(fr) > 0.0015:
+                log.warning(
+                    f"[{symbol}] 進場前檢查：funding {fr*100:.4f}%/8h 極端，擋"
+                )
+                return False
+    except Exception as e:
+        log.debug(f"[{symbol}] 進場前 funding 檢查失敗（略過）: {e}")
+
+    # 2. 相對強弱方向仍匹配
+    if market_ctx and symbol != "BTCUSDT" and \
+            getattr(Config, "SCREEN_REL_STRENGTH_ENABLED", True):
+        try:
+            coin_pct = market_ctx.price_change_pct_24h(symbol)
+            btc_pct = market_ctx.btc_change_pct_24h()
+            if coin_pct is not None and btc_pct is not None:
+                diff = coin_pct - btc_pct
+                min_diff = float(
+                    getattr(Config, "SCREEN_REL_STRENGTH_MIN_DIFF", 1.0)
+                )
+                if side == "LONG" and diff < -min_diff:
+                    log.warning(
+                        f"[{symbol}] 進場前檢查：LONG 但 rel diff "
+                        f"{diff:+.2f}% < -{min_diff}%，擋"
+                    )
+                    return False
+                if side == "SHORT" and diff > min_diff:
+                    log.warning(
+                        f"[{symbol}] 進場前檢查：SHORT 但 rel diff "
+                        f"{diff:+.2f}% > +{min_diff}%，擋"
+                    )
+                    return False
+        except Exception as e:
+            log.debug(f"[{symbol}] 進場前 rel strength 檢查失敗: {e}")
+
+    return True
 
 
 # ── 訊號檢查任務（每 SIGNAL_CHECK_MIN 分鐘）────────────────────
@@ -391,6 +505,12 @@ def check_signals():
             )
             if not pos:
                 log.warning(f"[{symbol}] 風控拒絕")
+                continue
+
+            # 進場前快檢查（funding / 相對強弱）
+            # 放在風控計算後，因為風控本身會抓 ticker 等 API，如果風控就擋下來
+            # 這裡就不用白跑一次 pre-check。
+            if not _entry_still_valid(symbol, sig.side):
                 continue
 
             # 執行開倉

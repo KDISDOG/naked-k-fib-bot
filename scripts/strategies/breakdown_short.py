@@ -139,11 +139,13 @@ class BreakdownShortStrategy(BaseStrategy):
         adx_val = float(adx_df["ADX_14"].iloc[-1])
 
         if Config.BD_ADX_MIN <= adx_val <= Config.BD_ADX_MAX:
-            score += 2
+            score += 2  # 25-50 甜蜜區
         elif 20 <= adx_val < Config.BD_ADX_MIN:
-            score += 1  # 弱趨勢但有方向
+            score += 1  # 20-25 弱趨勢但有方向
+        elif Config.BD_ADX_MAX < adx_val <= Config.BD_ADX_EXTREME:
+            score += 1  # 50-65 強動能（做空反而受益，不再直接淘汰）
         else:
-            return 0  # ADX 不在範圍內
+            return 0  # ADX <20 或 >65：沒方向 / 過熱
 
         # 4. 下降波段：近期 swing high 遞降
         swings_h = self._find_swing_highs(df, left=10, right=10)
@@ -202,6 +204,21 @@ class BreakdownShortStrategy(BaseStrategy):
                         score -= 1
             except Exception:
                 pass
+
+        # 量能趨勢：近 6 根 vs 前 18 根均量（15m tf 下約 1.5h vs 前 4.5h）
+        # 放量 ≥1.2x → +1（下跌放量確認）；縮量 ≤0.7x → -1
+        try:
+            if len(df) >= 24:
+                recent_qav = float(df["qav"].tail(6).mean())
+                prev_qav = float(df["qav"].iloc[-24:-6].mean())
+                if prev_qav > 0:
+                    vratio = recent_qav / prev_qav
+                    if vratio >= 1.2:
+                        score += 1
+                    elif vratio <= 0.7:
+                        score -= 1
+        except Exception:
+            pass
 
         return score
 
