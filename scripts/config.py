@@ -18,8 +18,10 @@ class Config:
     MAX_LEVERAGE      = int(os.getenv("MAX_LEVERAGE", 3))      # 固定 3x
     MARGIN_USDT       = float(os.getenv("MARGIN_USDT", 50.0))  # 單筆保證金上限（USDT），實際保證金由 RISK_PCT 決定
     MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", 6))     # 同時最多 6 倉
-    MAX_LONGS         = int(os.getenv("MAX_LONGS", 4))         # 單邊上限：做多最多 4 倉
-    MAX_SHORTS        = int(os.getenv("MAX_SHORTS", 4))        # 單邊上限：做空最多 4 倉
+    # 單邊上限：預設等於 MAX_POSITIONS，代表不額外限制同方向倉位數
+    # （僅受總倉位上限約束）。若要啟用單邊限制，設 MAX_LONGS/MAX_SHORTS 環境變數
+    MAX_LONGS         = int(os.getenv("MAX_LONGS", MAX_POSITIONS))
+    MAX_SHORTS        = int(os.getenv("MAX_SHORTS", MAX_POSITIONS))
     COOLDOWN_BARS     = int(os.getenv("COOLDOWN_BARS", 6))
     MAX_DAILY_LOSS    = float(os.getenv("MAX_DAILY_LOSS", 0.08))
 
