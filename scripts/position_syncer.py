@@ -189,7 +189,7 @@ class PositionSyncer:
                     )
 
                     if is_tp2_fired:
-                        # TP2 已觸發：優先用 Binance 真實成交 VWAP，
+                        # TP2 「疑似」觸發：優先用 Binance 真實成交 VWAP，
                         # 而非 DB 的 trade["tp2"]（可能與實際成交有偏差）
                         start_ms = self._opened_at_ms(trade)
                         tp2_info = self._get_recent_close_fills(
@@ -198,10 +198,85 @@ class PositionSyncer:
                         if tp2_info.get("vwap"):
                             exit_price = tp2_info["vwap"]
                             fee = tp2_info.get("fee", 0.0)
+                            realized_hint = tp2_info.get("realized")
                         else:
                             exit_price = trade["tp2"] or \
                                 self._get_last_trade_price(symbol) or entry
                             fee = RiskManager.estimate_fee(qty_diff, exit_price)
+                            realized_hint = None
+
+                        # ── 防呆：驗證 exit_price 真的接近 TP2 目標 ──
+                        # 若 tp2 order 因故不在掛單簿（被取消/替換/API 失敗誤判），
+                        # 但實際成交價根本沒到 TP2 → 這其實是 TP1 觸發，
+                        # 不能硬寫 "TP2" 也不能市價砍掉殘倉。
+                        # 改走 TP1 流程（移保本 + 啟用 trailing）。
+                        # （MAVUSDT #49 +0.55% 被誤標 TP2 的根因修正）
+                        tp2_target = trade.get("tp2") or 0
+                        entry_px   = trade.get("entry") or 0
+                        tp2_tol = entry_px * 0.01 if entry_px > 0 else 0
+                        tp2_price_ok = False
+                        if tp2_target > 0 and exit_price > 0:
+                            if direction == "LONG":
+                                tp2_price_ok = exit_price >= tp2_target - tp2_tol
+                            else:
+                                tp2_price_ok = exit_price <= tp2_target + tp2_tol
+
+                        if not tp2_price_ok:
+                            log.warning(
+                                f"[{symbol}] #{trade_id} tp2_order 已不在掛單簿但"
+                                f"成交價 {exit_price:.6f} 未達 TP2 目標 "
+                                f"{tp2_target:.6f} → 視為 TP1 觸發，走 TP1 流程"
+                            )
+                            # 決定 TP1 分支的 reason（比照 TP1 路徑邏輯）
+                            if realized_hint is not None and realized_hint < 0:
+                                tp1_reason = "TP1+BE" if trade.get("breakeven") else "SL"
+                            else:
+                                tp1_reason = "TP1"
+
+                            self.db.close_trade(
+                                trade_id     = trade_id,
+                                exit_price   = exit_price,
+                                fee          = fee,
+                                partial      = True,
+                                closed_qty   = qty_diff,
+                                close_reason = tp1_reason,
+                            )
+
+                            # 走 TP1 後置流程：移保本 + 啟用 trailing
+                            if not trade["breakeven"]:
+                                try:
+                                    self.executor.move_to_breakeven(
+                                        symbol      = symbol,
+                                        trade_id    = trade_id,
+                                        entry_price = entry,
+                                        direction   = direction,
+                                    )
+                                except Exception as be:
+                                    log.error(
+                                        f"[{symbol}] #{trade_id} move_to_breakeven 失敗: {be}"
+                                    )
+
+                            if Config.TRAILING_ENABLED and \
+                                    Config.TRAILING_ACTIVATE_AFTER_TP1 and \
+                                    not trade.get("use_trailing"):
+                                try:
+                                    atr_val = self._get_current_atr(
+                                        symbol, trade.get("timeframe", "15m")
+                                    )
+                                    if atr_val and atr_val > 0:
+                                        self.db.enable_trailing(trade_id, atr_val)
+                                        log.info(
+                                            f"[{symbol}] TP1 後啟用追蹤止盈"
+                                            f"（ATR={atr_val:.4f}，"
+                                            f"距離={Config.TRAILING_ATR_MULT}×ATR）"
+                                        )
+                                except Exception as te:
+                                    log.error(
+                                        f"[{symbol}] #{trade_id} 啟用追蹤止盈失敗: {te}"
+                                    )
+                            continue
+
+                        # 真正的 TP2：寫 DB + 砍殘倉
                         self.db.close_trade(
                             trade_id     = trade_id,
                             exit_price   = exit_price,
