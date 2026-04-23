@@ -1,18 +1,25 @@
 """
-Coin Screener v2 — 為裸K + Fibonacci 策略量身設計的選幣模組
+Coin Screener v3 — 為裸K + Fibonacci 策略量身設計的選幣模組
+
+v3 變更（基於實證檢討）：
+  - 移除 Fib 歷史回測分數：樣本小（60 根）、容忍度寬（±0.8%）、
+    只看觸及不看反轉，分數噪音大於訊號。
+  - 新增「相對 BTC 強弱」維度（方向感知）：swing_trend=up 要求
+    跑贏 BTC、down 要求跑輸 BTC，擋掉方向選錯的幣。
+  - 新增「量能趨勢」維度：近 6h 放量 vs 前 18h 平均，過濾量縮假突破。
 
 核心理念：裸K+Fib 需要的不是「低波動震盪幣」，而是：
   1. 有結構性趨勢的幣（會走一波、拉回、再走），Fib 回撤才有意義
   2. K 棒結構乾淨（實體大於影線），裸K形態才可靠
   3. 流動性足夠深（spread 小），合約不會滑價
-  4. 歷史上 Fib 位有明顯反應（價格尊重技術面）
+  4. 相對 BTC 有強弱特徵（做多選強勢、做空選弱勢）
   5. Funding Rate 中性（市場沒有極端偏向一方）
 
 評分標準（滿分 12 分，≥ 8 才入選）：
   - 流動性品質：USDT 成交量 + 資金費率          3 分
   - 趨勢結構：有清晰 swing，不是純橫盤            3 分
   - K 棒品質：實體占比高、影線雜訊低              3 分
-  - Fib 歷史回測：價格在 Fib 位有反應             3 分
+  - 相對強弱 + 量能趨勢：方向感知 rel str / 放量    3 分
 """
 import argparse
 import os
@@ -243,80 +250,103 @@ class CoinScreener:
         }
         return score, details
 
-    # ── 4. Fib 歷史回測（3 分）──────────────────────────────────
+    # ── 4. 相對強弱 + 量能趨勢（3 分）────────────────────────────
 
-    def _score_fib_respect(self, df: pd.DataFrame) -> tuple[int, dict]:
+    def _score_relative_strength(self, symbol: str,
+                                 swing_trend: str) -> tuple[int, dict]:
         """
-        回測過去的價格數據，看 Fib 關鍵位是否有明顯的支撐/壓力反應
-        如果一個幣歷史上不尊重 Fib，那用 Fib 策略去交易它就沒意義
+        方向感知相對強弱：
+          swing_trend=up  → 做多方向，要求個幣 24h 跑贏 BTC ≥ MIN_DIFF
+          swing_trend=down → 做空方向，要求個幣 24h 跑輸 BTC ≥ MIN_DIFF
+          swing_trend=""   → 方向不明，中性 0 分（不扣分、不加分）
+
+        加分規則（滿分 2）：
+          - 方向匹配且差值 ≥ 2 × MIN_DIFF → +2（強確認）
+          - 方向匹配且差值 ≥ MIN_DIFF     → +1
+          - 方向不匹配（逆向走勢）          → -1（扣分懲罰）
+        """
+        details = {"coin_24h_pct": None, "btc_24h_pct": None,
+                   "rel_diff": None, "rel_direction_match": None}
+
+        # 無 market_ctx → 無法判斷，回 0
+        if self.market_ctx is None:
+            return 0, details
+
+        from config import Config
+        if not getattr(Config, "SCREEN_REL_STRENGTH_ENABLED", True):
+            return 0, details
+
+        try:
+            coin_pct = self.market_ctx.price_change_pct_24h(symbol)
+            btc_pct = self.market_ctx.btc_change_pct_24h()
+        except Exception:
+            return 0, details
+
+        if coin_pct is None or btc_pct is None:
+            return 0, details
+
+        diff = coin_pct - btc_pct
+        details["coin_24h_pct"] = round(coin_pct, 2)
+        details["btc_24h_pct"] = round(btc_pct, 2)
+        details["rel_diff"] = round(diff, 2)
+
+        min_diff = float(getattr(Config, "SCREEN_REL_STRENGTH_MIN_DIFF", 1.0))
+
+        # BTC 本身或方向不明 → 不打分
+        if symbol == "BTCUSDT" or not swing_trend:
+            return 0, details
+
+        if swing_trend == "up":
+            # 做多方向：diff 要 ≥ min_diff
+            if diff >= min_diff * 2:
+                details["rel_direction_match"] = True
+                return 2, details
+            if diff >= min_diff:
+                details["rel_direction_match"] = True
+                return 1, details
+            if diff <= -min_diff:
+                details["rel_direction_match"] = False
+                return -1, details
+            return 0, details
+
+        if swing_trend == "down":
+            # 做空方向：diff 要 ≤ -min_diff
+            if diff <= -min_diff * 2:
+                details["rel_direction_match"] = True
+                return 2, details
+            if diff <= -min_diff:
+                details["rel_direction_match"] = True
+                return 1, details
+            if diff >= min_diff:
+                details["rel_direction_match"] = False
+                return -1, details
+            return 0, details
+
+        return 0, details
+
+    def _score_volume_trend(self, df: pd.DataFrame) -> tuple[int, dict]:
+        """
+        量能趨勢：近 6h 平均量 vs 前 18h 平均量
+          >= 1.2× → +1（放量，趨勢/突破更可信）
+          <= 0.7× → -1（量縮，易假訊號）
+          其他    → 0
         """
         score = 0
-        fib_reactions = 0
-        total_tests = 0
+        if len(df) < 24:
+            return 0, {"vol_trend_ratio": None}
 
-        # Rolling Fib：只看最近 60 根 K 棒（避免用過遠的歷史 swing）
-        df_recent = df.tail(60).reset_index(drop=True)
-        swings = self._find_all_swings(df_recent, left=3, right=3)
-        if len(swings) < 4:
-            return 0, {"fib_reactions": 0, "fib_tests": 0, "fib_rate": 0}
+        recent_vol = df["qav"].tail(6).mean()
+        prev_vol = df["qav"].iloc[-24:-6].mean()
+        if prev_vol <= 0:
+            return 0, {"vol_trend_ratio": None}
 
-        # 取最近 3 組 swing pair 來測試
-        for i in range(len(swings) - 1):
-            s1 = swings[i]
-            s2 = swings[i + 1]
-            if i >= 3:
-                break
-
-            if s1["type"] == "high" and s2["type"] == "low":
-                high, low = s1["price"], s2["price"]
-            elif s1["type"] == "low" and s2["type"] == "high":
-                high, low = s2["price"], s1["price"]
-            else:
-                continue
-
-            if high <= low:
-                continue
-
-            # 計算 Fib 位
-            diff = high - low
-            fib_levels = {
-                0.382: high - diff * 0.382,
-                0.500: high - diff * 0.500,
-                0.618: high - diff * 0.618,
-            }
-
-            # 檢查 swing 之後的 K 棒是否在 Fib 位反應
-            start_idx = max(s1["idx"], s2["idx"]) + 1
-            future = df_recent.iloc[start_idx:start_idx + 15]
-            for _, fib_price in fib_levels.items():
-                total_tests += 1
-                tolerance = fib_price * 0.008   # ±0.8% 容忍
-                # 價格觸及 Fib 位後反轉
-                touched = future[
-                    (future["low"] <= fib_price + tolerance) &
-                    (future["high"] >= fib_price - tolerance)
-                ]
-                if len(touched) > 0:
-                    # 觸及後的下一根有反轉跡象
-                    fib_reactions += 1
-
-        if total_tests == 0:
-            return 0, {"fib_reactions": 0, "fib_tests": 0, "fib_rate": 0}
-
-        fib_rate = fib_reactions / total_tests
-        if fib_rate >= 0.60:       # 60% 以上的 Fib 位有反應
-            score += 3
-        elif fib_rate >= 0.40:
-            score += 2
-        elif fib_rate >= 0.25:
+        ratio = recent_vol / prev_vol
+        if ratio >= 1.2:
             score += 1
+        elif ratio <= 0.7:
+            score -= 1
 
-        details = {
-            "fib_reactions": fib_reactions,
-            "fib_tests": total_tests,
-            "fib_rate": round(fib_rate, 2),
-        }
-        return score, details
+        return score, {"vol_trend_ratio": round(ratio, 2)}
 
     def _find_all_swings(self, df: pd.DataFrame,
                          left=5, right=5) -> list[dict]:
@@ -371,22 +401,33 @@ class CoinScreener:
             return 0, d1
         s2, d2 = self._score_trend_structure(df, swing_trend=swing_trend)
         s3, d3 = self._score_candle_quality(df)
-        s4, d4 = self._score_fib_respect(df)
+        # v3：Fib 回測分數移除，改為相對強弱（2 分）+ 量能趨勢（1 分）
+        s4a, d4a = self._score_relative_strength(symbol, swing_trend)
+        s4b, d4b = self._score_volume_trend(df)
+        s4 = s4a + s4b
+        d4 = {**d4a, **d4b}
 
         total = s1 + s2 + s3 + s4
 
-        # BTC Dominance > 55% → 山寨幣扣 2 分（BTCUSDT 本身不扣）
+        # BTC Dominance > 55% → 扣分：
+        # 相對強弱已處理「個幣 vs BTC」，所以這裡只對「跑輸或持平 BTC 的山寨」
+        # 再加碼扣 1 分（避免 rel strength 匹配的強勢山寨也被一刀切）
         btc_dom_penalty = 0
         if self.market_ctx and symbol != "BTCUSDT":
-            if self.market_ctx.is_high_btc_dominance(threshold=55.0):
-                btc_dom_penalty = -2
-                total += btc_dom_penalty
+            try:
+                if self.market_ctx.is_high_btc_dominance(threshold=55.0):
+                    # rel strength 已判斷方向匹配 → 不再額外扣
+                    if d4a.get("rel_direction_match") is not True:
+                        btc_dom_penalty = -1
+                        total += btc_dom_penalty
+            except Exception:
+                pass
 
         details = {
             "liquidity_score": s1,
             "trend_score": s2,
             "candle_score": s3,
-            "fib_score": s4,
+            "rel_vol_score": s4,
             "btc_dom_penalty": btc_dom_penalty,
             **d1, **d2, **d3, **d4
         }
@@ -467,9 +508,10 @@ class CoinScreener:
             log.info(
                 f"  {r['symbol']:15s} {r['score']:2d}/12  "
                 f"Liq={r['liquidity_score']} Trend={r['trend_score']} "
-                f"Candle={r['candle_score']} Fib={r['fib_score']}  "
+                f"Candle={r['candle_score']} RelVol={r.get('rel_vol_score', 0)}  "
                 f"Vol={r.get('vol_24h_m', 0)}M  ADX={r.get('adx', 0)}  "
-                f"ATR={r.get('atr_pct', 0)}%  FibRate={r.get('fib_rate', 0)}"
+                f"ATR={r.get('atr_pct', 0)}%  "
+                f"RelDiff={r.get('rel_diff')}  VolTrend={r.get('vol_trend_ratio')}"
             )
         return top_symbols
 

@@ -59,6 +59,18 @@ class Config:
     SCREEN_ATR_MAX_LONG  = float(os.getenv("SCREEN_ATR_MAX_LONG", 4.0))
     SCREEN_ATR_MAX_SHORT = float(os.getenv("SCREEN_ATR_MAX_SHORT", 8.0))
 
+    # ── 選幣層相對強弱濾網（v3 新增）────────────────────────────
+    # 所有策略的 screen_coins 階段都會檢查「個幣 24h 漲跌 vs BTC 24h」差值：
+    #   - CoinScreener (NKF)：方向感知加權，swing=up 要強、swing=down 要弱
+    #   - BreakdownShort：做空方向，要求跑輸 BTC
+    #   - MomentumLong：做多方向，要求跑贏 BTC（signal 層 ML_REL_STRENGTH 再擋一層）
+    SCREEN_REL_STRENGTH_ENABLED   = os.getenv(
+        "SCREEN_REL_STRENGTH_ENABLED", "true"
+    ).lower() == "true"
+    SCREEN_REL_STRENGTH_MIN_DIFF  = float(
+        os.getenv("SCREEN_REL_STRENGTH_MIN_DIFF", 1.0)  # % 單位
+    )
+
     # ── 裸K+Fib 入場參數（signal_engine）────────────────────────
     NKF_MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))
     NKF_FIB_TOL          = float(os.getenv("SIGNAL_FIB_TOL", 0.005))

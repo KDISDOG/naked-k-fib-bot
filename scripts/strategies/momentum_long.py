@@ -176,6 +176,26 @@ class MomentumLongStrategy(BaseStrategy):
             except Exception:
                 pass
 
+        # 相對強弱（做多方向）：個幣 24h 跑贏 BTC ≥ MIN_DIFF → +1；
+        # 跑輸 BTC ≥ MIN_DIFF → -1（無相對強度支撐的多單，易被震盪洗）
+        # 選幣層擋一層，signal 層 ML_REL_STRENGTH_MIN_DIFF 再擋一層，雙保險
+        if self._market_ctx and symbol != "BTCUSDT" and \
+                getattr(Config, "SCREEN_REL_STRENGTH_ENABLED", True):
+            try:
+                coin_pct = self._market_ctx.price_change_pct_24h(symbol)
+                btc_pct = self._market_ctx.btc_change_pct_24h()
+                if coin_pct is not None and btc_pct is not None:
+                    diff = coin_pct - btc_pct
+                    min_diff = float(
+                        getattr(Config, "SCREEN_REL_STRENGTH_MIN_DIFF", 1.0)
+                    )
+                    if diff >= min_diff:
+                        score += 1
+                    elif diff <= -min_diff:
+                        score -= 1
+            except Exception:
+                pass
+
         return score
 
     def _find_swing_highs(self, df: pd.DataFrame,
