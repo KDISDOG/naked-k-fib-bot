@@ -218,6 +218,27 @@ class MomentumLongStrategy(BaseStrategy):
             except Exception:
                 pass
 
+        # ── B1 相對強度過濾（實證：alt 弱於 BTC 時做多必輸） ──
+        # 個幣 24h 漲幅必須強於 BTC 至少 ML_REL_STRENGTH_MIN_DIFF %
+        if self._market_ctx and getattr(
+            Config, "ML_REL_STRENGTH_ENABLED", True
+        ):
+            try:
+                coin_pct = self._market_ctx.price_change_pct_24h(symbol)
+                btc_pct  = self._market_ctx.btc_change_pct_24h()
+                if coin_pct is not None and btc_pct is not None:
+                    diff = coin_pct - btc_pct
+                    min_diff = Config.ML_REL_STRENGTH_MIN_DIFF
+                    if diff < min_diff:
+                        log.debug(
+                            f"[{symbol}] ML 相對強度不足："
+                            f"coin 24h={coin_pct:+.2f}% BTC={btc_pct:+.2f}% "
+                            f"diff={diff:+.2f}% < {min_diff}%"
+                        )
+                        return None
+            except Exception as e:
+                log.debug(f"[{symbol}] ML 相對強度檢查失敗（略過）: {e}")
+
         try:
             df = self._get_klines(symbol, self.default_timeframe, limit=200)
         except Exception as e:
@@ -299,6 +320,15 @@ class MomentumLongStrategy(BaseStrategy):
         if score < Config.ML_MIN_SCORE:
             log.debug(
                 f"[{symbol}] ML 訊號強度 {score} < {Config.ML_MIN_SCORE}"
+            )
+            return None
+
+        # ── B3 高 Score 過熱過濾（實證：score=5 WR 僅 14.3%） ──
+        # score 越高勝率越差 → 視為「趨勢末端 / 追高」訊號，擋掉
+        max_score = getattr(Config, "ML_MAX_SCORE", 4)
+        if score > max_score:
+            log.debug(
+                f"[{symbol}] ML 訊號過熱：score={score} > {max_score}（擋）"
             )
             return None
 

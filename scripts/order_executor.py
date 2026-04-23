@@ -22,9 +22,10 @@ log = logging.getLogger("executor")
 
 
 class OrderExecutor:
-    def __init__(self, client: Client, db):
+    def __init__(self, client: Client, db, market_ctx=None):
         self.client = client
         self.db     = db
+        self.market_ctx = market_ctx     # 可選，用於 save_trade 時寫入市場脈絡
         self._symbol_info_cache: dict = {}
 
     # ── 精度處理 ─────────────────────────────────────────────────
@@ -393,7 +394,27 @@ class OrderExecutor:
             # 7. 計算保證金（實際成交價 × 數量 / 槓桿）
             margin = round(fill_price * qty / leverage, 2)
 
-            # 8. 寫入資料庫
+            # 8. 寫入資料庫（含成效分析脈絡欄位）
+            # regime / 24h 變化若查詢失敗則留 None，不阻擋下單流程
+            regime_at_entry = None
+            btc_24h_pct = None
+            coin_24h_pct = None
+            mctx = getattr(self, "market_ctx", None) or (meta or {}).get("market_ctx")
+            if mctx:
+                try:
+                    regime_at_entry = mctx.current_regime()
+                except Exception:
+                    pass
+                try:
+                    btc_24h_pct = mctx.btc_change_pct_24h()
+                except Exception:
+                    pass
+                try:
+                    coin_24h_pct = mctx.price_change_pct_24h(symbol)
+                except Exception:
+                    pass
+            atr_at_entry = (meta or {}).get("atr_at_entry") or trailing_atr
+
             self.db.save_trade(
                 symbol       = symbol,
                 direction    = direction,
@@ -415,6 +436,10 @@ class OrderExecutor:
                 btc_corr     = btc_corr,
                 strategy     = strategy,
                 margin       = margin,
+                regime_at_entry       = regime_at_entry,
+                btc_24h_pct_at_entry  = btc_24h_pct,
+                coin_24h_pct_at_entry = coin_24h_pct,
+                atr_at_entry          = atr_at_entry,
             )
 
             log.info(

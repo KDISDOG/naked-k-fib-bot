@@ -261,6 +261,53 @@ class MarketContext:
         # CHOPPY → 全擋
         return False
 
+    # ── 24h 漲跌幅（用於相對強度過濾）────────────────────────────
+    def price_change_pct_24h(self, symbol: str) -> Optional[float]:
+        """
+        取得 symbol 近 24h 漲跌幅（%）。
+        優先用 futures_ticker（含 priceChangePercent）；
+        失敗時 fallback 到 futures_klines 1h×24 自行計算。
+        快取 120 秒避免重複呼叫。
+        """
+        key = f"chg24_{symbol}"
+        cached = self._get_cached(key)
+        if cached is not None:
+            return cached
+        try:
+            t = self.client.futures_ticker(symbol=symbol)
+            # futures_ticker 可能回傳 list 或 dict，統一處理
+            if isinstance(t, list):
+                t = t[0] if t else {}
+            pct = t.get("priceChangePercent")
+            if pct is not None:
+                v = float(pct)
+                self._set_cached(key, v)
+                return v
+        except Exception as e:
+            log.debug(f"{symbol} 24h 變化查詢失敗（ticker）: {e}")
+
+        # fallback：用 1h×25 klines 算
+        try:
+            raw = self.client.futures_klines(
+                symbol=symbol, interval="1h", limit=25
+            )
+            if not raw or len(raw) < 24:
+                return None
+            start = float(raw[0][4])
+            end   = float(raw[-1][4])
+            if start <= 0:
+                return None
+            v = (end - start) / start * 100
+            self._set_cached(key, v)
+            return v
+        except Exception as e:
+            log.debug(f"{symbol} 24h 變化查詢失敗（klines fallback）: {e}")
+            return None
+
+    def btc_change_pct_24h(self) -> Optional[float]:
+        """BTC 24h 漲跌幅 shortcut"""
+        return self.price_change_pct_24h("BTCUSDT")
+
     # ── Open Interest 異常偵測 ───────────────────────────────────
     def oi_change_pct(self, symbol: str) -> Optional[float]:
         """

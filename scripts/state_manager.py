@@ -55,6 +55,13 @@ class Trade(Base):
     # v5.1 新增
     margin       = Column(Float, default=0.0)          # 開倉保證金（entry×qty/leverage）
     close_reason = Column(String, nullable=True)       # 平倉原因：TP1/TP2/SL/TIMEOUT/MANUAL/TRAILING
+    # v5.3 新增：策略成效分析用
+    regime_at_entry       = Column(String, nullable=True)   # 進場時 BTC regime
+    btc_24h_pct_at_entry  = Column(Float, nullable=True)    # 進場時 BTC 24h 漲跌 %
+    coin_24h_pct_at_entry = Column(Float, nullable=True)    # 進場時個幣 24h 漲跌 %
+    atr_at_entry          = Column(Float, nullable=True)    # 進場時 ATR 絕對值
+    mae_pct               = Column(Float, default=0.0)      # Max Adverse Excursion（%，正值=不利幅度）
+    mfe_pct               = Column(Float, default=0.0)      # Max Favorable Excursion（%，正值=順向幅度）
 
 
 class StateManager:
@@ -81,6 +88,13 @@ class StateManager:
             # v5.1
             "margin":        "FLOAT DEFAULT 0",
             "close_reason":  "TEXT",
+            # v5.3 成效分析欄位
+            "regime_at_entry":       "TEXT",
+            "btc_24h_pct_at_entry":  "FLOAT",
+            "coin_24h_pct_at_entry": "FLOAT",
+            "atr_at_entry":          "FLOAT",
+            "mae_pct":               "FLOAT DEFAULT 0",
+            "mfe_pct":               "FLOAT DEFAULT 0",
         }
         try:
             insp = inspect(self.engine)
@@ -104,7 +118,11 @@ class StateManager:
                    use_trailing=False, trailing_atr=None,
                    btc_corr=None,
                    strategy="naked_k_fib",
-                   margin=0.0) -> Trade:
+                   margin=0.0,
+                   regime_at_entry=None,
+                   btc_24h_pct_at_entry=None,
+                   coin_24h_pct_at_entry=None,
+                   atr_at_entry=None) -> Trade:
         with self.Session() as session:
             trade = Trade(
                 symbol=symbol, direction=direction,
@@ -119,12 +137,49 @@ class StateManager:
                 margin=margin,
                 highest_price=entry if direction == "LONG" else None,
                 lowest_price=entry if direction == "SHORT" else None,
+                # v5.3 成效分析脈絡
+                regime_at_entry=regime_at_entry,
+                btc_24h_pct_at_entry=btc_24h_pct_at_entry,
+                coin_24h_pct_at_entry=coin_24h_pct_at_entry,
+                atr_at_entry=atr_at_entry,
+                mae_pct=0.0,
+                mfe_pct=0.0,
             )
             session.add(trade)
             session.commit()
             session.refresh(trade)
             log.info(f"[DB] 交易紀錄已儲存：#{trade.id} {symbol} {direction}")
             return trade
+
+    # ── MAE / MFE 更新 ───────────────────────────────────────────
+    def update_excursion(self, trade_id: int, current_price: float):
+        """
+        更新 MAE（最大不利幅度）與 MFE（最大順向幅度），以 % 為單位儲存。
+        每次 sync 呼叫一次；只有朝擴大方向的值會被寫入。
+        """
+        with self.Session() as session:
+            trade = session.get(Trade, trade_id)
+            if not trade or not trade.entry or trade.entry <= 0:
+                return
+            entry = float(trade.entry)
+            if current_price <= 0:
+                return
+            if trade.direction == "LONG":
+                adverse_pct  = (entry - current_price) / entry * 100  # 跌幅
+                favor_pct    = (current_price - entry) / entry * 100  # 漲幅
+            else:  # SHORT
+                adverse_pct  = (current_price - entry) / entry * 100  # 漲幅（對空不利）
+                favor_pct    = (entry - current_price) / entry * 100  # 跌幅（對空有利）
+
+            changed = False
+            if adverse_pct > (trade.mae_pct or 0):
+                trade.mae_pct = adverse_pct
+                changed = True
+            if favor_pct > (trade.mfe_pct or 0):
+                trade.mfe_pct = favor_pct
+                changed = True
+            if changed:
+                session.commit()
 
     # ── 平倉更新 ──────────────────────────────────────────────────
 
@@ -472,6 +527,12 @@ class StateManager:
             "timeout_bars": getattr(t, "timeout_bars", 0),
             "margin":       getattr(t, "margin", 0) or 0,
             "close_reason": getattr(t, "close_reason", None),
+            "regime_at_entry":       getattr(t, "regime_at_entry", None),
+            "btc_24h_pct_at_entry":  getattr(t, "btc_24h_pct_at_entry", None),
+            "coin_24h_pct_at_entry": getattr(t, "coin_24h_pct_at_entry", None),
+            "atr_at_entry":          getattr(t, "atr_at_entry", None),
+            "mae_pct":               getattr(t, "mae_pct", 0) or 0,
+            "mfe_pct":               getattr(t, "mfe_pct", 0) or 0,
         }
 
     def get_open_trades_by_direction(self, direction: str) -> list[dict]:

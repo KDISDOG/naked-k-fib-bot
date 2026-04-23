@@ -307,7 +307,20 @@ class PositionSyncer:
                         except Exception as te:
                             log.error(f"[{symbol}] #{trade_id} 啟用追蹤止盈失敗: {te}")
 
-                # ── 情況 3: 倉位不變 → 檢查是否需要推進追蹤止盈 ─────
+                # ── 情況 3: 仍有持倉 → 更新 MAE/MFE + 檢查追蹤止盈 ─────
+                # 先更新 MAE/MFE（所有 open/partial 都要追蹤，不限 use_trailing）
+                # 這是策略成效分析的核心資料
+                try:
+                    ticker = retry_api(
+                        self.client.futures_symbol_ticker, symbol=symbol
+                    )
+                    cur_price = float(ticker["price"])
+                    self.db.update_excursion(trade_id, cur_price)
+                except Exception as ee:
+                    log.debug(
+                        f"[{symbol}] #{trade_id} excursion 更新失敗（略過）: {ee}"
+                    )
+
                 # 總開關關閉時直接略過，即使 DB 既有紀錄 use_trailing=True
                 if Config.TRAILING_ENABLED and trade.get("use_trailing"):
                     try:

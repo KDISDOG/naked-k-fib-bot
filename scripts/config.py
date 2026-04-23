@@ -145,6 +145,15 @@ class Config:
     #   0.618 → 1.618 extension（激進，教科書目標但命中率 30-40%）
     ML_TP2_FIB_MULT  = float(os.getenv("ML_TP2_FIB_MULT", 0.382))
 
+    # ── ML 實證調校（B1 + B3，基於 DB 回測：score=5 WR 14%） ─────
+    # B1 相對強度過濾：個幣 24h 漲幅必須強於 BTC 至少 N% 才做多
+    # 理由：alt 連 BTC 都打不過時，做多它沒有相對強度支撐，容易被震盪洗
+    ML_REL_STRENGTH_ENABLED = os.getenv("ML_REL_STRENGTH_ENABLED", "true").lower() == "true"
+    ML_REL_STRENGTH_MIN_DIFF = float(os.getenv("ML_REL_STRENGTH_MIN_DIFF", 1.0))  # % 單位
+    # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
+    # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
+    ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限
+
     # ── OI 異常過濾 ──────────────────────────────────────────────
     # OI 24h 變動 > N% 視為異常（大戶佈局，技術面易失效）
     # 20%→30%：小市值幣天然 OI 波動大，20% 容易誤殺；30% 是更合理的「明顯大戶動作」門檻

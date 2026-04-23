@@ -65,7 +65,7 @@ market_ctx  = MarketContext(client)
 screener    = CoinScreener(client, market_ctx=market_ctx)
 signal_e    = SignalEngine(client, market_ctx=market_ctx)
 risk        = RiskManager(client, db, market_ctx=market_ctx)
-executor    = OrderExecutor(client, db)
+executor    = OrderExecutor(client, db, market_ctx=market_ctx)
 syncer      = PositionSyncer(client, db, executor)
 
 # 策略實例

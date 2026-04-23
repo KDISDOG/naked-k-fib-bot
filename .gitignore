@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 # Copilot/Claude ¤u§@¥Ø¿ý
 .claude/
+bot.log.bak.*
+bot_state.db.bak.*
