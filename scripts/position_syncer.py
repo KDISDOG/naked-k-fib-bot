@@ -230,12 +230,48 @@ class PositionSyncer:
                                 tp2_price_ok = exit_price <= tp2_target + tp2_tol
 
                         if not tp2_price_ok:
+                            # 若此筆已經 TP1 過（prev close_reason 存在），現在又
+                            # 發生部分平倉且成交價未達 TP2 → 最可能是 trailing SL
+                            # 或 BE SL 觸發收尾，不是「TP1 再觸發一次」。
+                            # （MAGMAUSDT #72 被誤標 TP1 的根因修正）
+                            prev_reason = (trade.get("close_reason") or "").upper()
+                            already_past_tp1 = (
+                                prev_reason.startswith("TP1")
+                                or prev_reason.startswith("TIMEOUT")
+                                or prev_reason == "PARTIAL_TIMEOUT"
+                            )
+
+                            if already_past_tp1:
+                                # TP1 之後的部分平倉：判斷是 trailing 還是 SL
+                                if realized_hint is not None and realized_hint < 0:
+                                    post_reason = "SL"
+                                elif trade.get("use_trailing"):
+                                    post_reason = "TRAILING"
+                                else:
+                                    post_reason = "TP1+BE" if trade.get("breakeven") else "SL"
+                                log.warning(
+                                    f"[{symbol}] #{trade_id} 已過 TP1，本次部分平倉"
+                                    f"成交價 {exit_price:.6f} 未達 TP2 "
+                                    f"{tp2_target:.6f} → 視為 {post_reason}"
+                                )
+                                self.db.close_trade(
+                                    trade_id     = trade_id,
+                                    exit_price   = exit_price,
+                                    fee          = fee,
+                                    partial      = True,
+                                    closed_qty   = qty_diff,
+                                    close_reason = post_reason,
+                                )
+                                # 不重做 move_to_breakeven / enable_trailing
+                                # （已經設過；重做只會徒增 API 呼叫）
+                                continue
+
+                            # 首次部分平倉（未過 TP1）：走原本 TP1 流程
                             log.warning(
                                 f"[{symbol}] #{trade_id} tp2_order 已不在掛單簿但"
                                 f"成交價 {exit_price:.6f} 未達 TP2 目標 "
                                 f"{tp2_target:.6f} → 視為 TP1 觸發，走 TP1 流程"
                             )
-                            # 決定 TP1 分支的 reason（比照 TP1 路徑邏輯）
                             if realized_hint is not None and realized_hint < 0:
                                 tp1_reason = "TP1+BE" if trade.get("breakeven") else "SL"
                             else:
