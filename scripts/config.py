@@ -46,6 +46,11 @@ class Config:
     SIGNAL_CHECK_MIN = int(os.getenv("SIGNAL_CHECK_MIN", 5))
     SYNC_SEC         = int(os.getenv("SYNC_SEC", 30))
 
+    # WS 靜默重建門檻（秒）：超過此秒數沒收到任何 K 線 tick 則重建連線。
+    # Multiplex 連線即使全是 1h timeframe 也應每幾秒收到未收盤 tick；
+    # 5 分鐘無事件 = 連線必然斷了。
+    WS_SILENCE_RESET_SEC = float(os.getenv("WS_SILENCE_RESET_SEC", 300))
+
     # ── 策略選擇 ─────────────────────────────────────────────────
     # 可選：naked_k_fib / mean_reversion / all
     ACTIVE_STRATEGY  = os.getenv("ACTIVE_STRATEGY", "all")
