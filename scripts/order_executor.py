@@ -17,6 +17,7 @@ from binance_orders import (
     list_open_orders, cancel_order, cancel_all_for_symbol, extract_id
 )
 from notifier import notify
+from config import Config
 
 log = logging.getLogger("executor")
 
@@ -224,7 +225,9 @@ class OrderExecutor:
             #   原本 SL/TP 結構已失真（例：SHORT 訊號 87→成交 99，
             #   TP1/TP2 全數被 mark 越過 → Binance -2021 immediate trigger，
             #   留下裸倉）。遇此狀況直接平倉放棄，不入 DB。
-            MAX_SLIP = 0.03   # 3%
+            # 從 Config 讀，預設 1.5%（低流動性新幣市價單常滑 1-2%，
+            # 3% 太寬只擋得住閃崩；1.5% 可吸收正常滑價但擋住結構已壞的成交）
+            MAX_SLIP = float(getattr(Config, "MAX_FILL_SLIP", 0.015))
             if fill_price > 0 and entry > 0 and \
                     abs(fill_price - entry) / entry > MAX_SLIP:
                 slip_pct = (fill_price - entry) / entry * 100

@@ -477,18 +477,22 @@ class CoinScreener:
                 and not Config.is_excluded_symbol(s["symbol"])
             ]
             now_ms = pd.Timestamp.utcnow().timestamp() * 1000
-            thirty_days_ms = 30 * 24 * 60 * 60 * 1000
+            new_coin_days = int(getattr(Config, "NEW_COIN_MIN_DAYS", 60))
+            new_coin_ms = new_coin_days * 24 * 60 * 60 * 1000
             filtered = []
             for s in info["symbols"]:
                 if s["symbol"] not in base_symbols:
                     continue
                 onboard = s.get("onboardDate", 0)
-                if onboard and (now_ms - onboard) < thirty_days_ms:
+                if onboard and (now_ms - onboard) < new_coin_ms:
                     log.debug(f"跳過新幣：{s['symbol']}")
                     continue
                 filtered.append(s["symbol"])
             symbols = filtered
-            log.info(f"共 {len(symbols)} 個 USDT 合約（已排除新幣）")
+            log.info(
+                f"共 {len(symbols)} 個 USDT 合約"
+                f"（已排除 {new_coin_days} 天內新幣）"
+            )
 
         results = []
         for i, sym in enumerate(symbols):

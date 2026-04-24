@@ -226,7 +226,8 @@ def scan_coins():
     try:
         info = client.futures_exchange_info()
         now_ms = int(time.time() * 1000)
-        thirty_days_ms = 30 * 24 * 60 * 60 * 1000
+        new_coin_days = int(getattr(Config, "NEW_COIN_MIN_DAYS", 60))
+        new_coin_ms = new_coin_days * 24 * 60 * 60 * 1000
         all_symbols = [
             s["symbol"] for s in info["symbols"]
             if s["quoteAsset"] == "USDT"
@@ -235,11 +236,12 @@ def scan_coins():
             and not Config.is_excluded_symbol(s["symbol"])
             and not (
                 s.get("onboardDate", 0)
-                and (now_ms - s["onboardDate"]) < thirty_days_ms
+                and (now_ms - s["onboardDate"]) < new_coin_ms
             )
         ]
         log.info(
-            f"全市場候選池：{len(all_symbols)} 支（已排除黑名單 + 30 天新幣）"
+            f"全市場候選池：{len(all_symbols)} 支"
+            f"（已排除黑名單 + {new_coin_days} 天新幣）"
         )
     except Exception as e:
         log.error(f"取得全市場 symbol 失敗: {e}")
@@ -384,13 +386,16 @@ def check_strategy_timeout():
 
 # ── 進場前快檢查 ────────────────────────────────────────────────
 def _entry_still_valid(symbol: str, side: str,
-                       signal_entry: float = 0.0) -> bool:
+                       signal_entry: float = 0.0,
+                       stop_loss: float = 0.0) -> bool:
     """
     選幣到進場之間可能隔數分鐘～十幾分鐘，期間市場條件會變。
     進場前快查最敏感的濾網，避免選幣當下適合、進場時已不適合：
       1. funding rate 沒飆極端（|fr| > 0.15%/8h 直接擋）
       2. 相對 BTC 強弱方向仍匹配（LONG 沒跑輸 BTC 太多 / SHORT 沒跑贏太多）
       3. mark price 沒偏離訊號 entry（擋市價單薄市滑價，v4 新增）
+      4. mark price 未穿越 SL（穿越 = 訊號結構壞，進場=瞬間被打停，
+         v5 新增，stop_loss > 0 才檢查）
     任一項失敗回 False。API 失敗時 fail-open（不阻斷正常交易流程）。
     """
     if not getattr(Config, "PRE_ENTRY_RECHECK_ENABLED", True):
@@ -462,6 +467,25 @@ def _entry_still_valid(symbol: str, side: str,
                     f"{signal_entry}（{dev*100:+.2f}%）< -{max_dev*100:.2f}%，擋"
                 )
                 return False
+
+            # 4. Mark price 穿越 SL 檢查（v5 新增）
+            # 訊號送單之間若 mark 已穿越 SL（LONG 低於 SL、SHORT 高於 SL），
+            # 訊號結構已壞，進場就會瞬間被打停，浪費手續費 + 結構無意義。
+            # 順向偏離（對進場有利那側）若幅度大到穿越 SL，同樣反映價格已
+            # 脫離訊號 K 棒區間，不該進。
+            if stop_loss > 0:
+                if side == "LONG" and mark_price <= stop_loss:
+                    log.warning(
+                        f"[{symbol}] 進場前檢查：LONG mark={mark_price} "
+                        f"≤ SL={stop_loss}，訊號結構已壞，擋"
+                    )
+                    return False
+                if side == "SHORT" and mark_price >= stop_loss:
+                    log.warning(
+                        f"[{symbol}] 進場前檢查：SHORT mark={mark_price} "
+                        f"≥ SL={stop_loss}，訊號結構已壞，擋"
+                    )
+                    return False
         except Exception as e:
             log.debug(f"[{symbol}] 進場前 mark price 檢查失敗: {e}")
 
@@ -567,8 +591,11 @@ def _try_open_for_symbol(symbol: str, strategy) -> bool:
             log.warning(f"[{symbol}] 風控拒絕")
             return False
 
-        # 進場前快檢查
-        if not _entry_still_valid(symbol, sig.side, sig.entry_price):
+        # 進場前快檢查（風控計算後才有 pos["sl"]，順便檢查 mark 是否已穿越 SL）
+        if not _entry_still_valid(
+            symbol, sig.side, sig.entry_price,
+            stop_loss=pos.get("sl", 0.0),
+        ):
             return False
 
         order = executor.open_position(

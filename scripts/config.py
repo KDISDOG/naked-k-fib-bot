@@ -95,6 +95,15 @@ class Config:
         os.getenv("PRE_ENTRY_MAX_MARK_DEVIATION", 0.005)  # 0.5%
     )
 
+    # 成交後偏離門檻：fill_price 偏離訊號 entry 超過此比例就緊急平倉放棄。
+    # 3% 太寬、只擋得住閃崩；1.5% 可吸收新幣市價單 1-2% 正常滑價，
+    # 但擋住成交已穿越 SL / TP 等結構壞掉的情況。
+    MAX_FILL_SLIP = float(os.getenv("MAX_FILL_SLIP", 0.015))  # 1.5%
+
+    # 新幣過濾天數（onboardDate < 此天數者不進候選池）
+    # 新幣前 30-60 天流動性差、MM 操縱風險高、K 線結構不穩
+    NEW_COIN_MIN_DAYS = int(os.getenv("NEW_COIN_MIN_DAYS", 60))
+
     # ── 選幣層硬流動性門檻（v4 新增）─────────────────────────────
     # 24h USDT 成交量低於此值直接排除，不進 scoring。
     # 原先流動性只給「分數」不是硬門檻 → 薄流動性幣進榜 → 市價單滑價 5%+ → 放棄開倉。
