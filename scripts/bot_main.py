@@ -59,6 +59,12 @@ log = logging.getLogger("bot")
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
+# WebSocket 底層每 tick 都 DEBUG 一筆（continuous_kline / TEXT bytes...），
+# 會把 log 塞爆。壓成 WARNING。
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("binance").setLevel(logging.INFO)
+logging.getLogger("binance.ws").setLevel(logging.WARNING)
+logging.getLogger("binance.ws.reconnecting_websocket").setLevel(logging.WARNING)
 
 # ── 初始化 ──────────────────────────────────────────────────────
 client      = Client(Config.BINANCE_API_KEY, Config.BINANCE_SECRET,
