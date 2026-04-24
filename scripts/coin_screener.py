@@ -30,6 +30,7 @@ import numpy as np
 import logging
 from binance.client import Client
 from api_retry import retry_api
+from config import Config
 
 log = logging.getLogger("screener")
 
@@ -83,6 +84,18 @@ class CoinScreener:
         score = 0
         # 24h USDT 成交量（用 qav，不是 volume * close）
         vol_24h = df["qav"].tail(24).sum()
+
+        # ── 硬門檻：24h 成交量低於 SCREEN_MIN_QAV_24H 直接排除 ──
+        # 避免薄流動性幣進榜，市價單吃單吃出 3%+ 滑價
+        # 導致 order_executor 觸發「成交價偏離過大，放棄開倉」
+        min_qav = getattr(Config, "SCREEN_MIN_QAV_24H", 0)
+        if min_qav > 0 and vol_24h < min_qav:
+            details = {
+                "vol_24h_m":     round(vol_24h / 1_000_000, 1),
+                "liquidity_reject": True,
+                "min_qav_m":     round(min_qav / 1_000_000, 1),
+            }
+            return 0, details
 
         # 流動性分級
         if vol_24h >= 200_000_000:

@@ -85,9 +85,23 @@ class Config:
     # 選幣→進場之間可能隔數分鐘到十幾分鐘，進場前用輕量 API 再查：
     #   - funding rate 沒飆極端（|fr| > 0.15%/8h）
     #   - 相對強弱方向仍與進場方向匹配
+    #   - mark price 沒偏離訊號 entry 太多（v4 新增，擋市價單滑價爆倉）
     PRE_ENTRY_RECHECK_ENABLED = os.getenv(
         "PRE_ENTRY_RECHECK_ENABLED", "true"
     ).lower() == "true"
+    # 訊號→執行之間若 mark price 已偏離訊號 entry 超過此比例，跳過該訊號
+    # 避免市價單在薄市 / 急行情中滑價 3%+ 觸發 order_executor 的緊急平倉
+    PRE_ENTRY_MAX_MARK_DEVIATION = float(
+        os.getenv("PRE_ENTRY_MAX_MARK_DEVIATION", 0.005)  # 0.5%
+    )
+
+    # ── 選幣層硬流動性門檻（v4 新增）─────────────────────────────
+    # 24h USDT 成交量低於此值直接排除，不進 scoring。
+    # 原先流動性只給「分數」不是硬門檻 → 薄流動性幣進榜 → 市價單滑價 5%+ → 放棄開倉。
+    # 預設 50M（配合原本 _score_liquidity 的 +1 分級）。設 0 關閉硬門檻。
+    SCREEN_MIN_QAV_24H = float(
+        os.getenv("SCREEN_MIN_QAV_24H", 50_000_000)
+    )
 
     # ── 裸K+Fib 入場參數（signal_engine）────────────────────────
     NKF_MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))

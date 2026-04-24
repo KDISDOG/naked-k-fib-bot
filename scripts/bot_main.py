@@ -328,12 +328,14 @@ def check_strategy_timeout():
 
 
 # ── 進場前快檢查 ────────────────────────────────────────────────
-def _entry_still_valid(symbol: str, side: str) -> bool:
+def _entry_still_valid(symbol: str, side: str,
+                       signal_entry: float = 0.0) -> bool:
     """
     選幣到進場之間可能隔數分鐘～十幾分鐘，期間市場條件會變。
-    進場前快查兩項最敏感的濾網，避免選幣當下適合、進場時已不適合：
+    進場前快查最敏感的濾網，避免選幣當下適合、進場時已不適合：
       1. funding rate 沒飆極端（|fr| > 0.15%/8h 直接擋）
       2. 相對 BTC 強弱方向仍匹配（LONG 沒跑輸 BTC 太多 / SHORT 沒跑贏太多）
+      3. mark price 沒偏離訊號 entry（擋市價單薄市滑價，v4 新增）
     任一項失敗回 False。API 失敗時 fail-open（不阻斷正常交易流程）。
     """
     if not getattr(Config, "PRE_ENTRY_RECHECK_ENABLED", True):
@@ -377,6 +379,36 @@ def _entry_still_valid(symbol: str, side: str) -> bool:
                     return False
         except Exception as e:
             log.debug(f"[{symbol}] 進場前 rel strength 檢查失敗: {e}")
+
+    # 3. Mark price 偏離預檢（v4 新增）
+    # 訊號→送單之間若 mark price 已偏離 signal entry 過大，下市價單會再放大
+    # 滑價（吃訂單簿），order_executor 會觸發「偏離過大，放棄開倉」的緊急平倉，
+    # 等於白白吃手續費 + 訊號結構失真。這裡提前擋掉。
+    max_dev = float(
+        getattr(Config, "PRE_ENTRY_MAX_MARK_DEVIATION", 0.005)
+    )
+    if signal_entry > 0 and max_dev > 0:
+        try:
+            mark = client.futures_mark_price(symbol=symbol)
+            mark_price = float(mark["markPrice"])
+            dev = (mark_price - signal_entry) / signal_entry
+            # 方向感知：LONG 若 mark 已拉高（dev > +max_dev）進場就追高；
+            #           SHORT 若 mark 已下殺（dev < -max_dev）進場就追殺。
+            # 反向偏離（對進場有利那側）不擋，仍入場。
+            if side == "LONG" and dev > max_dev:
+                log.warning(
+                    f"[{symbol}] 進場前檢查：LONG mark={mark_price} 偏離訊號 "
+                    f"{signal_entry}（{dev*100:+.2f}%）> {max_dev*100:.2f}%，擋"
+                )
+                return False
+            if side == "SHORT" and dev < -max_dev:
+                log.warning(
+                    f"[{symbol}] 進場前檢查：SHORT mark={mark_price} 偏離訊號 "
+                    f"{signal_entry}（{dev*100:+.2f}%）< -{max_dev*100:.2f}%，擋"
+                )
+                return False
+        except Exception as e:
+            log.debug(f"[{symbol}] 進場前 mark price 檢查失敗: {e}")
 
     return True
 
@@ -507,10 +539,10 @@ def check_signals():
                 log.warning(f"[{symbol}] 風控拒絕")
                 continue
 
-            # 進場前快檢查（funding / 相對強弱）
+            # 進場前快檢查（funding / 相對強弱 / mark price 偏離）
             # 放在風控計算後，因為風控本身會抓 ticker 等 API，如果風控就擋下來
             # 這裡就不用白跑一次 pre-check。
-            if not _entry_still_valid(symbol, sig.side):
+            if not _entry_still_valid(symbol, sig.side, sig.entry_price):
                 continue
 
             # 執行開倉
