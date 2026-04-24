@@ -519,6 +519,11 @@ class OrderExecutor:
         TP1 觸發後，把止損移到入場價（保本）
         1. 取消所有既有 STOP_MARKET 掛單（含原 closePosition SL）
         2. 下新的止損單在入場價
+
+        邊緣情境（PARTIAL_TIMEOUT 呼叫本函式）：
+          價格可能仍在 entry 附近或不利側，BE SL 會立即觸發 (-2021)。
+          修正：先查 mark price，若 BE 目標對當前價不可行 → 直接放棄，
+          保留原 SL，不做任何修改（避免裸奔）。
         """
         try:
             trade = self.db.get_trade_by_id(trade_id)
@@ -532,15 +537,40 @@ class OrderExecutor:
 
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
 
-            # 防禦性清理：取消所有此 symbol/方向的 SL 掛單
-            self._cancel_existing_sl_orders(symbol, close_side)
-
             # 加一點 buffer 避免滑價
             price_precision = self._get_symbol_info(symbol)["price_precision"]
             if direction == "LONG":
                 new_sl = round(entry_price * 1.001, price_precision)  # 入場價 +0.1%
             else:
                 new_sl = round(entry_price * 0.999, price_precision)  # 入場價 -0.1%
+
+            # ── 預檢：BE 目標相對當前 mark 是否可下 ─────────────────
+            # LONG SL 必須在當前價之下；SHORT SL 必須在當前價之上。
+            # 若當前價已在 BE 目標同側或更不利側 → 立即觸發，直接跳過。
+            try:
+                ticker = retry_api(
+                    self.client.futures_mark_price, symbol=symbol
+                )
+                mark_price = float(ticker["markPrice"])
+            except Exception as pe:
+                log.warning(f"[{symbol}] 取得 mark price 失敗: {pe}，略過 BE 預檢")
+                mark_price = None
+
+            if mark_price is not None:
+                be_viable = (
+                    (direction == "LONG"  and mark_price > new_sl) or
+                    (direction == "SHORT" and mark_price < new_sl)
+                )
+                if not be_viable:
+                    log.warning(
+                        f"[{symbol}] #{trade_id} 當前 mark {mark_price} "
+                        f"不利於 BE 目標 {new_sl}（{direction}），"
+                        f"保留原 SL，不執行 move_to_breakeven"
+                    )
+                    return False
+
+            # 通過預檢才動刀：先取消舊 SL，再下新 BE SL
+            self._cancel_existing_sl_orders(symbol, close_side)
 
             # 計算剩餘倉位
             remaining = trade["qty"] - trade["qty_closed"]

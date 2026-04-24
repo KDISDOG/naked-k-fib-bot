@@ -607,12 +607,29 @@ class PositionSyncer:
         was_partial = trade.get("status") == "partial"
         is_be       = trade.get("breakeven", False)
 
+        # ── partial 前綴：依前一次的 close_reason 決定 ──
+        # 先前是 TP1   → "TP1+"（最常見）
+        # 先前是 PARTIAL_TIMEOUT → "TIMEOUT+"（半時砍半倉）
+        # 其他已知來源 → 直接用原 reason 當前綴，誠實標註
+        def _partial_prefix() -> str:
+            if not was_partial:
+                return ""
+            prev = (trade.get("close_reason") or "").upper()
+            if not prev or prev == "TP1":
+                return "TP1+"
+            if prev == "PARTIAL_TIMEOUT":
+                return "TIMEOUT+"
+            # 其他（例如未來新增的 partial 原因）原樣保留
+            return f"{prev}+"
+
+        pfx = _partial_prefix()
+
         # 容差：價格的 1.0%（滑價保護）
         tol = entry * 0.01 if entry > 0 else 0
 
         # ── 1. BREAKEVEN 最優先 ───────────────────────────────────
         if is_be and sl > 0 and abs(exit_price - sl) <= tol:
-            return "TP1+BE"
+            return f"{pfx}BE" if was_partial else "BE"
 
         # ── 2. 有 realized hint：按勝負分流 ───────────────────────
         if realized_hint is not None:
@@ -629,25 +646,25 @@ class PositionSyncer:
                     if tp1 > 0 and not was_partial and exit_price <= tp1 + tol:
                         return "TP1"
                 if trade.get("use_trailing"):
-                    return "TP1+TRAILING" if was_partial else "TRAILING"
+                    return f"{pfx}TRAILING" if was_partial else "TRAILING"
                 # 賺但對不上明確 TP（例如手動停單獲利、trailing 未標記）
-                return "TP1+WIN" if was_partial else "WIN"
+                return f"{pfx}WIN" if was_partial else "WIN"
             else:
                 # 虧損分支：優先判 SL
                 if direction == "LONG":
                     if sl > 0 and exit_price <= sl + tol:
-                        return "TP1+SL" if was_partial else "SL"
+                        return f"{pfx}SL" if was_partial else "SL"
                 else:
                     if sl > 0 and exit_price >= sl - tol:
-                        return "TP1+SL" if was_partial else "SL"
+                        return f"{pfx}SL" if was_partial else "SL"
                 if trade.get("use_trailing"):
-                    return "TP1+TRAILING" if was_partial else "TRAILING"
+                    return f"{pfx}TRAILING" if was_partial else "TRAILING"
                 log.warning(
                     f"[{trade.get('symbol')}] #{trade.get('id')} "
                     f"虧損但對不上 SL: dir={direction} exit={exit_price:.6f} "
                     f"entry={entry:.6f} sl={sl} realized={realized_hint:+.4f}"
                 )
-                return "TP1+EXT_LOSS" if was_partial else "EXT_LOSS"
+                return f"{pfx}EXT_LOSS" if was_partial else "EXT_LOSS"
 
         # ── 3. 無 realized hint：退回舊邏輯（純價格比對） ─────────
         if direction == "LONG":
@@ -656,17 +673,17 @@ class PositionSyncer:
             if tp1 > 0 and not was_partial and exit_price >= tp1 - tol:
                 return "TP1"
             if sl > 0 and exit_price <= sl + tol:
-                return "TP1+SL" if was_partial else "SL"
+                return f"{pfx}SL" if was_partial else "SL"
         else:  # SHORT
             if tp2 > 0 and exit_price <= tp2 + tol:
                 return "TP2"
             if tp1 > 0 and not was_partial and exit_price <= tp1 + tol:
                 return "TP1"
             if sl > 0 and exit_price >= sl - tol:
-                return "TP1+SL" if was_partial else "SL"
+                return f"{pfx}SL" if was_partial else "SL"
 
         if trade.get("use_trailing"):
-            return "TP1+TRAILING" if was_partial else "TRAILING"
+            return f"{pfx}TRAILING" if was_partial else "TRAILING"
 
         # Fallback：對不上任何結構化目標（無 realized hint 可用）
         log.warning(
@@ -680,7 +697,7 @@ class PositionSyncer:
             else:
                 win = exit_price < entry
             base = "EXT_WIN" if win else "EXT_LOSS"
-            return f"TP1+{base}" if was_partial else base
+            return f"{pfx}{base}" if was_partial else base
 
         return "UNKNOWN"
 
