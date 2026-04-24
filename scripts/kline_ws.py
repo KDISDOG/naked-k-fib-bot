@@ -49,6 +49,13 @@ class KlineWSManager:
         self._streams: set[str] = set()
         self._lock = threading.RLock()
         self._started = False
+        # 自愈用：ReadLoopClosed 發生後 _needs_reset=True，由外部 worker
+        # 呼叫 reset_connection() 重建（避免在 callback 執行緒做 stop/start
+        # 造成 TWM 內部死鎖）
+        self._needs_reset = False
+        self._last_error_log_ts = 0.0
+        # 最後一次收到有效事件的時間（含 non-closed K 線），用來偵測靜默死亡
+        self._last_event_ts = time.time()
 
     # ── 生命週期 ────────────────────────────────────────────────
     def start(self):
@@ -142,6 +149,59 @@ class KlineWSManager:
         with self._lock:
             return len(self._streams)
 
+    def needs_reset(self) -> bool:
+        with self._lock:
+            return self._needs_reset
+
+    def seconds_since_last_event(self) -> float:
+        with self._lock:
+            return time.time() - self._last_event_ts
+
+    def reset_connection(self):
+        """
+        強制重建 multiplex 連線（保留當前訂閱集合）。
+        由外部 worker 在偵測到 ReadLoopClosed 或長時間靜默時呼叫。
+        """
+        with self._lock:
+            if not self._started or not self._twm:
+                return False
+            streams_snapshot = set(self._streams)
+            # 停舊 socket
+            if self._conn_key:
+                try:
+                    self._twm.stop_socket(self._conn_key)
+                except Exception as e:
+                    log.debug(f"停止舊 socket 失敗（忽略）: {e}")
+                self._conn_key = None
+            self._streams = set()
+            self._needs_reset = False
+
+        # 釋放 lock 後等 TWM 清理
+        time.sleep(0.3)
+
+        # 用保存的串流集合還原
+        if not streams_snapshot:
+            log.warning("WS 重建：無串流可還原（streams 為空）")
+            return False
+
+        targets: set[tuple[str, str]] = set()
+        for s in streams_snapshot:
+            try:
+                sym, rest = s.split("@kline_", 1)
+                targets.add((sym.upper(), rest))
+            except Exception:
+                continue
+
+        try:
+            self.reconcile(targets)
+            log.info(f"WS 連線已重建（{len(targets)} 條串流）")
+            with self._lock:
+                self._last_event_ts = time.time()
+            return True
+        except Exception as e:
+            log.error(f"WS 重建失敗: {e}")
+            return False
+
     # ── 訊息處理 ────────────────────────────────────────────────
     def _on_message(self, msg: dict):
         """
@@ -162,6 +222,21 @@ class KlineWSManager:
             if not isinstance(msg, dict):
                 return
             if msg.get("e") == "error":
+                err_type = msg.get("type", "")
+                # ReadLoopClosed：底層 socket 死了，TWM 不會自動重建
+                # multiplex 連線；設 flag 交外部 worker 呼叫 reset_connection()
+                # 避免 callback 執行緒自己動 TWM 造成死鎖。
+                # 同時做 5 秒 rate-limit 以免同一次中斷被刷 N 筆相同錯。
+                if err_type == "ReadLoopClosed":
+                    now = time.time()
+                    with self._lock:
+                        if now - self._last_error_log_ts > 5.0:
+                            log.warning(
+                                "WS ReadLoopClosed：底層連線中斷，將自動重建"
+                            )
+                            self._last_error_log_ts = now
+                        self._needs_reset = True
+                    return
                 log.error(f"WS 回傳錯誤: {msg}")
                 return
 
@@ -170,6 +245,12 @@ class KlineWSManager:
             k = data.get("k") if isinstance(data, dict) else None
             if not isinstance(k, dict):
                 return
+
+            # 每筆有效 K 線訊息都更新 last_event_ts（不管是否收盤）
+            # 用於偵測「靜默死亡」——連 non-closed tick 都沒有時必然斷線
+            with self._lock:
+                self._last_event_ts = time.time()
+
             if not k.get("x"):
                 return
 

@@ -726,26 +726,54 @@ def _dispatch_kline_close(symbol: str, interval: str, close_time: int):
 def _ws_worker_loop():
     """
     WS 事件 worker thread 主迴圈。
-    從 ws_event_queue 拉 (symbol, interval, close_time_ms) 三元組，
-    交給 _dispatch_kline_close 處理。
+    - 從 ws_event_queue 拉 (symbol, interval, close_time_ms) 三元組 → dispatch
+    - 每 10 秒檢查 WS 健康狀態：
+      a. needs_reset（ReadLoopClosed 觸發過）→ 立即重建
+      b. 超過 WS_SILENCE_RESET_SEC 沒收到任何 K 線 tick → 重建
     """
     log.info("WS worker thread 啟動")
+    last_health_check = 0.0
+    # 超過此秒數沒收到事件就強制重建（預設 5 min）。
+    # 即使全 1h timeframe 也應該每幾秒收一筆 non-closed tick；
+    # 5 min 無事件 = 連線必然有問題。
+    silence_limit = float(
+        getattr(Config, "WS_SILENCE_RESET_SEC", 300.0)
+    )
+
     while not shutdown_event.is_set():
         try:
             item = ws_event_queue.get(timeout=1.0)
         except queue.Empty:
-            continue
+            item = None
         except Exception as e:
             log.error(f"WS queue 取訊息失敗: {e}")
-            continue
+            item = None
 
-        if item is None:
-            continue
-        try:
-            symbol, interval, close_time = item
-            _dispatch_kline_close(symbol, interval, close_time)
-        except Exception as e:
-            log.error(f"WS 事件分發失敗: {e}")
+        if item is not None:
+            try:
+                symbol, interval, close_time = item
+                _dispatch_kline_close(symbol, interval, close_time)
+            except Exception as e:
+                log.error(f"WS 事件分發失敗: {e}")
+
+        # 健康檢查（每 10 秒跑一次，避免每迴圈都拿 lock）
+        now = time.time()
+        if ws_manager and (now - last_health_check) >= 10.0:
+            last_health_check = now
+            try:
+                if ws_manager.needs_reset():
+                    log.warning("WS 偵測 needs_reset，觸發重建")
+                    ws_manager.reset_connection()
+                elif ws_manager.subscribed_count() > 0 and \
+                        ws_manager.seconds_since_last_event() > silence_limit:
+                    log.warning(
+                        f"WS 靜默 {ws_manager.seconds_since_last_event():.0f}s "
+                        f"超過 {silence_limit:.0f}s，觸發重建"
+                    )
+                    ws_manager.reset_connection()
+            except Exception as e:
+                log.error(f"WS 健康檢查失敗: {e}")
+
     log.info("WS worker thread 結束")
 
 
