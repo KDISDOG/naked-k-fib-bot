@@ -141,15 +141,23 @@ class PositionSyncer:
                         partial      = False,
                         close_reason = reason,
                     )
-                    # 通知淨盈虧：有 realized 就直接用（最準），否則重算
-                    if realized_hint is not None:
-                        _net = realized_hint - fee
-                    else:
-                        if direction == "LONG":
-                            _raw_pnl = (exit_price - entry) * qty
+                    # 通知淨盈虧：取 DB 累加後的 net_pnl（涵蓋 TP1/TP2/殘餘
+                    # 所有 legs）。舊版用 realized_hint 只反映「最後一腿」，
+                    # 導致 TP1+TP2+trailing 多段平倉時 Telegram 只顯示最後
+                    # 一段的微小淨盈虧（SPORTFUNUSDT #69 = +0.01 而非 +1.23）
+                    try:
+                        refreshed = self.db.get_trade_by_id(trade_id)
+                        _net = refreshed.get("net_pnl", 0.0) if refreshed else 0.0
+                    except Exception:
+                        # fallback：舊邏輯（單腿交易近似）
+                        if realized_hint is not None:
+                            _net = realized_hint - fee
                         else:
-                            _raw_pnl = (entry - exit_price) * qty
-                        _net = _raw_pnl - fee
+                            if direction == "LONG":
+                                _raw_pnl = (exit_price - entry) * qty
+                            else:
+                                _raw_pnl = (entry - exit_price) * qty
+                            _net = _raw_pnl - fee
                     notify.trade_closed(symbol, direction, _net, reason)
                     continue
 
