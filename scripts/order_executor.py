@@ -43,20 +43,27 @@ class OrderExecutor:
                     qty_precision = s.get("quantityPrecision", 3)
                     price_precision = s.get("pricePrecision", 2)
 
-                    # 找最小數量 (LOT_SIZE filter)
+                    # 找最小數量 (LOT_SIZE filter) + 最小 tick (PRICE_FILTER)
                     min_qty = 0.001
                     step_size = 0.001
+                    tick_size = 0.0
                     for f in s.get("filters", []):
                         if f["filterType"] == "LOT_SIZE":
                             min_qty = float(f["minQty"])
                             step_size = float(f["stepSize"])
-                            break
+                        elif f["filterType"] == "PRICE_FILTER":
+                            tick_size = float(f.get("tickSize", 0) or 0)
+
+                    # tick_size fallback：用 pricePrecision 推算
+                    if tick_size <= 0:
+                        tick_size = 10 ** (-price_precision)
 
                     result = {
                         "qty_precision": qty_precision,
                         "price_precision": price_precision,
                         "min_qty": min_qty,
                         "step_size": step_size,
+                        "tick_size": tick_size,
                     }
                     self._symbol_info_cache[symbol] = result
                     return result
@@ -68,6 +75,7 @@ class OrderExecutor:
             "price_precision": 2,
             "min_qty": 0.001,
             "step_size": 0.001,
+            "tick_size": 0.01,
         }
 
     def _round_qty(self, symbol: str, qty: float) -> float:
@@ -80,9 +88,34 @@ class OrderExecutor:
         rounded = math.floor(qty * (10 ** precision)) / (10 ** precision)
         return max(rounded, info["min_qty"])
 
-    def _round_price(self, symbol: str, price: float) -> float:
+    def _round_price(self, symbol: str, price: float,
+                     direction: str = "nearest") -> float:
+        """
+        按 tickSize 對齊價格（非只看 pricePrecision）。
+
+        Binance PRICE_FILTER 要求價格必須是 tickSize 的整數倍，否則回
+        -4014 "Price not increased by tick size"。純用 pricePrecision
+        四捨五入在 tickSize 非 10^-n 的幣種（特別是 memecoin）會失敗。
+
+        direction:
+          "nearest" — 最接近的 tick（預設，一般用途）
+          "down"    — 向下對齊（LONG 的 SL / SHORT 的 TP 用，避免越界）
+          "up"      — 向上對齊（SHORT 的 SL / LONG 的 TP 用，避免越界）
+        """
         info = self._get_symbol_info(symbol)
-        return round(price, info["price_precision"])
+        tick = info.get("tick_size", 0) or 0
+        if tick <= 0:
+            return round(price, info["price_precision"])
+
+        if direction == "down":
+            aligned = math.floor(price / tick) * tick
+        elif direction == "up":
+            aligned = math.ceil(price / tick) * tick
+        else:
+            aligned = round(price / tick) * tick
+
+        # 再用 pricePrecision 做浮點誤差修剪（避免 0.00039170000000001 之類）
+        return round(aligned, info["price_precision"])
 
     # ── 開倉（分批止盈）────────────────────────────────────────
 
@@ -110,13 +143,18 @@ class OrderExecutor:
         - 1 張 TP1 止盈（qty_tp1）
         - 1 張 TP2 止盈（qty_tp2）
         """
-        # 精度處理
+        # 精度處理（tickSize 對齊，方向感知避免 -4014/-2021）
         qty     = self._round_qty(symbol, qty)
         qty_tp1 = self._round_qty(symbol, qty_tp1)
         qty_tp2 = self._round_qty(symbol, qty_tp2)
-        sl      = self._round_price(symbol, sl)
-        tp1     = self._round_price(symbol, tp1)
-        tp2     = self._round_price(symbol, tp2)
+        # SL 往「離 entry 更遠」對齊：避免 nearest 取整把 SL 拉到當前價同側
+        # 觸發 -2021 "Order would immediately trigger"
+        sl_dir  = "down" if direction == "LONG" else "up"
+        # TP 往「離 entry 更遠」對齊：微幅保守，避免 TP 過早觸發
+        tp_dir  = "up"   if direction == "LONG" else "down"
+        sl      = self._round_price(symbol, sl, sl_dir)
+        tp1     = self._round_price(symbol, tp1, tp_dir)
+        tp2     = self._round_price(symbol, tp2, tp_dir)
 
         try:
             # 1. 設定槓桿
@@ -270,11 +308,9 @@ class OrderExecutor:
                 sl_order_id, _ = extract_id(sl_order)
             except Exception as e:
                 err_s = str(e)
-                # 4.1 -4045 stop 限額重試：先 cancel_all_for_symbol 強清
-                #     整個 symbol 的掛單（含 Algo），再試一次 SL。
-                #     第 4.0 的清理只處理 list_open_orders 能枚舉到的，
-                #     有些歷史 Algo 訂單可能枚舉不到但占用限額，需硬清。
                 retried_ok = False
+
+                # 4.1 -4045 stop 限額重試：強清此 symbol 所有掛單（含 Algo）
                 if "-4045" in err_s or "max stop order" in err_s.lower():
                     log.warning(
                         f"[{symbol}] SL 掛單遇 -4045 限額，強清殘留後重試一次"
@@ -299,8 +335,52 @@ class OrderExecutor:
                     except Exception as e2:
                         log.error(f"[{symbol}] -4045 重試仍失敗: {e2}")
 
+                # 4.1b -2021 Order would immediately trigger：
+                # 送單到成交有時差，mark price 可能已走過 SL。把 SL 往離 entry
+                # 遠方推 0.5%（LONG SL 更低 / SHORT SL 更高）再試一次，
+                # 避免被迫緊急平倉燒手續費。
+                elif ("-2021" in err_s
+                      or "immediately trigger" in err_s.lower()):
+                    if direction == "LONG":
+                        adj_sl = self._round_price(symbol, sl * 0.995, "down")
+                    else:
+                        adj_sl = self._round_price(symbol, sl * 1.005, "up")
+                    log.warning(
+                        f"[{symbol}] SL={sl} 撞 -2021（mark 已越過），"
+                        f"調整為 {adj_sl}（外推 0.5%）重試一次"
+                    )
+                    try:
+                        sl_order = create_order_safe(
+                            self.client, symbol,
+                            side        = close_side,
+                            type        = FUTURE_ORDER_TYPE_STOP_MARKET,
+                            stopPrice   = adj_sl,
+                            quantity    = qty,
+                            reduceOnly  = True,
+                            workingType = "MARK_PRICE",
+                        )
+                        sl_order_id, _ = extract_id(sl_order)
+                        sl = adj_sl  # 讓後續 DB / breakeven 用新的 SL
+                        retried_ok = True
+                        log.info(f"[{symbol}] -2021 外推後重試成功 SL={sl}")
+                    except Exception as e2:
+                        log.error(f"[{symbol}] -2021 外推重試仍失敗: {e2}")
+
+                # 4.1c -4014 / -1111 精度錯誤：tickSize 對齊失敗（極罕見，
+                # tick_size-aware _round_price 已涵蓋大部分）。記錄原始錯誤，
+                # 不自動重試（避免無限迴圈），落到緊急平倉。
+                elif ("-4014" in err_s or "-1111" in err_s
+                      or "tick size" in err_s.lower()
+                      or "precision" in err_s.lower()):
+                    log.error(
+                        f"[{symbol}] SL 掛單精度錯誤 SL={sl} err={err_s} "
+                        f"— 檢查 tick_size 邏輯"
+                    )
+
                 if not retried_ok:
-                    log.error(f"[{symbol}] SL 掛單失敗，緊急平倉: {e}")
+                    log.error(
+                        f"[{symbol}] SL 掛單失敗 SL={sl} err={err_s}，緊急平倉"
+                    )
                     notify.sl_placement_failed(symbol, direction)
                     # 緊急平倉保護資金
                     try:
