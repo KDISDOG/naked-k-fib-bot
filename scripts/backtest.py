@@ -1662,6 +1662,14 @@ def _trade_stats(trades: list, balance: float) -> dict:
         peak = max(peak, bal)
         if peak > 0:
             mdd = max(mdd, (peak - bal) / peak * 100)
+    # 平倉原因分布（診斷用：確認 TP/SL/TIMEOUT 各占比）
+    reason_counts: dict[str, int] = {}
+    reason_pnl: dict[str, float] = {}
+    for t in closed:
+        rsn = t.result or "UNK"
+        reason_counts[rsn] = reason_counts.get(rsn, 0) + 1
+        reason_pnl[rsn] = reason_pnl.get(rsn, 0.0) + t.net_pnl
+
     return {
         "trades":   len(closed),
         "wins":     len(wins),
@@ -1672,6 +1680,8 @@ def _trade_stats(trades: list, balance: float) -> dict:
         "max_dd":   mdd,
         "best":     max(t.net_pnl for t in closed),
         "worst":    min(t.net_pnl for t in closed),
+        "reason_counts": reason_counts,
+        "reason_pnl":    reason_pnl,
     }
 
 
@@ -1763,6 +1773,31 @@ def _print_multi_summary(results: dict, balance: float) -> None:
         print(f"  {sym:<14} {sc:>7} {s['trades']:>8} "
               f"{s['win_rate']:>6.1f}% {s['pnl']:>+11.2f} "
               f"{s['avg_pnl']:>+10.3f}{mark}")
+
+    # ── 3.5 平倉原因分布（每策略）── 根因診斷 ──────────────
+    print(f"\n{'='*78}")
+    print(f"  平倉原因分布（每策略，跨所有幣）—— 根因診斷")
+    print(f"{'='*78}")
+    print(f"  {'Strategy':<10} {'Reason':<12} {'Count':>7} {'Pct%':>7} "
+          f"{'PnL(U)':>10} {'AvgPnL':>9}")
+    print(f"  {'-'*68}")
+    for strat in strategies:
+        all_trades = []
+        for sym in symbols:
+            all_trades.extend(results.get((sym, strat), []))
+        s = _trade_stats(all_trades, balance)
+        if s["trades"] == 0:
+            continue
+        rc = s.get("reason_counts", {})
+        rp = s.get("reason_pnl", {})
+        # 排序：count 由高到低
+        for reason, cnt in sorted(rc.items(), key=lambda x: -x[1]):
+            pct = cnt / s["trades"] * 100
+            pnl = rp.get(reason, 0.0)
+            avg = pnl / cnt if cnt else 0.0
+            print(f"  {strat:<10} {reason:<12} {cnt:>7} {pct:>6.1f}% "
+                  f"{pnl:>+10.2f} {avg:>+9.3f}")
+        print(f"  {'-'*68}")
 
     # ── 4. 建議 ────────────────────────────────────────────
     print(f"\n{'='*78}")
