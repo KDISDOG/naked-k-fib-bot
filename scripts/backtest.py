@@ -1545,6 +1545,251 @@ _MR_SCAN_SYMBOLS = [
 ]
 
 
+_STABLE_QUOTE_PREFIXES = ("USDC", "FDUSD", "TUSD", "BUSD", "DAI")
+
+
+def _resolve_symbol_list(args, client: Client) -> list[str]:
+    """解析多幣回測的目標 symbol 清單。
+
+    優先順序：--symbols（手動）> --top-n（自動）> 單幣 --symbol。
+    """
+    if args.symbols:
+        syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        return syms
+
+    if args.top_n and args.top_n > 0:
+        try:
+            tickers = client.futures_ticker()
+        except Exception as e:
+            print(f"  ⚠ 取得 futures_ticker 失敗：{e}，fallback 單幣模式")
+            return [args.symbol]
+        # 24h quoteVolume 由高到低
+        ranked = sorted(
+            tickers,
+            key=lambda t: float(t.get("quoteVolume", 0) or 0),
+            reverse=True,
+        )
+        out: list[str] = []
+        for t in ranked:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            if sym.endswith("_PERP"):
+                continue
+            # 排除穩定幣對
+            if args.exclude_stable:
+                base = sym[:-4]
+                if any(base.startswith(p) for p in _STABLE_QUOTE_PREFIXES):
+                    continue
+            out.append(sym)
+            if len(out) >= args.top_n:
+                break
+        if not out:
+            return [args.symbol]
+        return out
+
+    return [args.symbol]
+
+
+def _run_multi_coin_backtest(
+    client: Client,
+    symbols: list[str],
+    args,
+    run_flags: dict,
+) -> dict:
+    """對每幣 × 每策略跑回測，回傳 {(sym, strat): [BtTrade]}。"""
+    results: dict[tuple[str, str], list] = {}
+    timeframes = args.tf or DEFAULT_TF
+
+    for i, sym in enumerate(symbols, 1):
+        print(f"\n[{i}/{len(symbols)}] {sym}")
+
+        if run_flags.get("nkf"):
+            tf_trades = []
+            for tf in timeframes:
+                try:
+                    tr = run_backtest(client, sym, tf, args.months,
+                                      max_bars=args.max_bars)
+                    tf_trades.extend(tr)
+                except Exception as e:
+                    print(f"  [NKF/{tf}] 失敗：{e}")
+            results[(sym, "NKF")] = tf_trades
+
+        if run_flags.get("mr"):
+            try:
+                tr = run_backtest_mr(client, sym, args.months,
+                                     debug=False, adx_max=args.adx_max)
+            except Exception as e:
+                print(f"  [MR] 失敗：{e}")
+                tr = []
+            results[(sym, "MR")] = tr
+
+        if run_flags.get("bd"):
+            try:
+                tr = run_backtest_bd(client, sym, args.months, debug=False)
+            except Exception as e:
+                print(f"  [BD] 失敗：{e}")
+                tr = []
+            results[(sym, "BD")] = tr
+
+        if run_flags.get("ml"):
+            try:
+                tr = run_backtest_ml(client, sym, args.months, debug=False)
+            except Exception as e:
+                print(f"  [ML] 失敗：{e}")
+                tr = []
+            results[(sym, "ML")] = tr
+
+    return results
+
+
+def _trade_stats(trades: list, balance: float) -> dict:
+    """單一交易組（同 symbol+strategy）的統計，回傳 dict。"""
+    closed = [t for t in trades if t.result not in ("", "OPEN")]
+    if not closed:
+        return {
+            "trades": 0, "wins": 0, "win_rate": 0.0,
+            "pnl": 0.0, "pct": 0.0, "avg_pnl": 0.0,
+            "max_dd": 0.0, "best": 0.0, "worst": 0.0,
+        }
+    wins = [t for t in closed if t.net_pnl > 0]
+    pnl_sum = sum(t.net_pnl for t in closed)
+    bal = balance
+    peak = bal
+    mdd = 0.0
+    for t in closed:
+        bal += t.net_pnl
+        peak = max(peak, bal)
+        if peak > 0:
+            mdd = max(mdd, (peak - bal) / peak * 100)
+    return {
+        "trades":   len(closed),
+        "wins":     len(wins),
+        "win_rate": len(wins) / len(closed) * 100,
+        "pnl":      pnl_sum,
+        "pct":      pnl_sum / balance * 100 if balance else 0.0,
+        "avg_pnl":  pnl_sum / len(closed),
+        "max_dd":   mdd,
+        "best":     max(t.net_pnl for t in closed),
+        "worst":    min(t.net_pnl for t in closed),
+    }
+
+
+def _print_multi_summary(results: dict, balance: float) -> None:
+    """三層輸出：cell × strategy / per-strategy / per-coin / 建議。"""
+    if not results:
+        print("\n⚠ 無回測結果")
+        return
+
+    symbols = sorted({s for s, _ in results.keys()})
+    strategies = sorted({st for _, st in results.keys()})
+
+    # ── 1. Cell 細表（symbol × strategy）──────────────────────
+    print(f"\n{'='*78}")
+    print(f"  細項表：每幣 × 每策略")
+    print(f"{'='*78}")
+    print(f"  {'Coin':<14} {'Strat':<6} {'Trades':>7} {'Win%':>7} "
+          f"{'PnL(U)':>10} {'AvgPnL':>9} {'MDD%':>7} {'Best':>8} {'Worst':>8}")
+    print(f"  {'-'*76}")
+    for sym in symbols:
+        for strat in strategies:
+            trades = results.get((sym, strat), [])
+            if not trades:
+                continue
+            s = _trade_stats(trades, balance)
+            if s["trades"] == 0:
+                continue
+            mark = ""
+            if s["trades"] >= 5:
+                if s["win_rate"] >= 55 and s["pnl"] > 0:
+                    mark = " ★"
+                elif s["win_rate"] < 35 and s["pnl"] < 0:
+                    mark = " ✗"
+            print(f"  {sym:<14} {strat:<6} {s['trades']:>7} "
+                  f"{s['win_rate']:>6.1f}% {s['pnl']:>+10.2f} "
+                  f"{s['avg_pnl']:>+9.3f} {s['max_dd']:>6.1f}% "
+                  f"{s['best']:>+8.2f} {s['worst']:>+8.2f}{mark}")
+
+    # ── 2. Per-strategy aggregate ──────────────────────────
+    print(f"\n{'='*78}")
+    print(f"  策略總計（跨所有幣）")
+    print(f"{'='*78}")
+    print(f"  {'Strategy':<10} {'Coins':>6} {'Trades':>8} {'Win%':>7} "
+          f"{'TotalPnL':>11} {'AvgPnL/T':>10} {'MaxDD%':>8}")
+    print(f"  {'-'*76}")
+    for strat in strategies:
+        all_trades = []
+        coin_count = 0
+        for sym in symbols:
+            trs = results.get((sym, strat), [])
+            cl = [t for t in trs if t.result not in ("", "OPEN")]
+            if cl:
+                coin_count += 1
+            all_trades.extend(trs)
+        s = _trade_stats(all_trades, balance)
+        print(f"  {strat:<10} {coin_count:>6} {s['trades']:>8} "
+              f"{s['win_rate']:>6.1f}% {s['pnl']:>+11.2f} "
+              f"{s['avg_pnl']:>+10.3f} {s['max_dd']:>7.1f}%")
+
+    # ── 3. Per-coin aggregate ──────────────────────────────
+    print(f"\n{'='*78}")
+    print(f"  幣種總計（跨所有策略）—— 依 PnL 由高到低")
+    print(f"{'='*78}")
+    print(f"  {'Coin':<14} {'Strats':>7} {'Trades':>8} {'Win%':>7} "
+          f"{'TotalPnL':>11} {'AvgPnL/T':>10}")
+    print(f"  {'-'*72}")
+    coin_summary = []
+    for sym in symbols:
+        all_trades = []
+        strat_count = 0
+        for strat in strategies:
+            trs = results.get((sym, strat), [])
+            cl = [t for t in trs if t.result not in ("", "OPEN")]
+            if cl:
+                strat_count += 1
+            all_trades.extend(trs)
+        s = _trade_stats(all_trades, balance)
+        if s["trades"] == 0:
+            continue
+        coin_summary.append((sym, strat_count, s))
+    coin_summary.sort(key=lambda x: x[2]["pnl"], reverse=True)
+    for sym, sc, s in coin_summary:
+        mark = ""
+        if s["trades"] >= 8:
+            if s["win_rate"] >= 55 and s["pnl"] > 0:
+                mark = " ★"
+            elif s["win_rate"] < 40 or s["pnl"] < -10:
+                mark = " ⚠"
+        print(f"  {sym:<14} {sc:>7} {s['trades']:>8} "
+              f"{s['win_rate']:>6.1f}% {s['pnl']:>+11.2f} "
+              f"{s['avg_pnl']:>+10.3f}{mark}")
+
+    # ── 4. 建議 ────────────────────────────────────────────
+    print(f"\n{'='*78}")
+    print(f"  建議（基於 trades >= 8 的幣 / >= 30 的策略）")
+    print(f"{'='*78}")
+
+    boost = [c for c in coin_summary
+             if c[2]["trades"] >= 8 and c[2]["win_rate"] >= 55
+             and c[2]["pnl"] > 0]
+    blacklist = [c for c in coin_summary
+                 if c[2]["trades"] >= 8 and (
+                     c[2]["win_rate"] < 40 or c[2]["pnl"] < -10
+                 )]
+    if boost:
+        print("  ★ 推薦加權 / 維持：")
+        for sym, _, s in boost:
+            print(f"     {sym:<14} Win {s['win_rate']:>5.1f}%  "
+                  f"PnL {s['pnl']:>+8.2f}  ({s['trades']} 單)")
+    if blacklist:
+        print("  ⚠ 黑名單候選：")
+        for sym, _, s in blacklist:
+            print(f"     {sym:<14} Win {s['win_rate']:>5.1f}%  "
+                  f"PnL {s['pnl']:>+8.2f}  ({s['trades']} 單)")
+    if not boost and not blacklist:
+        print("  （無明顯偏離；資料量可能不足或表現均衡）")
+
+
 def _run_mr_scan(client: Client, months: int, adx_max: float,
                  balance: float) -> None:
     """批量測試多幣種，找出目前最適合均值回歸的幣種。"""
@@ -1640,6 +1885,12 @@ def main():
                         help="MR ADX 上限（預設 25，試試 20 更嚴格選幣）")
     parser.add_argument("--scan",            action="store_true",
                         help="批量掃描多幣種，找出最適合 MR 的幣種")
+    parser.add_argument("--symbols",         default=None,
+                        help="多幣回測：逗號分隔列表（覆蓋 --symbol）")
+    parser.add_argument("--top-n",           type=int, default=0,
+                        help="多幣回測：自動抓全市場 USDT 合約成交量前 N 大")
+    parser.add_argument("--exclude-stable",  action="store_true", default=True,
+                        help="--top-n 時排除穩定幣對（USDC/FDUSD 等）")
     args = parser.parse_args()
 
     timeframes = args.tf or DEFAULT_TF
@@ -1674,6 +1925,27 @@ def main():
     if args.scan:
         _run_mr_scan(client, months=args.months, adx_max=args.adx_max,
                      balance=args.balance)
+        return
+
+    # ── 多幣回測模式（--symbols 或 --top-n 觸發）────────────────
+    multi_mode = bool(args.symbols) or (args.top_n and args.top_n > 0)
+    if multi_mode:
+        symbols = _resolve_symbol_list(args, client)
+        run_flags = {
+            "nkf": run_nkf, "mr": run_mr, "bd": run_bd, "ml": run_ml,
+        }
+        active_strats = [k.upper() for k, v in run_flags.items() if v]
+        print(f"\n{'='*78}")
+        print(f"  多幣多策略回測  共 {len(symbols)} 幣 × "
+              f"{len(active_strats)} 策略 = {len(symbols)*len(active_strats)} 組合")
+        print(f"  策略：{', '.join(active_strats)}  期間：{args.months} 個月")
+        print(f"  起始資金：{args.balance} USDT  每筆保證金：{MARGIN_USDT:.0f} USDT")
+        print(f"  資料來源：{'Testnet ⚠' if use_testnet else '正式 API ✓'}")
+        print(f"  幣種列表：{', '.join(symbols[:10])}"
+              + (f", ... +{len(symbols)-10}" if len(symbols) > 10 else ""))
+        print(f"{'='*78}")
+        results = _run_multi_coin_backtest(client, symbols, args, run_flags)
+        _print_multi_summary(results, args.balance)
         return
 
     print(f"\n{'='*60}")
