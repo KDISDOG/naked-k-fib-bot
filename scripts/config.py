@@ -51,6 +51,11 @@ class Config:
     # 5 分鐘無事件 = 連線必然斷了。
     WS_SILENCE_RESET_SEC = float(os.getenv("WS_SILENCE_RESET_SEC", 300))
 
+    # Dust 自動關閉門檻（USDT）：trailing/TP 平倉後殘留 qty 因幣安 stepSize
+    # 截斷而清不掉時，若殘留名目 < 此值視為實質已平倉，自動 close_trade。
+    # 預設 1 USDT = 殘留價值 < $1 直接收掉。
+    DUST_CLOSE_NOTIONAL = float(os.getenv("DUST_CLOSE_NOTIONAL", 1.0))
+
     # ── 策略選擇 ─────────────────────────────────────────────────
     # 可選：naked_k_fib / mean_reversion / all
     ACTIVE_STRATEGY  = os.getenv("ACTIVE_STRATEGY", "all")

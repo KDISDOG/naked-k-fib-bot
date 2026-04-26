@@ -94,9 +94,48 @@ class PositionSyncer:
 
                 expected_remaining = qty - qty_closed
 
-                # ── 情況 1: 完全平倉 ────────────────────────────────
-                if actual_qty <= 0 or abs(actual_qty) < 0.0001:
-                    log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
+                # ── Dust 偵測 ───────────────────────────────────────
+                # trailing/TP 平倉後殘留 qty 因幣安 stepSize 截斷常清不掉
+                # （例：VVVUSDT trailing 後剩 0.01 = 最小單位本身），DB 會
+                # 卡在 partial 狀態無法收尾。若殘留名目 < DUST_CLOSE_NOTIONAL
+                # 視為實質已平，best-effort 市價砍掉再走完全平倉流程。
+                dust_notional_thr = float(
+                    getattr(Config, "DUST_CLOSE_NOTIONAL", 1.0)
+                )
+                is_dust = (
+                    actual_qty > 0
+                    and qty_closed > 0
+                    and entry > 0
+                    and actual_qty * entry < dust_notional_thr
+                )
+
+                # ── 情況 1: 完全平倉（含 dust 視為平倉）─────────────
+                if actual_qty <= 0 or abs(actual_qty) < 0.0001 or is_dust:
+                    if is_dust:
+                        log.info(
+                            f"[{symbol}] #{trade_id} 偵測 dust 殘留 "
+                            f"qty={actual_qty} × entry={entry:.6f} "
+                            f"= {actual_qty * entry:.4f} USDT "
+                            f"< {dust_notional_thr}，視為完全平倉"
+                        )
+                        # best-effort 市價砍掉 dust（失敗也繼續寫 closed）
+                        try:
+                            from binance.enums import (
+                                ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
+                            )
+                            close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
+                            self.client.futures_create_order(
+                                symbol=symbol, side=close_side,
+                                type=ORDER_TYPE_MARKET,
+                                quantity=actual_qty, reduceOnly=True,
+                            )
+                            log.info(f"[{symbol}] dust 市價平倉送出")
+                        except Exception as de:
+                            log.debug(
+                                f"[{symbol}] dust 市價平倉失敗（仍標 closed）: {de}"
+                            )
+                    else:
+                        log.info(f"[{symbol}] #{trade_id} 偵測到完全平倉")
 
                     # 先清殘留掛單（含 Algo，reduceOnly TP/SL 不會自動取消）
                     # 放最前面：即使後續 close_trade/notify 丟例外，
