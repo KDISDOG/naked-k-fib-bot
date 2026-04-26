@@ -94,6 +94,109 @@ class BtTrade:
     strategy:   str  = "naked_k_fib"
 
 
+# ── BTC Regime 時間序列（回測用，模擬 live MarketContext.current_regime）─
+# Module-level cache：避免每幣回測都重抓
+_BTC_REGIME_CACHE: dict[int, "pd.Series"] = {}
+
+
+def _build_btc_regime_series(
+    client: Client, months: int
+) -> Optional["pd.Series"]:
+    """
+    建構 BTC regime 時間序列（與 live MarketContext.current_regime 同邏輯）：
+      4h ADX>=20 + 日線收盤 > MA50  → "TREND_UP"
+      4h ADX>=20 + 日線收盤 < MA50  → "TREND_DOWN"
+      4h ADX<20 + 收盤靠 MA50(±3%) → "RANGE"
+      其餘                          → "CHOPPY"
+
+    回傳：以 4h K 棒 close_time 為 index 的 Series（值為 regime 字串）
+    給策略 backtest 在每根 K 棒入場前查當下 BTC regime 用。
+    """
+    if months in _BTC_REGIME_CACHE:
+        return _BTC_REGIME_CACHE[months]
+
+    print(f"  預計算 BTC regime 時間序列（4h × {months}m + daily）...",
+          end="", flush=True)
+    try:
+        # 多抓 60 天 warmup 給 ADX/MA50
+        warmup_months = months + 2
+        df_4h    = fetch_klines(client, "BTCUSDT", "4h", warmup_months)
+        df_daily = fetch_klines(client, "BTCUSDT", "1d", warmup_months)
+    except Exception as e:
+        print(f" 失敗：{e}")
+        return None
+
+    if len(df_4h) < 30 or len(df_daily) < 50:
+        print(" 資料不足，跳過 regime gate")
+        return None
+
+    # 4h ADX
+    adx_df = ta.adx(df_4h["high"], df_4h["low"], df_4h["close"], length=14)
+    df_4h["adx"] = adx_df["ADX_14"] if adx_df is not None else float("nan")
+    # 日線 MA50
+    df_daily["ma50"] = df_daily["close"].rolling(50).mean()
+    # 對齊：每根 4h 取「最近的日線 MA50」（forward fill）
+    df_daily_idx = df_daily.set_index("time")[["close", "ma50"]]
+    df_4h_idx = df_4h.set_index("time")
+    aligned = df_4h_idx.join(
+        df_daily_idx.rename(columns={"close": "daily_close",
+                                       "ma50": "daily_ma50"}),
+        how="left"
+    )
+    aligned[["daily_close", "daily_ma50"]] = (
+        aligned[["daily_close", "daily_ma50"]].ffill()
+    )
+
+    def classify(row):
+        adx = row.get("adx")
+        d_close = row.get("daily_close")
+        d_ma = row.get("daily_ma50")
+        if pd.isna(adx) or pd.isna(d_close) or pd.isna(d_ma) or d_ma <= 0:
+            return "CHOPPY"
+        diff_pct = abs(d_close - d_ma) / d_ma
+        if adx >= 20:
+            return "TREND_UP" if d_close > d_ma else "TREND_DOWN"
+        if adx < 20 and diff_pct <= 0.03:
+            return "RANGE"
+        return "CHOPPY"
+
+    series = aligned.apply(classify, axis=1)
+    series.name = "regime"
+    print(f" 完成（{len(series)} 點）")
+    _BTC_REGIME_CACHE[months] = series
+    return series
+
+
+def _regime_at(series: Optional["pd.Series"], bar_time) -> str:
+    """查 bar_time 當下的 BTC regime（取最近一筆 ≤ bar_time 的 4h regime）。
+
+    series None 或查無資料時回 "CHOPPY"（保守，與 live fallback 一致）。
+    """
+    if series is None:
+        return "CHOPPY"
+    try:
+        # asof：取 ≤ bar_time 的最後一筆
+        idx = series.index.asof(bar_time)
+        if pd.isna(idx):
+            return "CHOPPY"
+        return series.loc[idx]
+    except Exception:
+        return "CHOPPY"
+
+
+def _regime_allows(regime: str, strategy: str) -> bool:
+    """與 live MarketContext.regime_allows 同邏輯。"""
+    if strategy == "naked_k_fib":
+        return True
+    if regime == "TREND_UP":
+        return strategy == "momentum_long"
+    if regime == "TREND_DOWN":
+        return strategy == "breakdown_short"
+    if regime == "RANGE":
+        return strategy == "mean_reversion"
+    return False
+
+
 # ── K 線下載（幣安期貨）──────────────────────────────────────────
 def fetch_klines(client: Client, symbol: str, interval: str,
                  months: int) -> pd.DataFrame:
@@ -463,7 +566,8 @@ class BacktestMLEngine:
 
 # ── ML 主回測邏輯 ───────────────────────────────────────────────
 def run_backtest_ml(client: Client, symbol: str, months: int,
-                    debug: bool = False) -> list:
+                    debug: bool = False,
+                    regime_series=None) -> list:
     """
     Momentum Long 策略回測：使用 ML_TIMEFRAME K 線逐根回放。
     指標在完整 DataFrame 上一次性計算（向量化 O(n)）。
@@ -499,7 +603,8 @@ def run_backtest_ml(client: Client, symbol: str, months: int,
     timeout_bars = Config.ML_TIMEOUT_BARS
     min_score    = Config.ML_MIN_SCORE
 
-    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
+    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0,
+           "regime_block": 0, "signals": 0}
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -580,6 +685,14 @@ def run_backtest_ml(client: Client, symbol: str, months: int,
         if score < min_score:
             dbg["low_score"] += 1
             continue
+
+        # ── Regime gate（v5：對齊 live MarketContext）──────────
+        if regime_series is not None:
+            bar_time = df_tf["time"].iloc[i]
+            regime = _regime_at(regime_series, bar_time)
+            if not _regime_allows(regime, "momentum_long"):
+                dbg["regime_block"] += 1
+                continue
 
         dbg["signals"] += 1
 
@@ -710,7 +823,8 @@ class BacktestBDEngine:
 
 
 # ── BD 主回測邏輯 ───────────────────────────────────────────────
-def run_backtest_bd(client: Client, symbol: str, months: int,
+def run_backtest_bd(client: Client, symbol: str, months: int, *,
+                    regime_series=None,
                     debug: bool = False) -> list:
     """
     Breakdown Short 策略回測：使用 BD_TIMEFRAME K 線逐根回放。
@@ -828,6 +942,15 @@ def run_backtest_bd(client: Client, symbol: str, months: int,
         if score < min_score:
             dbg["low_score"] += 1
             continue
+
+        # ── Regime gate（v5：對齊 live MarketContext）──────────
+        if regime_series is not None:
+            bar_time = df_tf["time"].iloc[i]
+            regime = _regime_at(regime_series, bar_time)
+            if not _regime_allows(regime, "breakdown_short"):
+                dbg.setdefault("regime_block", 0)
+                dbg["regime_block"] += 1
+                continue
 
         dbg["signals"] += 1
 
@@ -1072,7 +1195,8 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
 
 # ── MR 主回測邏輯 ───────────────────────────────────────────────
 def run_backtest_mr(client: Client, symbol: str, months: int,
-                    debug: bool = False, adx_max: float = 25.0) -> list:
+                    debug: bool = False, adx_max: float = 25.0, *,
+                    regime_series=None) -> list:
     """
     均值回歸策略回測：使用 MR_TIMEFRAME K 線逐根回放。
     指標在完整 DataFrame 上一次性計算（矢量化，O(n) 代替原 O(n²)）。
@@ -1201,6 +1325,15 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
         if score < min_score:
             dbg["low_score"] += 1
             continue
+
+        # ── Regime gate（v5：對齊 live MarketContext）──────────
+        if regime_series is not None:
+            bar_time = df_tf["time"].iloc[i]
+            regime = _regime_at(regime_series, bar_time)
+            if not _regime_allows(regime, "mean_reversion"):
+                dbg.setdefault("regime_block", 0)
+                dbg["regime_block"] += 1
+                continue
 
         # ── TP/SL ────────────────────────────────────────────────
         sl_dist = min(Config.MR_SL_PCT * price, atr_val * 1.0)
@@ -1601,6 +1734,15 @@ def _run_multi_coin_backtest(
     results: dict[tuple[str, str], list] = {}
     timeframes = args.tf or DEFAULT_TF
 
+    # 預先建構 BTC regime 時間序列（除非 --no-regime 關閉）
+    # 這對齊 live MarketContext.regime_allows 的過濾，避免 backtest 結果
+    # 對 ML/BD/MR 過於悲觀（live 已經在 CHOPPY 期間擋掉這些策略）
+    regime_series = None
+    if getattr(args, "use_regime", True) and any(
+        run_flags.get(k) for k in ("ml", "bd", "mr")
+    ):
+        regime_series = _build_btc_regime_series(client, args.months)
+
     for i, sym in enumerate(symbols, 1):
         print(f"\n[{i}/{len(symbols)}] {sym}")
 
@@ -1618,7 +1760,8 @@ def _run_multi_coin_backtest(
         if run_flags.get("mr"):
             try:
                 tr = run_backtest_mr(client, sym, args.months,
-                                     debug=False, adx_max=args.adx_max)
+                                     debug=False, adx_max=args.adx_max,
+                                     regime_series=regime_series)
             except Exception as e:
                 print(f"  [MR] 失敗：{e}")
                 tr = []
@@ -1626,7 +1769,8 @@ def _run_multi_coin_backtest(
 
         if run_flags.get("bd"):
             try:
-                tr = run_backtest_bd(client, sym, args.months, debug=False)
+                tr = run_backtest_bd(client, sym, args.months, debug=False,
+                                     regime_series=regime_series)
             except Exception as e:
                 print(f"  [BD] 失敗：{e}")
                 tr = []
@@ -1634,7 +1778,8 @@ def _run_multi_coin_backtest(
 
         if run_flags.get("ml"):
             try:
-                tr = run_backtest_ml(client, sym, args.months, debug=False)
+                tr = run_backtest_ml(client, sym, args.months, debug=False,
+                                     regime_series=regime_series)
             except Exception as e:
                 print(f"  [ML] 失敗：{e}")
                 tr = []
@@ -1926,6 +2071,9 @@ def main():
                         help="多幣回測：自動抓全市場 USDT 合約成交量前 N 大")
     parser.add_argument("--exclude-stable",  action="store_true", default=True,
                         help="--top-n 時排除穩定幣對（USDC/FDUSD 等）")
+    parser.add_argument("--no-regime",       dest="use_regime",
+                        action="store_false", default=True,
+                        help="多幣模式關閉 regime 模擬（預設 ON，對齊 live）")
     args = parser.parse_args()
 
     timeframes = args.tf or DEFAULT_TF
