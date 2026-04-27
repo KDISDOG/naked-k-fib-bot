@@ -1491,23 +1491,34 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
     return trades
 
 
-# ── SMC 反轉 K 棒判定（backtest helper）─────────────────────────
+# ── SMC 反轉 K 棒嚴格判定（v2：對齊 smc_sweep.py）──────────────
 def _bt_smc_bullish_reversal(df, i: int) -> bool:
+    """
+    Pin bar (lower wick ≥ 50% range) 或強實體陽線 (body ≥ 40% +
+    close 在後 60%) 或 bullish engulfing (with body ≥ 40%)
+    """
     o = float(df["open"].iloc[i])
     h = float(df["high"].iloc[i])
     l = float(df["low"].iloc[i])
     c = float(df["close"].iloc[i])
+    rng = h - l
+    if rng <= 0:
+        return False
     body = abs(c - o)
     lower_wick = min(o, c) - l
-    if body > 0 and lower_wick >= body * 1.5 and c > o:
+    body_ratio  = body / rng
+    lower_ratio = lower_wick / rng
+    close_in_upper = (c - l) / rng
+
+    if lower_ratio >= 0.5 and close_in_upper >= 0.6:
+        return True
+    if c > o and body_ratio >= 0.4 and close_in_upper >= 0.6:
         return True
     if i >= 1:
         po = float(df["open"].iloc[i - 1])
         pc = float(df["close"].iloc[i - 1])
-        if pc < po and c > o and c >= po and o <= pc:
+        if pc < po and c > o and c >= po and o <= pc and body_ratio >= 0.4:
             return True
-    if c > o and (h - max(o, c)) < lower_wick:
-        return True
     return False
 
 
@@ -1516,17 +1527,24 @@ def _bt_smc_bearish_reversal(df, i: int) -> bool:
     h = float(df["high"].iloc[i])
     l = float(df["low"].iloc[i])
     c = float(df["close"].iloc[i])
+    rng = h - l
+    if rng <= 0:
+        return False
     body = abs(c - o)
     upper_wick = h - max(o, c)
-    if body > 0 and upper_wick >= body * 1.5 and c < o:
+    body_ratio  = body / rng
+    upper_ratio = upper_wick / rng
+    close_in_lower = (h - c) / rng
+
+    if upper_ratio >= 0.5 and close_in_lower >= 0.6:
+        return True
+    if c < o and body_ratio >= 0.4 and close_in_lower >= 0.6:
         return True
     if i >= 1:
         po = float(df["open"].iloc[i - 1])
         pc = float(df["close"].iloc[i - 1])
-        if pc > po and c < o and c <= po and o >= pc:
+        if pc > po and c < o and c <= po and o >= pc and body_ratio >= 0.4:
             return True
-    if c < o and (min(o, c) - l) < upper_wick:
-        return True
     return False
 
 
@@ -1591,20 +1609,31 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
             dbg["cooldown"] += 1
             continue
 
+        # v2 修正：sweep 在 i-1（前一根）、confirmation 在 i（當根）
+        # → 等下一根確認方向才入場，避免接刀
+        sweep_idx = i - 1
+        if sweep_idx < right + 5:
+            continue
+
+        sw_high_p = float(df_tf["high"].iloc[sweep_idx])
+        sw_low_p  = float(df_tf["low"].iloc[sweep_idx])
+        sw_close  = float(df_tf["close"].iloc[sweep_idx])
+        sw_vol    = float(df_tf["volume"].iloc[sweep_idx])
+        cur_close = float(df_tf["close"].iloc[i])
         cur_high  = float(df_tf["high"].iloc[i])
         cur_low   = float(df_tf["low"].iloc[i])
-        cur_close = float(df_tf["close"].iloc[i])
         cur_vol   = float(df_tf["volume"].iloc[i])
+
         atr_val   = atr_full.iloc[i] if atr_full is not None else float("nan")
-        avg_vol   = avg_vol_s.iloc[i] if avg_vol_s is not None else float("nan")
+        avg_vol   = avg_vol_s.iloc[sweep_idx] if avg_vol_s is not None else float("nan")
 
         if pd.isna(atr_val) or pd.isna(avg_vol) or float(avg_vol) <= 0:
             continue
         atr_val = float(atr_val)
         avg_vol = float(avg_vol)
 
-        # 在 lookback 內找最近的 swing low/high（必須在 i - right 之前）
-        end_search   = i - right
+        # 找 swing：必須在 sweep_idx - right 之前
+        end_search   = sweep_idx - right
         start_search = max(0, end_search - int(Config.SMC_SWING_LOOKBACK))
         last_sw_low  = None
         last_sw_high = None
@@ -1623,30 +1652,31 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
         side = None
         sweep_level = 0.0
 
-        # LONG sweep
+        # LONG：sweep@i-1 + reversal@i-1 + confirmation@i
         if last_sw_low is not None:
-            sweep_pct = (last_sw_low - cur_low) / last_sw_low if last_sw_low > 0 else 0
-            if sweep_min <= sweep_pct <= sweep_max and cur_close > last_sw_low:
-                if _bt_smc_bullish_reversal(df_tf, i):
-                    if cur_vol >= avg_vol * vol_mult:
-                        side = "LONG"
-                        sweep_level = last_sw_low
+            sweep_pct = (last_sw_low - sw_low_p) / last_sw_low if last_sw_low > 0 else 0
+            if sweep_min <= sweep_pct <= sweep_max and sw_close > last_sw_low:
+                if _bt_smc_bullish_reversal(df_tf, sweep_idx):
+                    if sw_vol >= avg_vol * vol_mult:
+                        if cur_close > sw_close:        # confirmation：續漲
+                            side = "LONG"
+                            sweep_level = last_sw_low
                     else:
                         dbg["no_volume"] += 1
                 else:
                     dbg["no_reversal"] += 1
-            elif cur_low < last_sw_low * (1 - sweep_max):
-                # 刺破過深 = 真破位非 sweep
+            elif sw_low_p < last_sw_low * (1 - sweep_max):
                 dbg["no_sweep"] += 1
 
-        # SHORT sweep
+        # SHORT：sweep@i-1 + reversal@i-1 + confirmation@i
         if side is None and last_sw_high is not None:
-            sweep_pct = (cur_high - last_sw_high) / last_sw_high if last_sw_high > 0 else 0
-            if sweep_min <= sweep_pct <= sweep_max and cur_close < last_sw_high:
-                if _bt_smc_bearish_reversal(df_tf, i):
-                    if cur_vol >= avg_vol * vol_mult:
-                        side = "SHORT"
-                        sweep_level = last_sw_high
+            sweep_pct = (sw_high_p - last_sw_high) / last_sw_high if last_sw_high > 0 else 0
+            if sweep_min <= sweep_pct <= sweep_max and sw_close < last_sw_high:
+                if _bt_smc_bearish_reversal(df_tf, sweep_idx):
+                    if sw_vol >= avg_vol * vol_mult:
+                        if cur_close < sw_close:        # confirmation：續跌
+                            side = "SHORT"
+                            sweep_level = last_sw_high
                     else:
                         dbg["no_volume"] += 1
                 else:
@@ -1656,8 +1686,9 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
             continue
 
         # ── Score（對齊 live SMC._score_signal）─────────────────
+        # v2：用 sweep candle 的量（是訊號當下意義的量）
         score = 1
-        ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+        ratio = sw_vol / avg_vol if avg_vol > 0 else 1.0
         if ratio >= 2.5:
             score += 2
         elif ratio >= 1.5:

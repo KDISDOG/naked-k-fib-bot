@@ -252,7 +252,7 @@ class Config:
     SMC_VOL_MULT        = float(os.getenv("SMC_VOL_MULT", 1.3))       # 入場 K 棒量能下限倍數
     SMC_SL_BUFFER       = float(os.getenv("SMC_SL_BUFFER", 0.5))      # SL 在刺破點外側 0.5×ATR
     SMC_MIN_SCORE       = int(os.getenv("SMC_MIN_SCORE", 3))          # 最低訊號評分
-    SMC_TIMEOUT_BARS    = int(os.getenv("SMC_TIMEOUT_BARS", 12))      # 1h × 12 = 12h
+    SMC_TIMEOUT_BARS    = int(os.getenv("SMC_TIMEOUT_BARS", 24))      # 1h × 24 = 24h（v2：12→24，給 sweep 反轉時間）
     SMC_MIN_RR          = float(os.getenv("SMC_MIN_RR", 1.5))         # 最低 R:R
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]

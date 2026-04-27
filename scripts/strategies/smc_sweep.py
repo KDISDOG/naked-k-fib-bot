@@ -194,38 +194,41 @@ class SMCSweepStrategy(BaseStrategy):
         if len(df) < 60:
             return None
 
-        # 用倒數第二根（已收盤）作為「觸發 K 棒」
+        # 用倒數第二根作為「觸發 K 棒」(confirmation)，倒數第三根才是 sweep
+        # v2 修正：sweep 在前一根 → 等下一根確認方向 → 才入場（避免接刀）
         df_a = df.iloc[:-1].copy().reset_index(drop=True)
         if len(df_a) < 50:
             return None
 
-        # 觸發 K 棒
-        latest = df_a.iloc[-1]
-        cur_open  = float(latest["open"])
-        cur_high  = float(latest["high"])
-        cur_low   = float(latest["low"])
-        cur_close = float(latest["close"])
-        cur_vol   = float(latest["volume"])
+        # confirmation candle (i)：當前要進場的 K 棒
+        trig = df_a.iloc[-1]
+        # sweep candle (i-1)：發生 sweep + 反轉 K 棒形態的那根
+        sweep = df_a.iloc[-2]
+        # sweep 之前一根（給 engulfing 比較用）
+        prev_sweep = df_a.iloc[-3] if len(df_a) >= 3 else None
 
-        # 量能基準：前 20 根均量（不含當根）
-        avg_vol = float(df_a["volume"].tail(21).iloc[:-1].mean())
+        cur_close = float(trig["close"])
+        sw_low_p  = float(sweep["low"])
+        sw_high_p = float(sweep["high"])
+        sw_close  = float(sweep["close"])
+        sw_vol    = float(sweep["volume"])
+
+        # 量能基準：sweep 之前 20 根均量
+        avg_vol = float(df_a["volume"].iloc[-22:-2].mean())
         if avg_vol <= 0:
             return None
-        vol_ok = cur_vol >= avg_vol * Config.SMC_VOL_MULT
+        vol_ok = sw_vol >= avg_vol * Config.SMC_VOL_MULT
 
-        # ── 找 swing low / high（在當根之前的 lookback 範圍）─────
+        # ── 找 swing low / high（在 sweep 之前的 lookback 範圍）──
         lookback = int(Config.SMC_SWING_LOOKBACK)
-        # 排除最後 SMC_SWING_RIGHT 根（fractal 需要右側確認，否則
-        # 「當根」自己就是 swing 沒意義）
         right_buffer = int(Config.SMC_SWING_RIGHT)
-        end_idx = len(df_a) - 1 - right_buffer
+        # 結束位置必須在 sweep 之前 right_buffer 根（fractal 確認）
+        end_idx = len(df_a) - 2 - right_buffer
         start_idx = max(0, end_idx - lookback)
         if end_idx - start_idx < 5:
             return None
 
         win = df_a.iloc[start_idx:end_idx + 1]
-
-        # swing low/high 用簡化 fractal：左 N 右 right_buffer 根
         left = int(Config.SMC_SWING_LEFT)
         sw_lows  = self._find_fractal_levels(win, "low", left, right_buffer)
         sw_highs = self._find_fractal_levels(win, "high", left, right_buffer)
@@ -233,45 +236,42 @@ class SMCSweepStrategy(BaseStrategy):
         if not sw_lows and not sw_highs:
             return None
 
-        # 取最近的 swing low/high
-        last_sw_low  = max(sw_lows)  if sw_lows  else None  # max → 最近
-        last_sw_high = min(sw_highs) if sw_highs else None  # min → 最近
-        # （上面 max/min 取的是「最高/低的價格」，但我們要最近的「位置」）
-        # 改用 list[-1] 取最近一個（已按時間順序）
         last_sw_low  = sw_lows[-1] if sw_lows else None
         last_sw_high = sw_highs[-1] if sw_highs else None
 
         side: Optional[str] = None
         sweep_level: float = 0.0
+        sweep_min = float(Config.SMC_SWEEP_MIN_PCT)
+        sweep_max = float(Config.SMC_SWEEP_MAX_PCT)
 
-        # ── LONG：sweep swing low ────────────────────────────
-        if last_sw_low is not None:
-            sweep_pct = (last_sw_low - cur_low) / last_sw_low if last_sw_low > 0 else 0
-            sweep_min = float(Config.SMC_SWEEP_MIN_PCT)
-            sweep_max = float(Config.SMC_SWEEP_MAX_PCT)
-            # 條件：刺破幅度在 [min, max] 範圍 + close 回到 sw_low 之上
-            #       + 反轉 K 棒（lower wick ≥ 1.5× body 或 bullish engulfing）
+        # ── LONG：sweep swing low + reversal candle + 確認上行 ──
+        if last_sw_low is not None and last_sw_low > 0:
+            sweep_pct = (last_sw_low - sw_low_p) / last_sw_low
             if (sweep_min <= sweep_pct <= sweep_max
-                    and cur_close > last_sw_low
-                    and self._is_bullish_reversal_candle(df_a)):
-                if vol_ok:
-                    side = "LONG"
-                    sweep_level = last_sw_low
+                    and sw_close > last_sw_low                      # sweep 收盤回到上方
+                    and self._is_strong_bullish_reversal(sweep, prev_sweep)
+                    and vol_ok
+                    and cur_close > sw_close):                      # confirmation：續漲
+                side = "LONG"
+                sweep_level = last_sw_low
 
-        # ── SHORT：sweep swing high ──────────────────────────
-        if side is None and last_sw_high is not None:
-            sweep_pct = (cur_high - last_sw_high) / last_sw_high if last_sw_high > 0 else 0
-            sweep_min = float(Config.SMC_SWEEP_MIN_PCT)
-            sweep_max = float(Config.SMC_SWEEP_MAX_PCT)
+        # ── SHORT：sweep swing high + reversal candle + 確認下行 ──
+        if side is None and last_sw_high is not None and last_sw_high > 0:
+            sweep_pct = (sw_high_p - last_sw_high) / last_sw_high
             if (sweep_min <= sweep_pct <= sweep_max
-                    and cur_close < last_sw_high
-                    and self._is_bearish_reversal_candle(df_a)):
-                if vol_ok:
-                    side = "SHORT"
-                    sweep_level = last_sw_high
+                    and sw_close < last_sw_high
+                    and self._is_strong_bearish_reversal(sweep, prev_sweep)
+                    and vol_ok
+                    and cur_close < sw_close):                      # confirmation：續跌
+                side = "SHORT"
+                sweep_level = last_sw_high
 
         if side is None:
             return None
+
+        cur_high = float(trig["high"])
+        cur_low  = float(trig["low"])
+        cur_vol  = float(trig["volume"])
 
         # ── 訊號評分 ─────────────────────────────────────────────
         score = self._score_signal(
@@ -339,45 +339,61 @@ class SMCSweepStrategy(BaseStrategy):
                     out.append(float(arr[i]))
         return out
 
-    # ── 反轉 K 棒判定 ────────────────────────────────────────────
+    # ── 反轉 K 棒嚴格判定（v2：解決原 39% win 主因之一）─────────
+    # 三種型態擇一即視為反轉：
+    #   (a) Pin bar / hammer: 反向影線 ≥ 50% range + close 在順向後 60%
+    #   (b) 強實體：body ≥ 40% range + close 在順向後 60%
+    #   (c) Engulfing：吞噬前一根 + body ≥ 40%
     @staticmethod
-    def _is_bullish_reversal_candle(df: pd.DataFrame) -> bool:
-        """LONG：lower wick ≥ 1.5× body（pinbar）或 bullish engulfing"""
-        c = df.iloc[-1]
-        o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+    def _is_strong_bullish_reversal(c, prev=None) -> bool:
+        o = float(c["open"]); h = float(c["high"])
+        l = float(c["low"]);  cl = float(c["close"])
+        rng = h - l
+        if rng <= 0:
+            return False
         body = abs(cl - o)
         lower_wick = min(o, cl) - l
-        if body > 0 and lower_wick >= body * 1.5 and cl > o:
-            # pinbar / hammer
+        body_ratio  = body / rng
+        lower_ratio = lower_wick / rng
+        close_in_upper = (cl - l) / rng  # 0.6+ = 在上 40%
+
+        # (a) Pin bar
+        if lower_ratio >= 0.5 and close_in_upper >= 0.6:
             return True
-        # bullish engulfing
-        if len(df) >= 2:
-            p = df.iloc[-2]
-            po, pcl = float(p["open"]), float(p["close"])
-            if pcl < po and cl > o and cl >= po and o <= pcl:
+        # (b) 強實體陽線
+        if cl > o and body_ratio >= 0.4 and close_in_upper >= 0.6:
+            return True
+        # (c) Bullish engulfing
+        if prev is not None:
+            po = float(prev["open"]); pcl = float(prev["close"])
+            if pcl < po and cl > o and cl >= po and o <= pcl and body_ratio >= 0.4:
                 return True
-        # 至少：陽線 + 上引短於下影
-        if cl > o and (h - max(o, cl)) < lower_wick:
-            return True
         return False
 
     @staticmethod
-    def _is_bearish_reversal_candle(df: pd.DataFrame) -> bool:
-        """SHORT：upper wick ≥ 1.5× body 或 bearish engulfing"""
-        c = df.iloc[-1]
-        o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+    def _is_strong_bearish_reversal(c, prev=None) -> bool:
+        o = float(c["open"]); h = float(c["high"])
+        l = float(c["low"]);  cl = float(c["close"])
+        rng = h - l
+        if rng <= 0:
+            return False
         body = abs(cl - o)
         upper_wick = h - max(o, cl)
-        if body > 0 and upper_wick >= body * 1.5 and cl < o:
+        body_ratio  = body / rng
+        upper_ratio = upper_wick / rng
+        close_in_lower = (h - cl) / rng
+
+        # (a) Shooting star / hanging man
+        if upper_ratio >= 0.5 and close_in_lower >= 0.6:
             return True
-        if len(df) >= 2:
-            p = df.iloc[-2]
-            po, pcl = float(p["open"]), float(p["close"])
-            if pcl > po and cl < o and cl <= po and o >= pcl:
+        # (b) 強實體陰線
+        if cl < o and body_ratio >= 0.4 and close_in_lower >= 0.6:
+            return True
+        # (c) Bearish engulfing
+        if prev is not None:
+            po = float(prev["open"]); pcl = float(prev["close"])
+            if pcl > po and cl < o and cl <= po and o >= pcl and body_ratio >= 0.4:
                 return True
-        # 至少：陰線 + 下引短於上影
-        if cl < o and (min(o, cl) - l) < upper_wick:
-            return True
         return False
 
     # ── 訊號評分 ─────────────────────────────────────────────────
