@@ -1614,10 +1614,13 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
             df_htf = fetch_klines(client, symbol, htf_tf, months + 2)
             if len(df_htf) >= htf_period + 5:
                 htf_ema = ta.ema(df_htf["close"], length=htf_period)
-                # asof 對齊：每個 1h bar 的 open time 找最近的 4h close_time ≤ it
-                # (close_time < 1h_open → 該 4h 已收盤、資料可用)
+                # 重要：fetch_klines 的 close_time 仍是 int64 ms，必須
+                # 轉為 datetime 才能跟 df_tf["time"]（datetime）merge_asof，
+                # 否則 silent fail 導致 HTF 過濾不生效（v3 bug）
                 df_htf_aligned = pd.DataFrame({
-                    "close_time": df_htf["close_time"],
+                    "close_time": pd.to_datetime(
+                        df_htf["close_time"], unit="ms"
+                    ),
                     "htf_close":  df_htf["close"].values,
                     "htf_ema":    htf_ema.values,
                 }).dropna()
@@ -1633,7 +1636,12 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
                 merged = merged.sort_values("_orig_idx").reset_index(drop=True)
                 htf_close_arr = merged["htf_close"].values
                 htf_ema_arr   = merged["htf_ema"].values
-                print(" 完成")
+                # 驗證至少有效資料 ≥ warmup 後總根數的 50%
+                valid_pct = (
+                    int((~merged["htf_close"].isna()).sum())
+                    / max(len(merged), 1) * 100
+                )
+                print(f" 完成（{valid_pct:.0f}% 有效）")
             else:
                 print(" 資料不足，HTF 過濾停用")
         except Exception as e:
