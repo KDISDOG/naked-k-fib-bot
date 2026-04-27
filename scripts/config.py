@@ -254,6 +254,11 @@ class Config:
     SMC_MIN_SCORE       = int(os.getenv("SMC_MIN_SCORE", 3))          # 最低訊號評分
     SMC_TIMEOUT_BARS    = int(os.getenv("SMC_TIMEOUT_BARS", 24))      # 1h × 24 = 24h（v2：12→24，給 sweep 反轉時間）
     SMC_MIN_RR          = float(os.getenv("SMC_MIN_RR", 1.5))         # 最低 R:R
+    # SMC v3 HTF 趨勢過濾：4h EMA50 必須與交易方向同向
+    # 過濾掉 BTC/SOL/HYPE/DOGE 在 4h chop 期間的雜訊 sweep
+    SMC_HTF_FILTER_ENABLED = os.getenv("SMC_HTF_FILTER_ENABLED", "true").lower() == "true"
+    SMC_HTF_TIMEFRAME      = os.getenv("SMC_HTF_TIMEFRAME", "4h")
+    SMC_HTF_EMA_PERIOD     = int(os.getenv("SMC_HTF_EMA_PERIOD", 50))
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限

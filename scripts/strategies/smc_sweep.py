@@ -269,6 +269,35 @@ class SMCSweepStrategy(BaseStrategy):
         if side is None:
             return None
 
+        # ── HTF（4h EMA50）趨勢過濾（v3）─────────────────────────
+        # 回測證據：BTC/SOL/HYPE/DOGE 在 4h chop 期間 sweep 多為雜訊。
+        # 要求 sweep 方向與 4h 大趨勢同向，過濾這類無效訊號。
+        if getattr(Config, "SMC_HTF_FILTER_ENABLED", True):
+            try:
+                htf_tf     = getattr(Config, "SMC_HTF_TIMEFRAME", "4h")
+                htf_period = int(getattr(Config, "SMC_HTF_EMA_PERIOD", 50))
+                df_htf = self._get_klines(symbol, htf_tf, limit=htf_period + 30)
+                if len(df_htf) >= htf_period + 5:
+                    htf_ema = ta.ema(df_htf["close"], length=htf_period)
+                    # 用倒數第二根（已收盤確認）
+                    htf_close = float(df_htf["close"].iloc[-2])
+                    htf_ema_v = float(htf_ema.iloc[-2]) if htf_ema is not None else float("nan")
+                    if not (pd.isna(htf_close) or pd.isna(htf_ema_v)):
+                        if side == "LONG" and htf_close <= htf_ema_v:
+                            log.debug(
+                                f"[{symbol}] SMC LONG 被 HTF 過濾："
+                                f"4h close={htf_close:.4f} ≤ EMA{htf_period}={htf_ema_v:.4f}"
+                            )
+                            return None
+                        if side == "SHORT" and htf_close >= htf_ema_v:
+                            log.debug(
+                                f"[{symbol}] SMC SHORT 被 HTF 過濾："
+                                f"4h close={htf_close:.4f} ≥ EMA{htf_period}={htf_ema_v:.4f}"
+                            )
+                            return None
+            except Exception as e:
+                log.debug(f"[{symbol}] SMC HTF 檢查失敗（fail-open，略過）: {e}")
+
         cur_high = float(trig["high"])
         cur_low  = float(trig["low"])
         cur_vol  = float(trig["volume"])

@@ -1600,7 +1600,46 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
 
     dbg = {"cooldown": 0, "no_swing": 0, "no_sweep": 0,
            "no_reversal": 0, "no_volume": 0, "low_score": 0,
-           "bad_pos": 0, "signals": 0}
+           "bad_pos": 0, "htf_block": 0, "signals": 0}
+
+    # ── HTF (4h EMA50) 趨勢過濾預計算 ───────────────────────────
+    htf_enabled = bool(getattr(Config, "SMC_HTF_FILTER_ENABLED", True))
+    htf_close_arr = None
+    htf_ema_arr   = None
+    if htf_enabled:
+        try:
+            htf_tf      = getattr(Config, "SMC_HTF_TIMEFRAME", "4h")
+            htf_period  = int(getattr(Config, "SMC_HTF_EMA_PERIOD", 50))
+            print(f"  下載 HTF {htf_tf} 計算 EMA{htf_period}...", end="", flush=True)
+            df_htf = fetch_klines(client, symbol, htf_tf, months + 2)
+            if len(df_htf) >= htf_period + 5:
+                htf_ema = ta.ema(df_htf["close"], length=htf_period)
+                # asof 對齊：每個 1h bar 的 open time 找最近的 4h close_time ≤ it
+                # (close_time < 1h_open → 該 4h 已收盤、資料可用)
+                df_htf_aligned = pd.DataFrame({
+                    "close_time": df_htf["close_time"],
+                    "htf_close":  df_htf["close"].values,
+                    "htf_ema":    htf_ema.values,
+                }).dropna()
+                df_1h_idx = df_tf[["time"]].copy()
+                df_1h_idx["_orig_idx"] = range(len(df_1h_idx))
+                merged = pd.merge_asof(
+                    df_1h_idx.sort_values("time"),
+                    df_htf_aligned.sort_values("close_time"),
+                    left_on="time",
+                    right_on="close_time",
+                    direction="backward",
+                )
+                merged = merged.sort_values("_orig_idx").reset_index(drop=True)
+                htf_close_arr = merged["htf_close"].values
+                htf_ema_arr   = merged["htf_ema"].values
+                print(" 完成")
+            else:
+                print(" 資料不足，HTF 過濾停用")
+        except Exception as e:
+            print(f" 失敗（{e}），HTF 過濾停用")
+            htf_close_arr = None
+            htf_ema_arr   = None
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -1684,6 +1723,22 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
 
         if side is None:
             continue
+
+        # ── HTF（4h EMA50）趨勢過濾（v3）─────────────────────────
+        if htf_close_arr is not None and htf_ema_arr is not None:
+            htf_c = htf_close_arr[i] if i < len(htf_close_arr) else None
+            htf_e = htf_ema_arr[i]   if i < len(htf_ema_arr)   else None
+            if htf_c is None or htf_e is None or pd.isna(htf_c) or pd.isna(htf_e):
+                # 無 HTF 資料 → fail-open（不擋）
+                pass
+            else:
+                htf_c = float(htf_c); htf_e = float(htf_e)
+                if side == "LONG" and htf_c <= htf_e:
+                    dbg["htf_block"] += 1
+                    continue
+                if side == "SHORT" and htf_c >= htf_e:
+                    dbg["htf_block"] += 1
+                    continue
 
         # ── Score（對齊 live SMC._score_signal）─────────────────
         # v2：用 sweep candle 的量（是訊號當下意義的量）
@@ -1786,6 +1841,7 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
         print(f"  ├─ 量能不足           ：{dbg['no_volume']} 根")
         print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根")
         print(f"  ├─ R:R 過低 / SL 異常  ：{dbg['bad_pos']} 根")
+        print(f"  ├─ HTF 趨勢過濾擋下    ：{dbg['htf_block']} 根")
         print(f"  └─ 通過全部過濾       ：{dbg['signals']} 根")
     return trades
 
