@@ -1354,18 +1354,27 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
             dbg["no_sig"] += 1
             continue
 
-        # ── 結構性過濾（v5：對齊 mean_reversion.py 的 hard filters）──
-        if getattr(Config, "MR_REQUIRE_DIVERGENCE", True):
-            div_lookback = int(getattr(Config, "MR_DIV_LOOKBACK", 20))
-            if not _bt_has_rsi_divergence(df_tf, rsi_s, i, side, div_lookback):
-                dbg["no_div"] += 1
-                continue
-
-        if getattr(Config, "MR_REQUIRE_SR_TEST", True):
-            sr_lookback = int(getattr(Config, "MR_SR_LOOKBACK", 30))
-            sr_tol = float(getattr(Config, "MR_SR_TOLERANCE", 0.015))
-            if not _bt_has_sr_test(df_tf, i, side, sr_lookback, sr_tol):
-                dbg["no_sr"] += 1
+        # ── 結構性過濾（v5：對齊 mean_reversion.py）─────────────
+        # MR_STRUCTURAL_REQUIRED：0/1/2，至少幾道過濾通過才放行
+        required = int(getattr(Config, "MR_STRUCTURAL_REQUIRED", 1))
+        if required > 0:
+            has_div = False
+            has_sr  = False
+            if getattr(Config, "MR_REQUIRE_DIVERGENCE", True):
+                div_lookback = int(getattr(Config, "MR_DIV_LOOKBACK", 20))
+                has_div = _bt_has_rsi_divergence(
+                    df_tf, rsi_s, i, side, div_lookback
+                )
+            if getattr(Config, "MR_REQUIRE_SR_TEST", True):
+                sr_lookback = int(getattr(Config, "MR_SR_LOOKBACK", 30))
+                sr_tol = float(getattr(Config, "MR_SR_TOLERANCE", 0.015))
+                has_sr = _bt_has_sr_test(df_tf, i, side, sr_lookback, sr_tol)
+            confirmations = int(has_div) + int(has_sr)
+            if confirmations < required:
+                if not has_div:
+                    dbg["no_div"] += 1
+                if not has_sr:
+                    dbg["no_sr"] += 1
                 continue
 
         # ── 評分（同正式 _score_signal：base=1, RSI極端+1, BB超出+1, StochRSI+1, MACD背離+1）

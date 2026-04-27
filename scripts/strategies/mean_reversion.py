@@ -264,25 +264,26 @@ class MeanReversionStrategy(BaseStrategy):
             return None
 
         # ── 結構性過濾（v5：根因解 MR 邊際負期望）──────────────
-        # 之前 MR 44% win × R:R 1.14 → 微負期望，主因「無結構盲接 RSI 訊號」。
-        # 加兩道硬門檻：
-        #   1. 正規 RSI 背離（價格 LL + RSI HL）→ 動能轉強早期訊號
-        #   2. 接近結構性 S/R 區（最近 swing low/high）→ 確認有支撐
-        # 預期：訊號量 -60~70%，但勝率從 44% → 50%+，期望值由負轉正。
-
-        if getattr(Config, "MR_REQUIRE_DIVERGENCE", True):
-            div_lookback = int(getattr(Config, "MR_DIV_LOOKBACK", 20))
-            if not self._has_rsi_divergence(df_a, rsi, side, div_lookback):
-                log.debug(f"[{symbol}] MR {side} 無 RSI 背離（lookback={div_lookback}），跳過")
-                return None
-
-        if getattr(Config, "MR_REQUIRE_SR_TEST", True):
-            sr_lookback = int(getattr(Config, "MR_SR_LOOKBACK", 30))
-            sr_tol = float(getattr(Config, "MR_SR_TOLERANCE", 0.015))
-            if not self._has_sr_test(df_a, side, sr_lookback, sr_tol):
+        # 兩道過濾：RSI 背離 / 接近 S/R。MR_STRUCTURAL_REQUIRED 控制：
+        #   0 = 都不擋（與舊行為相同）
+        #   1 = 至少一道（推薦默認，過濾雜訊保留訊號量）
+        #   2 = 兩道都要（嚴格，可能訊號太少）
+        required = int(getattr(Config, "MR_STRUCTURAL_REQUIRED", 1))
+        if required > 0:
+            has_div = False
+            has_sr  = False
+            if getattr(Config, "MR_REQUIRE_DIVERGENCE", True):
+                div_lookback = int(getattr(Config, "MR_DIV_LOOKBACK", 20))
+                has_div = self._has_rsi_divergence(df_a, rsi, side, div_lookback)
+            if getattr(Config, "MR_REQUIRE_SR_TEST", True):
+                sr_lookback = int(getattr(Config, "MR_SR_LOOKBACK", 30))
+                sr_tol = float(getattr(Config, "MR_SR_TOLERANCE", 0.015))
+                has_sr = self._has_sr_test(df_a, side, sr_lookback, sr_tol)
+            confirmations = int(has_div) + int(has_sr)
+            if confirmations < required:
                 log.debug(
-                    f"[{symbol}] MR {side} 未測試到結構性 S/R "
-                    f"(lookback={sr_lookback} tol={sr_tol*100:.1f}%)，跳過"
+                    f"[{symbol}] MR {side} 結構過濾不足："
+                    f"div={has_div} sr={has_sr} 共 {confirmations} < {required}"
                 )
                 return None
 

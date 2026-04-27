@@ -226,11 +226,19 @@ class Config:
     BD_REL_STRENGTH_MIN_DIFF = float(os.getenv("BD_REL_STRENGTH_MIN_DIFF", 1.0))  # % 單位
 
     # MR 結構性確認（v5）：避免單純 RSI 觸發在無 S/R 區的雜訊位
-    MR_REQUIRE_DIVERGENCE = os.getenv("MR_REQUIRE_DIVERGENCE", "true").lower() == "true"
-    MR_REQUIRE_SR_TEST    = os.getenv("MR_REQUIRE_SR_TEST", "true").lower() == "true"
-    MR_DIV_LOOKBACK       = int(os.getenv("MR_DIV_LOOKBACK", 20))   # 找 swing low/high 的回看根數
-    MR_SR_LOOKBACK        = int(os.getenv("MR_SR_LOOKBACK", 30))    # 找關鍵 S/R 的回看根數
-    MR_SR_TOLERANCE       = float(os.getenv("MR_SR_TOLERANCE", 0.015))  # 1.5% 容忍貼合度
+    # 兩道過濾：
+    #   1. _has_rsi_divergence：價格 LL/HH + RSI HL/LH（≥2 點 RSI 差）
+    #   2. _has_sr_test：當前 close 接近最近 swing low/high（±tolerance）
+    # MR_STRUCTURAL_REQUIRED：需通過幾道才放行
+    #   0 = 都不擋（純 RSI/BB 觸發）
+    #   1 = 至少一道（默認、推薦）— 過濾雜訊但保留訊號量
+    #   2 = 兩道都要（嚴格、可能訊號太少）
+    MR_REQUIRE_DIVERGENCE  = os.getenv("MR_REQUIRE_DIVERGENCE", "true").lower() == "true"
+    MR_REQUIRE_SR_TEST     = os.getenv("MR_REQUIRE_SR_TEST", "true").lower() == "true"
+    MR_STRUCTURAL_REQUIRED = int(os.getenv("MR_STRUCTURAL_REQUIRED", 1))  # 0/1/2
+    MR_DIV_LOOKBACK        = int(os.getenv("MR_DIV_LOOKBACK", 20))   # 找 swing low/high 的回看根數
+    MR_SR_LOOKBACK         = int(os.getenv("MR_SR_LOOKBACK", 30))    # 找關鍵 S/R 的回看根數
+    MR_SR_TOLERANCE        = float(os.getenv("MR_SR_TOLERANCE", 0.015))  # 1.5% 容忍貼合度
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限
