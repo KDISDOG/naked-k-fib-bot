@@ -267,6 +267,11 @@ class Config:
     # SMC v4 排除清單：個別幣 SL 平均虧太深（gap risk / 流動性差）
     # 預設只擋 HYPEUSDT（回測 8 單 50% win 但 worst -3.37 = 33% margin）
     SMC_EXCLUDED_SYMBOLS = os.getenv("SMC_EXCLUDED_SYMBOLS", "HYPEUSDT")
+
+    # SMC v5 HTF 斜率過濾：4h EMA50 必須正在朝交易方向移動
+    # 「close > EMA + 0.5%」還可能在 chop 反彈中；要 EMA 本身也在上升才是真趨勢
+    SMC_HTF_REQUIRE_SLOPE = os.getenv("SMC_HTF_REQUIRE_SLOPE", "true").lower() == "true"
+    SMC_HTF_SLOPE_BARS    = int(os.getenv("SMC_HTF_SLOPE_BARS", 5))    # 算斜率的回看根數
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限

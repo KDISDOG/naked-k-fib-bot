@@ -1614,14 +1614,19 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
     htf_enabled = bool(getattr(Config, "SMC_HTF_FILTER_ENABLED", True))
     htf_close_arr = None
     htf_ema_arr   = None
+    htf_slope_arr = None  # v5：EMA50 斜率系列
     if htf_enabled:
         try:
             htf_tf      = getattr(Config, "SMC_HTF_TIMEFRAME", "4h")
             htf_period  = int(getattr(Config, "SMC_HTF_EMA_PERIOD", 50))
             print(f"  下載 HTF {htf_tf} 計算 EMA{htf_period}...", end="", flush=True)
+            slope_bars = int(getattr(Config, "SMC_HTF_SLOPE_BARS", 5))
             df_htf = fetch_klines(client, symbol, htf_tf, months + 2)
-            if len(df_htf) >= htf_period + 5:
+            if len(df_htf) >= htf_period + slope_bars + 5:
                 htf_ema = ta.ema(df_htf["close"], length=htf_period)
+                # v5：算 EMA 斜率（pct）— 過去 slope_bars 根 EMA 的相對變動
+                htf_ema_past = htf_ema.shift(slope_bars)
+                htf_slope = (htf_ema - htf_ema_past) / htf_ema_past
                 # 重要：fetch_klines 的 close_time 仍是 int64 ms，必須
                 # 轉為 datetime 才能跟 df_tf["time"]（datetime）merge_asof，
                 # 否則 silent fail 導致 HTF 過濾不生效（v3 bug）
@@ -1631,6 +1636,7 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
                     ),
                     "htf_close":  df_htf["close"].values,
                     "htf_ema":    htf_ema.values,
+                    "htf_slope":  htf_slope.values,
                 }).dropna()
                 df_1h_idx = df_tf[["time"]].copy()
                 df_1h_idx["_orig_idx"] = range(len(df_1h_idx))
@@ -1644,6 +1650,7 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
                 merged = merged.sort_values("_orig_idx").reset_index(drop=True)
                 htf_close_arr = merged["htf_close"].values
                 htf_ema_arr   = merged["htf_ema"].values
+                htf_slope_arr = merged["htf_slope"].values
                 # 驗證至少有效資料 ≥ warmup 後總根數的 50%
                 valid_pct = (
                     int((~merged["htf_close"].isna()).sum())
@@ -1740,7 +1747,7 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
         if side is None:
             continue
 
-        # ── HTF（4h EMA50）趨勢過濾（v3 + v4 嚴格化）────────────
+        # ── HTF（4h EMA50）趨勢過濾（v3+v4+v5）─────────────────
         if htf_close_arr is not None and htf_ema_arr is not None:
             htf_c = htf_close_arr[i] if i < len(htf_close_arr) else None
             htf_e = htf_ema_arr[i]   if i < len(htf_ema_arr)   else None
@@ -1760,6 +1767,19 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
                 if side == "SHORT" and htf_c > lower_thr:
                     dbg["htf_block"] += 1
                     continue
+
+                # v5：EMA50 斜率方向確認
+                if (htf_slope_arr is not None
+                        and getattr(Config, "SMC_HTF_REQUIRE_SLOPE", True)):
+                    htf_s = htf_slope_arr[i] if i < len(htf_slope_arr) else None
+                    if htf_s is not None and not pd.isna(htf_s):
+                        slope = float(htf_s)
+                        if side == "LONG" and slope <= 0:
+                            dbg["htf_block"] += 1
+                            continue
+                        if side == "SHORT" and slope >= 0:
+                            dbg["htf_block"] += 1
+                            continue
 
         # ── Score（對齊 live SMC._score_signal）─────────────────
         # v2：用 sweep candle 的量（是訊號當下意義的量）

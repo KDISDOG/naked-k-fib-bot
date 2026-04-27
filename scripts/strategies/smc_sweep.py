@@ -279,16 +279,22 @@ class SMCSweepStrategy(BaseStrategy):
         if side is None:
             return None
 
-        # ── HTF（4h EMA50）趨勢過濾（v3 + v4 嚴格化）────────────
-        # v3：要求 sweep 方向與 4h 大趨勢同向
-        # v4：再加「離 EMA 至少 X%」過濾貼 EMA 的 chop（同向但無趨勢動能）
+        # ── HTF（4h EMA50）趨勢過濾（v3+v4+v5）─────────────────
+        # v3：要求 sweep 方向與 4h 大趨勢同向（close vs EMA 位置）
+        # v4：再加「離 EMA 至少 X%」過濾貼 EMA 的 chop
+        # v5：再加 EMA 斜率方向確認（趨勢正在進行中，不是末段反彈）
         if getattr(Config, "SMC_HTF_FILTER_ENABLED", True):
             try:
                 htf_tf     = getattr(Config, "SMC_HTF_TIMEFRAME", "4h")
                 htf_period = int(getattr(Config, "SMC_HTF_EMA_PERIOD", 50))
                 min_dist   = float(getattr(Config, "SMC_HTF_MIN_DISTANCE_PCT", 0.005))
-                df_htf = self._get_klines(symbol, htf_tf, limit=htf_period + 30)
-                if len(df_htf) >= htf_period + 5:
+                req_slope  = bool(getattr(Config, "SMC_HTF_REQUIRE_SLOPE", True))
+                slope_bars = int(getattr(Config, "SMC_HTF_SLOPE_BARS", 5))
+                df_htf = self._get_klines(
+                    symbol, htf_tf,
+                    limit=htf_period + slope_bars + 30,
+                )
+                if len(df_htf) >= htf_period + slope_bars + 3:
                     htf_ema = ta.ema(df_htf["close"], length=htf_period)
                     htf_close = float(df_htf["close"].iloc[-2])
                     htf_ema_v = float(htf_ema.iloc[-2]) if htf_ema is not None else float("nan")
@@ -297,18 +303,36 @@ class SMCSweepStrategy(BaseStrategy):
                         lower_thr = htf_ema_v * (1 - min_dist)
                         if side == "LONG" and htf_close < upper_thr:
                             log.debug(
-                                f"[{symbol}] SMC LONG HTF 過濾："
-                                f"4h close={htf_close:.4f} < EMA×(1+{min_dist:.3f})="
-                                f"{upper_thr:.4f}"
+                                f"[{symbol}] SMC LONG HTF 距離過濾："
+                                f"4h close={htf_close:.4f} < EMA×1.005={upper_thr:.4f}"
                             )
                             return None
                         if side == "SHORT" and htf_close > lower_thr:
                             log.debug(
-                                f"[{symbol}] SMC SHORT HTF 過濾："
-                                f"4h close={htf_close:.4f} > EMA×(1-{min_dist:.3f})="
-                                f"{lower_thr:.4f}"
+                                f"[{symbol}] SMC SHORT HTF 距離過濾："
+                                f"4h close={htf_close:.4f} > EMA×0.995={lower_thr:.4f}"
                             )
                             return None
+
+                        # v5 斜率過濾
+                        if req_slope:
+                            ema_now = htf_ema_v
+                            ema_past = float(htf_ema.iloc[-2 - slope_bars])
+                            if not pd.isna(ema_past) and ema_past > 0:
+                                slope_pct = (ema_now - ema_past) / ema_past
+                                # LONG 要求 EMA 正在上升、SHORT 要求下降
+                                if side == "LONG" and slope_pct <= 0:
+                                    log.debug(
+                                        f"[{symbol}] SMC LONG HTF 斜率過濾："
+                                        f"EMA50 過去 {slope_bars} 根 slope={slope_pct*100:+.3f}%"
+                                    )
+                                    return None
+                                if side == "SHORT" and slope_pct >= 0:
+                                    log.debug(
+                                        f"[{symbol}] SMC SHORT HTF 斜率過濾："
+                                        f"EMA50 過去 {slope_bars} 根 slope={slope_pct*100:+.3f}%"
+                                    )
+                                    return None
             except Exception as e:
                 log.debug(f"[{symbol}] SMC HTF 檢查失敗（fail-open，略過）: {e}")
 
