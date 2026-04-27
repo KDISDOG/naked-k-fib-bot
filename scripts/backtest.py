@@ -94,6 +94,70 @@ class BtTrade:
     strategy:   str  = "naked_k_fib"
 
 
+# ── MR 結構性過濾 helper（v5：對齊 mean_reversion.py 的 _has_*）────
+def _bt_has_rsi_divergence(df, rsi_series, i: int, side: str,
+                           lookback: int = 20) -> bool:
+    """
+    RSI 背離偵測（bar i 為當前根，回看 lookback 根找 swing）：
+      LONG  bullish：價格 lower-low + RSI higher-low（差 ≥ 2 點）
+      SHORT bearish：價格 higher-high + RSI lower-high
+    """
+    import numpy as np
+    if i < lookback or rsi_series is None:
+        return False
+    try:
+        start = i - lookback + 1
+        if side == "LONG":
+            arr  = df["low"].iloc[start:i + 1].values
+            rarr = rsi_series.iloc[start:i + 1].values
+            cur_pos = int(np.argmin(arr))
+            if cur_pos < 3:
+                return False
+            prev_pos = int(np.argmin(arr[:cur_pos - 2]))
+            if np.isnan(rarr[cur_pos]) or np.isnan(rarr[prev_pos]):
+                return False
+            price_ll = arr[cur_pos] < arr[prev_pos]
+            rsi_hl   = rarr[cur_pos] > rarr[prev_pos]
+            rsi_meaningful = abs(rarr[cur_pos] - rarr[prev_pos]) >= 2.0
+            return bool(price_ll and rsi_hl and rsi_meaningful)
+        else:
+            arr  = df["high"].iloc[start:i + 1].values
+            rarr = rsi_series.iloc[start:i + 1].values
+            cur_pos = int(np.argmax(arr))
+            if cur_pos < 3:
+                return False
+            prev_pos = int(np.argmax(arr[:cur_pos - 2]))
+            if np.isnan(rarr[cur_pos]) or np.isnan(rarr[prev_pos]):
+                return False
+            price_hh = arr[cur_pos] > arr[prev_pos]
+            rsi_lh   = rarr[cur_pos] < rarr[prev_pos]
+            rsi_meaningful = abs(rarr[cur_pos] - rarr[prev_pos]) >= 2.0
+            return bool(price_hh and rsi_lh and rsi_meaningful)
+    except Exception:
+        return False
+
+
+def _bt_has_sr_test(df, i: int, side: str,
+                    lookback: int = 30, tolerance: float = 0.015) -> bool:
+    """
+    結構性 S/R 測試：bar i 的 close 必須接近 lookback 內最近 swing low/high。
+    """
+    if i < lookback + 1:
+        return False
+    try:
+        cur = float(df["close"].iloc[i])
+        if side == "LONG":
+            key_level = float(df["low"].iloc[i - lookback:i].min())
+            return cur <= key_level * (1 + tolerance) and \
+                   cur >= key_level * (1 - tolerance * 2)
+        else:
+            key_level = float(df["high"].iloc[i - lookback:i].max())
+            return cur >= key_level * (1 - tolerance) and \
+                   cur <= key_level * (1 + tolerance * 2)
+    except Exception:
+        return False
+
+
 # ── BTC Regime 時間序列（回測用，模擬 live MarketContext.current_regime）─
 # Module-level cache：避免每幣回測都重抓
 _BTC_REGIME_CACHE: dict[int, "pd.Series"] = {}
@@ -1237,7 +1301,8 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
     timeout_bars   = Config.MR_TIMEOUT_BARS
     min_score      = Config.MR_MIN_SCORE
 
-    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
+    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0,
+           "no_div": 0, "no_sr": 0, "signals": 0}
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -1288,6 +1353,20 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
         if side is None:
             dbg["no_sig"] += 1
             continue
+
+        # ── 結構性過濾（v5：對齊 mean_reversion.py 的 hard filters）──
+        if getattr(Config, "MR_REQUIRE_DIVERGENCE", True):
+            div_lookback = int(getattr(Config, "MR_DIV_LOOKBACK", 20))
+            if not _bt_has_rsi_divergence(df_tf, rsi_s, i, side, div_lookback):
+                dbg["no_div"] += 1
+                continue
+
+        if getattr(Config, "MR_REQUIRE_SR_TEST", True):
+            sr_lookback = int(getattr(Config, "MR_SR_LOOKBACK", 30))
+            sr_tol = float(getattr(Config, "MR_SR_TOLERANCE", 0.015))
+            if not _bt_has_sr_test(df_tf, i, side, sr_lookback, sr_tol):
+                dbg["no_sr"] += 1
+                continue
 
         # ── 評分（同正式 _score_signal：base=1, RSI極端+1, BB超出+1, StochRSI+1, MACD背離+1）
         score = 1
