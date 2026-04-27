@@ -1557,6 +1557,14 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
     SMC 不依賴 regime（與 NKF 一樣特權）；regime_series 參數保留為
     對齊其他策略的呼叫簽名，實際不擋。
     """
+    # v4：個別幣排除（gap risk / 結構性失敗無法靠技術過濾解）
+    excluded = getattr(Config, "SMC_EXCLUDED_SYMBOLS", "")
+    if excluded:
+        ex_set = {s.strip().upper() for s in excluded.split(",") if s.strip()}
+        if symbol.upper() in ex_set:
+            print(f"\n[{symbol} SMC] 在排除清單，跳過")
+            return []
+
     tf = Config.SMC_TIMEFRAME
     print(f"\n[{symbol} SMC {tf}] 回測開始")
 
@@ -1732,7 +1740,7 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
         if side is None:
             continue
 
-        # ── HTF（4h EMA50）趨勢過濾（v3）─────────────────────────
+        # ── HTF（4h EMA50）趨勢過濾（v3 + v4 嚴格化）────────────
         if htf_close_arr is not None and htf_ema_arr is not None:
             htf_c = htf_close_arr[i] if i < len(htf_close_arr) else None
             htf_e = htf_ema_arr[i]   if i < len(htf_ema_arr)   else None
@@ -1741,10 +1749,15 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
                 pass
             else:
                 htf_c = float(htf_c); htf_e = float(htf_e)
-                if side == "LONG" and htf_c <= htf_e:
+                min_dist = float(
+                    getattr(Config, "SMC_HTF_MIN_DISTANCE_PCT", 0.005)
+                )
+                upper_thr = htf_e * (1 + min_dist)
+                lower_thr = htf_e * (1 - min_dist)
+                if side == "LONG" and htf_c < upper_thr:
                     dbg["htf_block"] += 1
                     continue
-                if side == "SHORT" and htf_c >= htf_e:
+                if side == "SHORT" and htf_c > lower_thr:
                     dbg["htf_block"] += 1
                     continue
 

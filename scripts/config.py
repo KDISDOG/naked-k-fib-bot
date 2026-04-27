@@ -259,6 +259,14 @@ class Config:
     SMC_HTF_FILTER_ENABLED = os.getenv("SMC_HTF_FILTER_ENABLED", "true").lower() == "true"
     SMC_HTF_TIMEFRAME      = os.getenv("SMC_HTF_TIMEFRAME", "4h")
     SMC_HTF_EMA_PERIOD     = int(os.getenv("SMC_HTF_EMA_PERIOD", 50))
+
+    # SMC v4 嚴 HTF：除了「同方向」還要求離 EMA 至少 X%（避免貼著 EMA 的 chop）
+    SMC_HTF_MIN_DISTANCE_PCT = float(
+        os.getenv("SMC_HTF_MIN_DISTANCE_PCT", 0.005)  # 0.5%
+    )
+    # SMC v4 排除清單：個別幣 SL 平均虧太深（gap risk / 流動性差）
+    # 預設只擋 HYPEUSDT（回測 8 單 50% win 但 worst -3.37 = 33% margin）
+    SMC_EXCLUDED_SYMBOLS = os.getenv("SMC_EXCLUDED_SYMBOLS", "HYPEUSDT")
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限

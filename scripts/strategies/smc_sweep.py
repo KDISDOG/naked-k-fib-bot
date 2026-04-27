@@ -182,6 +182,16 @@ class SMCSweepStrategy(BaseStrategy):
         # 但仍尊重 REGIME_GATE_ENABLED 全局開關（如果用戶要強制限制）
         # 這裡選擇不讀 regime_allows，因為 SMC 並未在 market_context 註冊。
 
+        # ── 個別幣排除（v4）─────────────────────────────────────
+        # 回測證據：HYPEUSDT 等高 gap risk 幣 SL 平均虧 33% margin（極端）
+        # 這類結構性失敗無法靠技術過濾解，直接排除最划算
+        excluded = getattr(Config, "SMC_EXCLUDED_SYMBOLS", "")
+        if excluded:
+            ex_set = {s.strip().upper() for s in excluded.split(",") if s.strip()}
+            if symbol.upper() in ex_set:
+                log.debug(f"[{symbol}] SMC 在排除清單，跳過")
+                return None
+
         try:
             df = self._get_klines(
                 symbol, self.default_timeframe,
@@ -269,30 +279,34 @@ class SMCSweepStrategy(BaseStrategy):
         if side is None:
             return None
 
-        # ── HTF（4h EMA50）趨勢過濾（v3）─────────────────────────
-        # 回測證據：BTC/SOL/HYPE/DOGE 在 4h chop 期間 sweep 多為雜訊。
-        # 要求 sweep 方向與 4h 大趨勢同向，過濾這類無效訊號。
+        # ── HTF（4h EMA50）趨勢過濾（v3 + v4 嚴格化）────────────
+        # v3：要求 sweep 方向與 4h 大趨勢同向
+        # v4：再加「離 EMA 至少 X%」過濾貼 EMA 的 chop（同向但無趨勢動能）
         if getattr(Config, "SMC_HTF_FILTER_ENABLED", True):
             try:
                 htf_tf     = getattr(Config, "SMC_HTF_TIMEFRAME", "4h")
                 htf_period = int(getattr(Config, "SMC_HTF_EMA_PERIOD", 50))
+                min_dist   = float(getattr(Config, "SMC_HTF_MIN_DISTANCE_PCT", 0.005))
                 df_htf = self._get_klines(symbol, htf_tf, limit=htf_period + 30)
                 if len(df_htf) >= htf_period + 5:
                     htf_ema = ta.ema(df_htf["close"], length=htf_period)
-                    # 用倒數第二根（已收盤確認）
                     htf_close = float(df_htf["close"].iloc[-2])
                     htf_ema_v = float(htf_ema.iloc[-2]) if htf_ema is not None else float("nan")
-                    if not (pd.isna(htf_close) or pd.isna(htf_ema_v)):
-                        if side == "LONG" and htf_close <= htf_ema_v:
+                    if not (pd.isna(htf_close) or pd.isna(htf_ema_v)) and htf_ema_v > 0:
+                        upper_thr = htf_ema_v * (1 + min_dist)
+                        lower_thr = htf_ema_v * (1 - min_dist)
+                        if side == "LONG" and htf_close < upper_thr:
                             log.debug(
-                                f"[{symbol}] SMC LONG 被 HTF 過濾："
-                                f"4h close={htf_close:.4f} ≤ EMA{htf_period}={htf_ema_v:.4f}"
+                                f"[{symbol}] SMC LONG HTF 過濾："
+                                f"4h close={htf_close:.4f} < EMA×(1+{min_dist:.3f})="
+                                f"{upper_thr:.4f}"
                             )
                             return None
-                        if side == "SHORT" and htf_close >= htf_ema_v:
+                        if side == "SHORT" and htf_close > lower_thr:
                             log.debug(
-                                f"[{symbol}] SMC SHORT 被 HTF 過濾："
-                                f"4h close={htf_close:.4f} ≥ EMA{htf_period}={htf_ema_v:.4f}"
+                                f"[{symbol}] SMC SHORT HTF 過濾："
+                                f"4h close={htf_close:.4f} > EMA×(1-{min_dist:.3f})="
+                                f"{lower_thr:.4f}"
                             )
                             return None
             except Exception as e:
