@@ -239,6 +239,21 @@ class Config:
     MR_DIV_LOOKBACK        = int(os.getenv("MR_DIV_LOOKBACK", 20))   # 找 swing low/high 的回看根數
     MR_SR_LOOKBACK         = int(os.getenv("MR_SR_LOOKBACK", 30))    # 找關鍵 S/R 的回看根數
     MR_SR_TOLERANCE        = float(os.getenv("MR_SR_TOLERANCE", 0.015))  # 1.5% 容忍貼合度
+
+    # ── SMC（Smart Money Concepts）Liquidity Sweep + Reversal ─────
+    # 取代 MR：在 swing high/low 被刺破後反轉時順機構方向開倉。
+    # 多空雙向、與 BD/ML 互補（SMC 不依賴 trend regime）。
+    SMC_TIMEFRAME       = os.getenv("SMC_TIMEFRAME", "1h")
+    SMC_SWING_LOOKBACK  = int(os.getenv("SMC_SWING_LOOKBACK", 50))   # 找 swing 的回看根數
+    SMC_SWING_LEFT      = int(os.getenv("SMC_SWING_LEFT", 3))        # fractal 左側確認根數
+    SMC_SWING_RIGHT     = int(os.getenv("SMC_SWING_RIGHT", 3))       # fractal 右側確認根數
+    SMC_SWEEP_MIN_PCT   = float(os.getenv("SMC_SWEEP_MIN_PCT", 0.001))  # 0.1% 最小刺破
+    SMC_SWEEP_MAX_PCT   = float(os.getenv("SMC_SWEEP_MAX_PCT", 0.020))  # 2% 最大（防止破壞性下跌假認為 sweep）
+    SMC_VOL_MULT        = float(os.getenv("SMC_VOL_MULT", 1.3))       # 入場 K 棒量能下限倍數
+    SMC_SL_BUFFER       = float(os.getenv("SMC_SL_BUFFER", 0.5))      # SL 在刺破點外側 0.5×ATR
+    SMC_MIN_SCORE       = int(os.getenv("SMC_MIN_SCORE", 3))          # 最低訊號評分
+    SMC_TIMEOUT_BARS    = int(os.getenv("SMC_TIMEOUT_BARS", 12))      # 1h × 12 = 12h
+    SMC_MIN_RR          = float(os.getenv("SMC_MIN_RR", 1.5))         # 最低 R:R
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限

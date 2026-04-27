@@ -42,6 +42,7 @@ from strategies.naked_k_fib import NakedKFibStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.breakdown_short import BreakdownShortStrategy
 from strategies.momentum_long import MomentumLongStrategy
+from strategies.smc_sweep import SMCSweepStrategy
 from notifier import notify
 from kline_ws import KlineWSManager
 
@@ -85,6 +86,7 @@ _nkf_strategy = NakedKFibStrategy(
 _mr_strategy = MeanReversionStrategy(client, market_ctx=market_ctx)
 _bd_strategy = BreakdownShortStrategy(client, market_ctx=market_ctx)
 _ml_strategy = MomentumLongStrategy(client, market_ctx=market_ctx)
+_smc_strategy = SMCSweepStrategy(client, market_ctx=market_ctx)
 
 # 全局狀態
 candidate_symbols: dict[str, list[str]] = {}   # strategy_name → symbols
@@ -121,6 +123,7 @@ def _strategy_timeframe(strategy_name: str) -> str:
         "mean_reversion":   Config.MR_TIMEFRAME,
         "breakdown_short":  Config.BD_TIMEFRAME,
         "momentum_long":    Config.ML_TIMEFRAME,
+        "smc_sweep":        Config.SMC_TIMEFRAME,
     }.get(strategy_name, "1h")
 
 
@@ -144,19 +147,42 @@ def check_regime_change():
 
 # ── 策略載入 ─────────────────────────────────────────────────────
 def load_strategies() -> list:
+    """
+    解析 ACTIVE_STRATEGY env：
+      - "all" → 載入全部
+      - 單一名稱（如 "naked_k_fib"）→ 載入該策略
+      - 逗號分隔列表（如 "naked_k_fib,breakdown_short,smc_sweep"）→ 載入子集
+    """
     active = _active_strategy_override or Config.ACTIVE_STRATEGY
     all_strategies = {
         "naked_k_fib":      _nkf_strategy,
         "mean_reversion":   _mr_strategy,
         "breakdown_short":  _bd_strategy,
         "momentum_long":    _ml_strategy,
+        "smc_sweep":        _smc_strategy,
     }
     if active == "all":
         return list(all_strategies.values())
-    elif active in all_strategies:
+
+    # 支援逗號分隔的多策略列表（例：移除 MR）
+    if "," in active:
+        names = [s.strip() for s in active.split(",") if s.strip()]
+        out = []
+        unknown = []
+        for n in names:
+            if n in all_strategies:
+                out.append(all_strategies[n])
+            else:
+                unknown.append(n)
+        if unknown:
+            raise ValueError(f"未知策略: {unknown}")
+        if not out:
+            raise ValueError("ACTIVE_STRATEGY 列表為空")
+        return out
+
+    if active in all_strategies:
         return [all_strategies[active]]
-    else:
-        raise ValueError(f"未知策略: {active}")
+    raise ValueError(f"未知策略: {active}")
 
 
 # ── 選幣後：相關性去重 ─────────────────────────────────────────
@@ -314,6 +340,11 @@ def check_strategy_timeout():
             "strategy": "momentum_long",
             "timeframe": Config.ML_TIMEFRAME,
             "timeout_bars": Config.ML_TIMEOUT_BARS,
+        },
+        {
+            "strategy": "smc_sweep",
+            "timeframe": Config.SMC_TIMEFRAME,
+            "timeout_bars": Config.SMC_TIMEOUT_BARS,
         },
     ]
 
@@ -497,19 +528,22 @@ _MIN_SCORE_MAP = {
     "mean_reversion":  lambda: Config.MR_MIN_SCORE,
     "breakdown_short": lambda: Config.BD_MIN_SCORE,
     "momentum_long":   lambda: Config.ML_MIN_SCORE,
+    "smc_sweep":       lambda: Config.SMC_MIN_SCORE,
 }
 _MIN_RR_MAP = {
     "naked_k_fib":     lambda: Config.NKF_MIN_RR,
     "mean_reversion":  lambda: Config.MR_MIN_RR,
     "breakdown_short": lambda: Config.BD_MIN_RR,
     "momentum_long":   lambda: Config.ML_MIN_RR,
+    "smc_sweep":       lambda: Config.SMC_MIN_RR,
 }
 # 分倉策略（TP1 成交比例）：
 #   MR 0.7：快速反轉、TP2 鮮少觸及，先鎖利
-#   BD/ML/NKF 0.3：DB 證據顯示 9 筆 TP2 貢獻 +486（總盈利 68%），
-#     極端 fat-tail 分佈下保留 70% 跑尾比 50/50 期望值高
+#   SMC 0.5：sweep + reversal 命中率中等，半倉鎖利、半倉跑 fat-tail
+#   BD/ML/NKF 0.3：DB 證據顯示 TP2 貢獻 ~68% 總盈利
 _TP1_SPLIT_MAP = {
     "mean_reversion":  0.7,
+    "smc_sweep":       0.5,
     "breakdown_short": 0.3,
     "momentum_long":   0.3,
     "naked_k_fib":     0.3,
@@ -959,7 +993,8 @@ def main():
                         help="跳過等待 K 棒收盤")
     parser.add_argument("--strategy",
                         choices=["naked_k_fib", "mean_reversion",
-                                 "breakdown_short", "momentum_long", "all"],
+                                 "breakdown_short", "momentum_long",
+                                 "smc_sweep", "all"],
                         default=None,
                         help="覆蓋 .env 的 ACTIVE_STRATEGY")
     args = parser.parse_args()

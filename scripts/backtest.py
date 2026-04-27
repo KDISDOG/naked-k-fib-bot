@@ -1491,6 +1491,274 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
     return trades
 
 
+# ── SMC 反轉 K 棒判定（backtest helper）─────────────────────────
+def _bt_smc_bullish_reversal(df, i: int) -> bool:
+    o = float(df["open"].iloc[i])
+    h = float(df["high"].iloc[i])
+    l = float(df["low"].iloc[i])
+    c = float(df["close"].iloc[i])
+    body = abs(c - o)
+    lower_wick = min(o, c) - l
+    if body > 0 and lower_wick >= body * 1.5 and c > o:
+        return True
+    if i >= 1:
+        po = float(df["open"].iloc[i - 1])
+        pc = float(df["close"].iloc[i - 1])
+        if pc < po and c > o and c >= po and o <= pc:
+            return True
+    if c > o and (h - max(o, c)) < lower_wick:
+        return True
+    return False
+
+
+def _bt_smc_bearish_reversal(df, i: int) -> bool:
+    o = float(df["open"].iloc[i])
+    h = float(df["high"].iloc[i])
+    l = float(df["low"].iloc[i])
+    c = float(df["close"].iloc[i])
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    if body > 0 and upper_wick >= body * 1.5 and c < o:
+        return True
+    if i >= 1:
+        po = float(df["open"].iloc[i - 1])
+        pc = float(df["close"].iloc[i - 1])
+        if pc > po and c < o and c <= po and o >= pc:
+            return True
+    if c < o and (min(o, c) - l) < upper_wick:
+        return True
+    return False
+
+
+# ── SMC 主回測邏輯 ──────────────────────────────────────────────
+def run_backtest_smc(client: Client, symbol: str, months: int,
+                    debug: bool = False, *,
+                    regime_series=None) -> list:
+    """
+    SMC Liquidity Sweep + Reversal 策略回測。
+    SMC 不依賴 regime（與 NKF 一樣特權）；regime_series 參數保留為
+    對齊其他策略的呼叫簽名，實際不擋。
+    """
+    tf = Config.SMC_TIMEFRAME
+    print(f"\n[{symbol} SMC {tf}] 回測開始")
+
+    df_tf = fetch_klines(client, symbol, tf, months)
+    if len(df_tf) < 80:
+        print(f"  資料不足（{len(df_tf)} 根），跳過")
+        return []
+
+    print("  預計算指標...", end="", flush=True)
+    atr_full  = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    avg_vol_s = df_tf["volume"].rolling(21).mean().shift(1)
+
+    # 預先標記所有 fractal swing low/high（向量化前處理）
+    n = len(df_tf)
+    left  = int(Config.SMC_SWING_LEFT)
+    right = int(Config.SMC_SWING_RIGHT)
+    is_swing_low  = np.zeros(n, dtype=bool)
+    is_swing_high = np.zeros(n, dtype=bool)
+    lows_arr  = df_tf["low"].values
+    highs_arr = df_tf["high"].values
+    for k in range(left, n - right):
+        if lows_arr[k] == lows_arr[k - left:k + right + 1].min():
+            is_swing_low[k] = True
+        if highs_arr[k] == highs_arr[k - left:k + right + 1].max():
+            is_swing_high[k] = True
+
+    # MACD（給 score 用）
+    macd_full = ta.macd(df_tf["close"])
+    print(" 完成")
+
+    warmup = max(60, int(Config.SMC_SWING_LOOKBACK) + right + 5)
+    trades = []
+    cooldown_until = -1
+    timeout_bars = int(Config.SMC_TIMEOUT_BARS)
+    min_score    = int(Config.SMC_MIN_SCORE)
+    sweep_min    = float(Config.SMC_SWEEP_MIN_PCT)
+    sweep_max    = float(Config.SMC_SWEEP_MAX_PCT)
+    vol_mult     = float(Config.SMC_VOL_MULT)
+    sl_buffer_pct = float(Config.SMC_SL_BUFFER)
+    min_rr       = float(Config.SMC_MIN_RR)
+
+    dbg = {"cooldown": 0, "no_swing": 0, "no_sweep": 0,
+           "no_reversal": 0, "no_volume": 0, "low_score": 0,
+           "bad_pos": 0, "signals": 0}
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 1):
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+
+        cur_high  = float(df_tf["high"].iloc[i])
+        cur_low   = float(df_tf["low"].iloc[i])
+        cur_close = float(df_tf["close"].iloc[i])
+        cur_vol   = float(df_tf["volume"].iloc[i])
+        atr_val   = atr_full.iloc[i] if atr_full is not None else float("nan")
+        avg_vol   = avg_vol_s.iloc[i] if avg_vol_s is not None else float("nan")
+
+        if pd.isna(atr_val) or pd.isna(avg_vol) or float(avg_vol) <= 0:
+            continue
+        atr_val = float(atr_val)
+        avg_vol = float(avg_vol)
+
+        # 在 lookback 內找最近的 swing low/high（必須在 i - right 之前）
+        end_search   = i - right
+        start_search = max(0, end_search - int(Config.SMC_SWING_LOOKBACK))
+        last_sw_low  = None
+        last_sw_high = None
+        for k in range(end_search, start_search - 1, -1):
+            if last_sw_low is None and is_swing_low[k]:
+                last_sw_low = float(lows_arr[k])
+            if last_sw_high is None and is_swing_high[k]:
+                last_sw_high = float(highs_arr[k])
+            if last_sw_low is not None and last_sw_high is not None:
+                break
+
+        if last_sw_low is None and last_sw_high is None:
+            dbg["no_swing"] += 1
+            continue
+
+        side = None
+        sweep_level = 0.0
+
+        # LONG sweep
+        if last_sw_low is not None:
+            sweep_pct = (last_sw_low - cur_low) / last_sw_low if last_sw_low > 0 else 0
+            if sweep_min <= sweep_pct <= sweep_max and cur_close > last_sw_low:
+                if _bt_smc_bullish_reversal(df_tf, i):
+                    if cur_vol >= avg_vol * vol_mult:
+                        side = "LONG"
+                        sweep_level = last_sw_low
+                    else:
+                        dbg["no_volume"] += 1
+                else:
+                    dbg["no_reversal"] += 1
+            elif cur_low < last_sw_low * (1 - sweep_max):
+                # 刺破過深 = 真破位非 sweep
+                dbg["no_sweep"] += 1
+
+        # SHORT sweep
+        if side is None and last_sw_high is not None:
+            sweep_pct = (cur_high - last_sw_high) / last_sw_high if last_sw_high > 0 else 0
+            if sweep_min <= sweep_pct <= sweep_max and cur_close < last_sw_high:
+                if _bt_smc_bearish_reversal(df_tf, i):
+                    if cur_vol >= avg_vol * vol_mult:
+                        side = "SHORT"
+                        sweep_level = last_sw_high
+                    else:
+                        dbg["no_volume"] += 1
+                else:
+                    dbg["no_reversal"] += 1
+
+        if side is None:
+            continue
+
+        # ── Score（對齊 live SMC._score_signal）─────────────────
+        score = 1
+        ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+        if ratio >= 2.5:
+            score += 2
+        elif ratio >= 1.5:
+            score += 1
+        if sweep_level > 0:
+            recovery_pct = abs(cur_close - sweep_level) / sweep_level * 100
+            if recovery_pct >= 0.3:
+                score += 1
+        # MACD 動能對齊
+        try:
+            if macd_full is not None and macd_full.shape[1] >= 3:
+                hist = macd_full.iloc[:, 2]
+                if not pd.isna(hist.iloc[i]) and not pd.isna(hist.iloc[i - 1]):
+                    if side == "LONG" and float(hist.iloc[i]) > float(hist.iloc[i - 1]):
+                        score += 1
+                    elif side == "SHORT" and float(hist.iloc[i]) < float(hist.iloc[i - 1]):
+                        score += 1
+        except Exception:
+            pass
+        score = min(score, 5)
+
+        if score < min_score:
+            dbg["low_score"] += 1
+            continue
+
+        # ── SL / TP ────────────────────────────────────────────
+        atr_buf = atr_val * sl_buffer_pct
+        if side == "LONG":
+            sl = sweep_level - atr_buf - cur_close * 0.001
+            risk = cur_close - sl
+            if risk <= 0:
+                sl = cur_close - atr_val * 1.5
+                risk = cur_close - sl
+            tp1 = cur_close + risk * 1.0
+            tp2 = cur_close + risk * 2.0
+        else:
+            sl = sweep_level + atr_buf + cur_close * 0.001
+            risk = sl - cur_close
+            if risk <= 0:
+                sl = cur_close + atr_val * 1.5
+                risk = sl - cur_close
+            tp1 = cur_close - risk * 1.0
+            tp2 = cur_close - risk * 2.0
+
+        # R:R 檢查
+        rr = abs(tp2 - cur_close) / risk if risk > 0 else 0
+        if rr < min_rr:
+            dbg["bad_pos"] += 1
+            continue
+
+        # 分倉 50/50
+        qty_total = MARGIN_USDT * LEVERAGE / cur_close
+        qty_tp1 = round(qty_total * 0.5, 4)
+        qty_tp2 = round(qty_total - qty_tp1, 4)
+
+        trade = BtTrade(
+            symbol    = symbol,
+            direction = side,
+            entry     = cur_close,
+            sl        = sl,
+            tp1       = tp1,
+            tp2       = tp2,
+            qty       = qty_total,
+            qty_tp1   = qty_tp1,
+            qty_tp2   = qty_tp2,
+            fib_level = "",
+            pattern   = "SMC_SWEEP",
+            score     = score,
+            timeframe = tf,
+            open_bar  = i,
+            open_time = df_tf["time"].iloc[i],
+            strategy  = "smc_sweep",
+        )
+
+        df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
+        trade = simulate_trade(trade, df_future, max_bars=timeout_bars)
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        trades.append(trade)
+        dbg["signals"] += 1
+
+        if "SL" in trade.result:
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+
+    print(f" 找到 {len(trades)} 筆訊號")
+    if debug or len(trades) == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"]
+        print(f"\n  ── SMC 診斷（為何沒有入場？）──")
+        print(f"  總掃描根數：{scanned}")
+        print(f"  ├─ 找不到 swing       ：{dbg['no_swing']} 根")
+        print(f"  ├─ 刺破過深非 sweep    ：{dbg['no_sweep']} 根")
+        print(f"  ├─ 反轉 K 棒不成立    ：{dbg['no_reversal']} 根")
+        print(f"  ├─ 量能不足           ：{dbg['no_volume']} 根")
+        print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根")
+        print(f"  ├─ R:R 過低 / SL 異常  ：{dbg['bad_pos']} 根")
+        print(f"  └─ 通過全部過濾       ：{dbg['signals']} 根")
+    return trades
+
+
 # ── 輸出統計 ──────────────────────────────────────────────────────
 def print_stats(trades: list, timeframe: str, symbol: str,
                 initial_balance: float, label: str = ""):
@@ -1873,6 +2141,15 @@ def _run_multi_coin_backtest(
                 tr = []
             results[(sym, "ML")] = tr
 
+        if run_flags.get("smc"):
+            try:
+                tr = run_backtest_smc(client, sym, args.months, debug=False,
+                                      regime_series=regime_series)
+            except Exception as e:
+                print(f"  [SMC] 失敗：{e}")
+                tr = []
+            results[(sym, "SMC")] = tr
+
     return results
 
 
@@ -2141,8 +2418,8 @@ def main():
     parser.add_argument("--skip-vol-rise",  action="store_true", default=BT_SKIP_VOL_RISE,  help="不要求當根成交量>前根")
     parser.add_argument("--no-skip-bad-fib",action="store_true",                   help="包含低R:R的0.236/0.786位")
     parser.add_argument("--strategy",       default="naked_k_fib",
-                        choices=["naked_k_fib", "mean_reversion", "breakdown_short", "momentum_long", "all"],
-                        help="回測策略：naked_k_fib / mean_reversion / breakdown_short / momentum_long / all")
+                        choices=["naked_k_fib", "mean_reversion", "breakdown_short", "momentum_long", "smc_sweep", "all"],
+                        help="回測策略：naked_k_fib / mean_reversion / breakdown_short / momentum_long / smc_sweep / all")
     parser.add_argument("--max-bars",       type=int,   default=48,
                         help="NKF 最大持倉根數（超時平倉，預設 48）")
     parser.add_argument("--testnet",        action="store_true",
@@ -2191,6 +2468,7 @@ def main():
     run_mr  = args.strategy in ("mean_reversion", "all")
     run_bd  = args.strategy in ("breakdown_short", "all")
     run_ml  = args.strategy in ("momentum_long", "all")
+    run_smc = args.strategy in ("smc_sweep", "all")
 
     # ── 掃描模式（優先）──────────────────────────────────────────
     if args.scan:
@@ -2203,7 +2481,8 @@ def main():
     if multi_mode:
         symbols = _resolve_symbol_list(args, client)
         run_flags = {
-            "nkf": run_nkf, "mr": run_mr, "bd": run_bd, "ml": run_ml,
+            "nkf": run_nkf, "mr": run_mr, "bd": run_bd,
+            "ml": run_ml, "smc": run_smc,
         }
         active_strats = [k.upper() for k, v in run_flags.items() if v]
         print(f"\n{'='*78}")
@@ -2230,6 +2509,8 @@ def main():
         print(f"  [BD]  時間框架：{Config.BD_TIMEFRAME}  超時：{Config.BD_TIMEOUT_BARS} 根  做空突破策略")
     if run_ml:
         print(f"  [ML]  時間框架：{Config.ML_TIMEFRAME}  超時：{Config.ML_TIMEOUT_BARS} 根  做多突破策略")
+    if run_smc:
+        print(f"  [SMC] 時間框架：{Config.SMC_TIMEFRAME}  超時：{Config.SMC_TIMEOUT_BARS} 根  Liquidity Sweep + Reversal")
     print(f"  回測期間：最近 {args.months} 個月")
     print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每筆保證金：{MARGIN_USDT:.0f} USDT")
     if run_nkf:
@@ -2240,6 +2521,7 @@ def main():
     all_mr  = []
     all_bd  = []
     all_ml  = []
+    all_smc = []
 
     # ── NKF 回測 ──────────────────────────────────────────────────
     if run_nkf:
@@ -2280,11 +2562,25 @@ def main():
                     args.balance, label="ML")
         all_ml.extend(trades_ml)
 
+    # ── SMC 回測 ──────────────────────────────────────────────────
+    if run_smc:
+        trades_smc = run_backtest_smc(client, args.symbol, args.months,
+                                      debug=args.debug_indicators)
+        print_stats(trades_smc, Config.SMC_TIMEFRAME, args.symbol,
+                    args.balance, label="SMC")
+        all_smc.extend(trades_smc)
+
     # ── 合併統計（only when running all）─────────────────────────
-    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml):
-        combined = all_nkf + all_mr + all_bd + all_ml
+    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml or all_smc):
+        combined = all_nkf + all_mr + all_bd + all_ml + all_smc
         combined.sort(key=lambda t: t.open_time or datetime.min)
-        strats = "+".join(s for s, flag in [("NKF", bool(all_nkf)), ("MR", bool(all_mr)), ("BD", bool(all_bd)), ("ML", bool(all_ml))] if flag)
+        strats = "+".join(
+            s for s, flag in [
+                ("NKF", bool(all_nkf)), ("MR", bool(all_mr)),
+                ("BD",  bool(all_bd)),  ("ML", bool(all_ml)),
+                ("SMC", bool(all_smc)),
+            ] if flag
+        )
         print_stats(combined, "ALL", args.symbol, args.balance, label=f"{strats} 合併")
 
 
