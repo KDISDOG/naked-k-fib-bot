@@ -86,7 +86,7 @@ _nkf_strategy = NakedKFibStrategy(
 _mr_strategy = MeanReversionStrategy(client, market_ctx=market_ctx)
 _bd_strategy = BreakdownShortStrategy(client, market_ctx=market_ctx)
 _ml_strategy = MomentumLongStrategy(client, market_ctx=market_ctx)
-_smc_strategy = SMCSweepStrategy(client, market_ctx=market_ctx)
+_smc_strategy = SMCSweepStrategy(client, market_ctx=market_ctx, db=db)
 
 # 全局狀態
 candidate_symbols: dict[str, list[str]] = {}   # strategy_name → symbols

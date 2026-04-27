@@ -1608,7 +1608,8 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
 
     dbg = {"cooldown": 0, "no_swing": 0, "no_sweep": 0,
            "no_reversal": 0, "no_volume": 0, "low_score": 0,
-           "bad_pos": 0, "htf_block": 0, "signals": 0}
+           "bad_pos": 0, "htf_block": 0, "auto_excluded": 0,
+           "signals": 0}
 
     # ── HTF (4h EMA50) 趨勢過濾預計算 ───────────────────────────
     htf_enabled = bool(getattr(Config, "SMC_HTF_FILTER_ENABLED", True))
@@ -1746,6 +1747,22 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
 
         if side is None:
             continue
+
+        # ── Per-coin 自動學習（v7）──────────────────────────────
+        # 看本次 backtest 已完成的 trades（同 symbol）的近 N 單 win rate，
+        # 低於門檻就跳過。模擬 live DB 自動學習行為。
+        if getattr(Config, "SMC_AUTO_EXCLUDE_ENABLED", True):
+            min_n = int(getattr(Config, "SMC_AUTO_EXCLUDE_MIN_TRADES", 10))
+            thr   = float(getattr(Config, "SMC_AUTO_EXCLUDE_WIN_THRESHOLD", 0.35))
+            lb    = int(getattr(Config, "SMC_AUTO_EXCLUDE_LOOKBACK", 30))
+            completed = [t for t in trades if t.result not in ("", "OPEN")]
+            if len(completed) >= min_n:
+                recent = completed[-lb:]
+                wins = sum(1 for t in recent if t.net_pnl > 0)
+                wr = wins / len(recent) if recent else 1.0
+                if wr < thr:
+                    dbg["auto_excluded"] += 1
+                    continue
 
         # ── HTF（4h EMA50）趨勢過濾（v3+v4+v5）─────────────────
         if htf_close_arr is not None and htf_ema_arr is not None:
@@ -1886,6 +1903,7 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
         print(f"  ├─ 評分不足 (<{min_score})：{dbg['low_score']} 根")
         print(f"  ├─ R:R 過低 / SL 異常  ：{dbg['bad_pos']} 根")
         print(f"  ├─ HTF 趨勢過濾擋下    ：{dbg['htf_block']} 根")
+        print(f"  ├─ Auto-exclude（學習）：{dbg['auto_excluded']} 根")
         print(f"  └─ 通過全部過濾       ：{dbg['signals']} 根")
     return trades
 

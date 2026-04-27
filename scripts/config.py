@@ -275,6 +275,13 @@ class Config:
     # SMC v6：要求 slope 強度（避免趨勢幣的「微正斜率」也通過 = 假趨勢）
     # 0.005 = 0.5%（過去 SLOPE_BARS 根 EMA50 漲跌幅 ≥ 0.5% 才算有效）
     SMC_HTF_MIN_SLOPE_PCT = float(os.getenv("SMC_HTF_MIN_SLOPE_PCT", 0.005))
+
+    # SMC v7 per-coin 自動學習：追蹤每幣近 N 單 SMC 表現，
+    # win rate < 門檻就自動暫停該幣 SMC 開倉（治本，隨市場進化）
+    SMC_AUTO_EXCLUDE_ENABLED       = os.getenv("SMC_AUTO_EXCLUDE_ENABLED", "true").lower() == "true"
+    SMC_AUTO_EXCLUDE_MIN_TRADES    = int(os.getenv("SMC_AUTO_EXCLUDE_MIN_TRADES", 10))      # 至少要這麼多 sample 才啟動判斷
+    SMC_AUTO_EXCLUDE_WIN_THRESHOLD = float(os.getenv("SMC_AUTO_EXCLUDE_WIN_THRESHOLD", 0.35))  # 低於此 win rate 暫停
+    SMC_AUTO_EXCLUDE_LOOKBACK      = int(os.getenv("SMC_AUTO_EXCLUDE_LOOKBACK", 30))      # 看近幾單
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限

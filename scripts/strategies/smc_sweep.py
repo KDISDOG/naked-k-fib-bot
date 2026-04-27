@@ -52,9 +52,11 @@ log = logging.getLogger("strategy.smc")
 
 class SMCSweepStrategy(BaseStrategy):
 
-    def __init__(self, client: Client, market_ctx=None):
+    def __init__(self, client: Client, market_ctx=None, db=None):
         self._client = client
         self._market_ctx = market_ctx
+        # v7：注入 DB 給 per-coin auto-exclude 用
+        self._db = db
 
     @property
     def name(self) -> str:
@@ -189,8 +191,32 @@ class SMCSweepStrategy(BaseStrategy):
         if excluded:
             ex_set = {s.strip().upper() for s in excluded.split(",") if s.strip()}
             if symbol.upper() in ex_set:
-                log.debug(f"[{symbol}] SMC 在排除清單，跳過")
+                log.debug(f"[{symbol}] SMC 在靜態排除清單，跳過")
                 return None
+
+        # ── Per-coin 自動學習（v7）──────────────────────────────
+        # 追蹤每幣 SMC 近 N 單表現，win rate < 門檻就自動暫停該幣
+        # 隨市場進化（不依賴人工維護排除清單）
+        if getattr(Config, "SMC_AUTO_EXCLUDE_ENABLED", True) and self._db is not None:
+            try:
+                lookback = int(getattr(Config, "SMC_AUTO_EXCLUDE_LOOKBACK", 30))
+                min_n    = int(getattr(Config, "SMC_AUTO_EXCLUDE_MIN_TRADES", 10))
+                thr      = float(getattr(Config, "SMC_AUTO_EXCLUDE_WIN_THRESHOLD", 0.35))
+                pnls = self._db.get_recent_trade_outcomes(
+                    symbol, self.name, lookback
+                )
+                if pnls and len(pnls) >= min_n:
+                    wins = sum(1 for p in pnls if p > 0)
+                    win_rate = wins / len(pnls)
+                    if win_rate < thr:
+                        log.info(
+                            f"[{symbol}] SMC auto-exclude："
+                            f"近 {len(pnls)} 單 win {win_rate*100:.1f}% "
+                            f"< 門檻 {thr*100:.0f}%，暫停"
+                        )
+                        return None
+            except Exception as e:
+                log.debug(f"[{symbol}] SMC auto-exclude 查詢失敗（fail-open）: {e}")
 
         try:
             df = self._get_klines(

@@ -573,6 +573,30 @@ class StateManager:
                 .count()
             )
 
+    def get_recent_trade_outcomes(
+        self,
+        symbol: str,
+        strategy: str,
+        limit: int = 30,
+    ) -> list[float]:
+        """
+        查詢特定 (symbol, strategy) 近 limit 筆已平倉交易的 net_pnl，
+        最新先回傳。供策略自動學習：win rate 低於門檻暫停該幣開倉。
+        """
+        with self.Session() as session:
+            rows = (
+                session.query(Trade.net_pnl)
+                .filter(
+                    Trade.symbol == symbol,
+                    Trade.strategy == strategy,
+                    Trade.status == "closed",
+                )
+                .order_by(Trade.closed_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [float(r[0]) for r in rows if r[0] is not None]
+
     def increment_timeout_bars(self, trade_id: int) -> int:
         """持倉 K 棒數 +1，回傳新的 timeout_bars 值（均值回歸超時用）"""
         with self.Session() as session:
