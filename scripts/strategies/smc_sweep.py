@@ -314,23 +314,29 @@ class SMCSweepStrategy(BaseStrategy):
                             )
                             return None
 
-                        # v5 斜率過濾
+                        # v5 斜率方向 + v6 斜率強度
                         if req_slope:
                             ema_now = htf_ema_v
                             ema_past = float(htf_ema.iloc[-2 - slope_bars])
+                            min_slope = float(
+                                getattr(Config, "SMC_HTF_MIN_SLOPE_PCT", 0.005)
+                            )
                             if not pd.isna(ema_past) and ema_past > 0:
                                 slope_pct = (ema_now - ema_past) / ema_past
-                                # LONG 要求 EMA 正在上升、SHORT 要求下降
-                                if side == "LONG" and slope_pct <= 0:
+                                # LONG 要求 EMA 上升 ≥ min_slope
+                                # SHORT 要求 EMA 下降 ≥ min_slope（即 slope ≤ -min_slope）
+                                if side == "LONG" and slope_pct < min_slope:
                                     log.debug(
-                                        f"[{symbol}] SMC LONG HTF 斜率過濾："
-                                        f"EMA50 過去 {slope_bars} 根 slope={slope_pct*100:+.3f}%"
+                                        f"[{symbol}] SMC LONG HTF 斜率不足："
+                                        f"EMA50 {slope_bars} 根 slope={slope_pct*100:+.3f}% "
+                                        f"< {min_slope*100:.2f}%"
                                     )
                                     return None
-                                if side == "SHORT" and slope_pct >= 0:
+                                if side == "SHORT" and slope_pct > -min_slope:
                                     log.debug(
-                                        f"[{symbol}] SMC SHORT HTF 斜率過濾："
-                                        f"EMA50 過去 {slope_bars} 根 slope={slope_pct*100:+.3f}%"
+                                        f"[{symbol}] SMC SHORT HTF 斜率不足："
+                                        f"EMA50 {slope_bars} 根 slope={slope_pct*100:+.3f}% "
+                                        f"> -{min_slope*100:.2f}%"
                                     )
                                     return None
             except Exception as e:

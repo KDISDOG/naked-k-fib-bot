@@ -1768,16 +1768,19 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
                     dbg["htf_block"] += 1
                     continue
 
-                # v5：EMA50 斜率方向確認
+                # v5 方向 + v6 強度：EMA50 斜率必須有足夠幅度
                 if (htf_slope_arr is not None
                         and getattr(Config, "SMC_HTF_REQUIRE_SLOPE", True)):
                     htf_s = htf_slope_arr[i] if i < len(htf_slope_arr) else None
                     if htf_s is not None and not pd.isna(htf_s):
                         slope = float(htf_s)
-                        if side == "LONG" and slope <= 0:
+                        min_slope = float(
+                            getattr(Config, "SMC_HTF_MIN_SLOPE_PCT", 0.005)
+                        )
+                        if side == "LONG" and slope < min_slope:
                             dbg["htf_block"] += 1
                             continue
-                        if side == "SHORT" and slope >= 0:
+                        if side == "SHORT" and slope > -min_slope:
                             dbg["htf_block"] += 1
                             continue
 

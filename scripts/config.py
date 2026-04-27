@@ -272,6 +272,9 @@ class Config:
     # 「close > EMA + 0.5%」還可能在 chop 反彈中；要 EMA 本身也在上升才是真趨勢
     SMC_HTF_REQUIRE_SLOPE = os.getenv("SMC_HTF_REQUIRE_SLOPE", "true").lower() == "true"
     SMC_HTF_SLOPE_BARS    = int(os.getenv("SMC_HTF_SLOPE_BARS", 5))    # 算斜率的回看根數
+    # SMC v6：要求 slope 強度（避免趨勢幣的「微正斜率」也通過 = 假趨勢）
+    # 0.005 = 0.5%（過去 SLOPE_BARS 根 EMA50 漲跌幅 ≥ 0.5% 才算有效）
+    SMC_HTF_MIN_SLOPE_PCT = float(os.getenv("SMC_HTF_MIN_SLOPE_PCT", 0.005))
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限
