@@ -219,6 +219,18 @@ class Config:
     # 理由：alt 連 BTC 都打不過時，做多它沒有相對強度支撐，容易被震盪洗
     ML_REL_STRENGTH_ENABLED = os.getenv("ML_REL_STRENGTH_ENABLED", "true").lower() == "true"
     ML_REL_STRENGTH_MIN_DIFF = float(os.getenv("ML_REL_STRENGTH_MIN_DIFF", 1.0))  # % 單位
+
+    # BD 相對弱勢硬門檻（v5）：個幣 24h 必須跑輸 BTC ≥ MIN_DIFF % 才能做空
+    # 對應 ML 的 hard block，讓 BD 也只在「相對弱勢」幣做空（不在強勢幣逆勢）
+    BD_REL_STRENGTH_ENABLED  = os.getenv("BD_REL_STRENGTH_ENABLED", "true").lower() == "true"
+    BD_REL_STRENGTH_MIN_DIFF = float(os.getenv("BD_REL_STRENGTH_MIN_DIFF", 1.0))  # % 單位
+
+    # MR 結構性確認（v5）：避免單純 RSI 觸發在無 S/R 區的雜訊位
+    MR_REQUIRE_DIVERGENCE = os.getenv("MR_REQUIRE_DIVERGENCE", "true").lower() == "true"
+    MR_REQUIRE_SR_TEST    = os.getenv("MR_REQUIRE_SR_TEST", "true").lower() == "true"
+    MR_DIV_LOOKBACK       = int(os.getenv("MR_DIV_LOOKBACK", 20))   # 找 swing low/high 的回看根數
+    MR_SR_LOOKBACK        = int(os.getenv("MR_SR_LOOKBACK", 30))    # 找關鍵 S/R 的回看根數
+    MR_SR_TOLERANCE       = float(os.getenv("MR_SR_TOLERANCE", 0.015))  # 1.5% 容忍貼合度
     # B3 高 Score 反轉：實證 score=5 時 WR=14.3%（反指標，視為過熱頂部）
     # 預設擋 score >= 5 的訊號，只放行 score ∈ [ML_MIN_SCORE, ML_MAX_SCORE]
     ML_MAX_SCORE     = int(os.getenv("ML_MAX_SCORE", 4))         # 過熱上限

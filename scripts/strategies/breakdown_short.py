@@ -264,6 +264,31 @@ class BreakdownShortStrategy(BaseStrategy):
             except Exception:
                 pass
 
+        # ── BD 相對弱勢 hard block（v5：對齊 ML 的 hard filter）──
+        # 個幣 24h 必須跑輸 BTC ≥ BD_REL_STRENGTH_MIN_DIFF %，否則不做空。
+        # 回測證據：BD 在 TREND_DOWN 反而易被 squeeze（共振反彈），
+        # alpha 來自「相對弱勢」，個幣強於 BTC 硬要做空就是逆勢。
+        if self._market_ctx and symbol != "BTCUSDT" and \
+                getattr(Config, "BD_REL_STRENGTH_ENABLED", True):
+            try:
+                coin_pct = self._market_ctx.price_change_pct_24h(symbol)
+                btc_pct  = self._market_ctx.btc_change_pct_24h()
+                if coin_pct is not None and btc_pct is not None:
+                    diff = coin_pct - btc_pct
+                    bd_min_diff = float(
+                        getattr(Config, "BD_REL_STRENGTH_MIN_DIFF", 1.0)
+                    )
+                    # 做空要 diff <= -bd_min_diff（個幣弱於 BTC ≥ 1%）
+                    if diff > -bd_min_diff:
+                        log.debug(
+                            f"[{symbol}] BD 相對弱勢不足："
+                            f"coin 24h={coin_pct:+.2f}% BTC={btc_pct:+.2f}% "
+                            f"diff={diff:+.2f}% > -{bd_min_diff}%"
+                        )
+                        return None
+            except Exception as e:
+                log.debug(f"[{symbol}] BD 相對弱勢檢查失敗（略過）: {e}")
+
         try:
             df = self._get_klines(symbol, self.default_timeframe, limit=200)
         except Exception as e:

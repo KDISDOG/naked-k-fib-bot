@@ -263,6 +263,29 @@ class MeanReversionStrategy(BaseStrategy):
         if side is None:
             return None
 
+        # ── 結構性過濾（v5：根因解 MR 邊際負期望）──────────────
+        # 之前 MR 44% win × R:R 1.14 → 微負期望，主因「無結構盲接 RSI 訊號」。
+        # 加兩道硬門檻：
+        #   1. 正規 RSI 背離（價格 LL + RSI HL）→ 動能轉強早期訊號
+        #   2. 接近結構性 S/R 區（最近 swing low/high）→ 確認有支撐
+        # 預期：訊號量 -60~70%，但勝率從 44% → 50%+，期望值由負轉正。
+
+        if getattr(Config, "MR_REQUIRE_DIVERGENCE", True):
+            div_lookback = int(getattr(Config, "MR_DIV_LOOKBACK", 20))
+            if not self._has_rsi_divergence(df_a, rsi, side, div_lookback):
+                log.debug(f"[{symbol}] MR {side} 無 RSI 背離（lookback={div_lookback}），跳過")
+                return None
+
+        if getattr(Config, "MR_REQUIRE_SR_TEST", True):
+            sr_lookback = int(getattr(Config, "MR_SR_LOOKBACK", 30))
+            sr_tol = float(getattr(Config, "MR_SR_TOLERANCE", 0.015))
+            if not self._has_sr_test(df_a, side, sr_lookback, sr_tol):
+                log.debug(
+                    f"[{symbol}] MR {side} 未測試到結構性 S/R "
+                    f"(lookback={sr_lookback} tol={sr_tol*100:.1f}%)，跳過"
+                )
+                return None
+
         # ── BTC 週線趨勢過濾（MR 兩邊都不逆大盤）────────────────
         # LONG 被週線空頭過濾、SHORT 被週線多頭過濾，避免小週期反轉訊號
         # 跟大週期方向硬碰硬（牛市急拉時 RSI>75 的山寨做空常被掃）
@@ -326,6 +349,104 @@ class MeanReversionStrategy(BaseStrategy):
             f"BB={'下' if side=='LONG' else '上'}軌 強度={score}"
         )
         return sig
+
+    # ── RSI 背離偵測（v5）────────────────────────────────────────
+    def _has_rsi_divergence(
+        self,
+        df: pd.DataFrame,
+        rsi_series: pd.Series,
+        side: str,
+        lookback: int = 20,
+    ) -> bool:
+        """
+        正規 RSI 背離（比現有「最近 2 根 MACD hist」嚴格得多）：
+
+        LONG bullish divergence：
+            價格在 lookback 內創 lower-low，但 RSI 在同位點創 higher-low
+            → 動能轉強的早期訊號，反彈成功率高
+
+        SHORT bearish divergence：
+            價格 higher-high + RSI lower-high
+
+        實作：
+        1. 找 lookback 區間內最近的兩個 swing low/high（彼此間隔 ≥ 3 根）
+        2. 比較它們的價格 + 對應 RSI 值
+        3. 滿足背離條件 → 回 True
+        """
+        if df is None or rsi_series is None:
+            return False
+        try:
+            window = df.tail(lookback).reset_index(drop=True)
+            rsi_w = rsi_series.tail(lookback).reset_index(drop=True)
+            if len(window) < 8 or len(rsi_w) < 8:
+                return False
+
+            if side == "LONG":
+                # 找最低點（swing low）
+                cur_idx = int(window["low"].idxmin())
+                # 之前的 swing low（隔 ≥ 3 根，避免相鄰）
+                prior_window = window["low"].iloc[:max(0, cur_idx - 3)]
+                if len(prior_window) < 3:
+                    return False
+                prev_idx = int(prior_window.idxmin())
+                # 條件：價格 lower-low + RSI higher-low
+                price_ll = float(window["low"].iloc[cur_idx]) < \
+                           float(window["low"].iloc[prev_idx])
+                rsi_hl = float(rsi_w.iloc[cur_idx]) > \
+                         float(rsi_w.iloc[prev_idx])
+                # 排除過於接近（無意義）：RSI 差至少 2 點
+                rsi_meaningful = abs(
+                    float(rsi_w.iloc[cur_idx]) - float(rsi_w.iloc[prev_idx])
+                ) >= 2.0
+                return price_ll and rsi_hl and rsi_meaningful
+            else:  # SHORT
+                cur_idx = int(window["high"].idxmax())
+                prior_window = window["high"].iloc[:max(0, cur_idx - 3)]
+                if len(prior_window) < 3:
+                    return False
+                prev_idx = int(prior_window.idxmax())
+                price_hh = float(window["high"].iloc[cur_idx]) > \
+                           float(window["high"].iloc[prev_idx])
+                rsi_lh = float(rsi_w.iloc[cur_idx]) < \
+                         float(rsi_w.iloc[prev_idx])
+                rsi_meaningful = abs(
+                    float(rsi_w.iloc[cur_idx]) - float(rsi_w.iloc[prev_idx])
+                ) >= 2.0
+                return price_hh and rsi_lh and rsi_meaningful
+        except Exception:
+            return False
+
+    # ── 支撐/阻力測試（v5）──────────────────────────────────────
+    def _has_sr_test(
+        self,
+        df: pd.DataFrame,
+        side: str,
+        lookback: int = 30,
+        tolerance: float = 0.015,
+    ) -> bool:
+        """
+        確認當前價格在「結構性 S/R 區」：
+          LONG  → 當前 close 接近 lookback 內的最低 low（±tolerance）
+          SHORT → 接近最高 high
+
+        防止在「無結構支撐」的下跌中盲接刀子（mean revert 失敗主因）。
+        """
+        if df is None or len(df) < lookback + 1:
+            return False
+        try:
+            window = df.iloc[-lookback - 1:-1]  # 不含當根（防 self-reference）
+            cur = float(df["close"].iloc[-1])
+            if side == "LONG":
+                key_level = float(window["low"].min())
+                # 當前價必須在 key_level 的 ±tolerance 範圍內
+                return cur <= key_level * (1 + tolerance) and \
+                       cur >= key_level * (1 - tolerance * 2)
+            else:
+                key_level = float(window["high"].max())
+                return cur >= key_level * (1 - tolerance) and \
+                       cur <= key_level * (1 + tolerance * 2)
+        except Exception:
+            return False
 
     # ── 反轉 K 棒偵測 ────────────────────────────────────────────
 
