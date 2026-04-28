@@ -225,7 +225,9 @@ class Config:
     # 兩層 v2：
     #   ① Volume Burst 替代訊號（單根爆量續勢）— 增訊號量
     #   ② HTF (4h EMA50) confluence — 提升質
-    ML_V2_ENABLED            = os.getenv("ML_V2_ENABLED", "true").lower() == "true"
+    # 12m 驗證失敗：v1 +7.70 → v2 +5.19，HTF 過濾把好交易擋掉
+    # 預設關閉，code 保留
+    ML_V2_ENABLED            = os.getenv("ML_V2_ENABLED", "false").lower() == "true"
     # ① Volume Burst：cur_vol ≥ MULT × avg_vol + close 在當根高 70%+ + close > EMA20
     # 預設關閉：回測 38.6% win（vs v1 45.5%），單根爆量但無 follow-through
     # 訊號太多，反而拖累。保留 code 給未來改進（如加 next-bar 確認）
@@ -233,7 +235,7 @@ class Config:
     ML_V2_VOL_BURST_MULT     = float(os.getenv("ML_V2_VOL_BURST_MULT", 3.0))
     ML_V2_VOL_BURST_CLOSE_PCT = float(os.getenv("ML_V2_VOL_BURST_CLOSE_PCT", 0.7))
     # ② HTF confluence：4h EMA50 上行（slope ≥ 0.3% over 5 bars）才放行
-    ML_V2_HTF_ENABLED        = os.getenv("ML_V2_HTF_ENABLED", "true").lower() == "true"
+    ML_V2_HTF_ENABLED        = os.getenv("ML_V2_HTF_ENABLED", "false").lower() == "true"
     ML_V2_HTF_TIMEFRAME      = os.getenv("ML_V2_HTF_TIMEFRAME", "4h")
     ML_V2_HTF_EMA_PERIOD     = int(os.getenv("ML_V2_HTF_EMA_PERIOD", 50))
     # 0.003 過嚴（回測訊號 -60% 且 PnL 反降），放寬到 0.001 只擋明顯下行
@@ -251,9 +253,11 @@ class Config:
     #   ② 殺到底部支撐區（BTC/XRP/ETH 拖累 -14）
     #   ③ 沒辨識「失敗反彈」結構
     # 三層 v2 補丁：
-    BD_V2_ENABLED             = os.getenv("BD_V2_ENABLED", "true").lower() == "true"
+    # 12m 驗證失敗：v1 -1.26 → v2 -9.99，multi-bar 等確認錯過初期動量
+    # 預設關閉，code 保留供未來改進（如 different confirmation logic）
+    BD_V2_ENABLED             = os.getenv("BD_V2_ENABLED", "false").lower() == "true"
     # ① Multi-bar confirmation：要求 i-1 突破 + i 收更低
-    BD_V2_REQUIRE_CONFIRM     = os.getenv("BD_V2_REQUIRE_CONFIRM", "true").lower() == "true"
+    BD_V2_REQUIRE_CONFIRM     = os.getenv("BD_V2_REQUIRE_CONFIRM", "false").lower() == "true"
     # ② 拒絕距支撐區太近：close 距最近 N 根 swing low < ATR_MULT × ATR 拒絕
     # 註：對突破策略概念衝突（觸發時 price < support 必然接近 deepest_low），
     # 預設關閉。保留 code 給左側策略借用。
@@ -261,7 +265,7 @@ class Config:
     BD_V2_SUPPORT_LOOKBACK    = int(os.getenv("BD_V2_SUPPORT_LOOKBACK", 30))
     BD_V2_SUPPORT_ATR_MULT    = float(os.getenv("BD_V2_SUPPORT_ATR_MULT", 1.0))
     # ③ 要求近 N 根至少 2 個 lower-high（失敗反彈確認）
-    BD_V2_REQUIRE_LOWER_HIGHS = os.getenv("BD_V2_REQUIRE_LOWER_HIGHS", "true").lower() == "true"
+    BD_V2_REQUIRE_LOWER_HIGHS = os.getenv("BD_V2_REQUIRE_LOWER_HIGHS", "false").lower() == "true"
     BD_V2_LH_LOOKBACK         = int(os.getenv("BD_V2_LH_LOOKBACK", 30))
 
     # MR 結構性確認（v5）：避免單純 RSI 觸發在無 S/R 區的雜訊位
