@@ -321,22 +321,76 @@ class MomentumLongStrategy(BaseStrategy):
         recent_highs = df_a["high"].iloc[-(lookback + 1):-1]
         resistance_level = float(recent_highs.max())
 
-        # 當根收盤必須突破阻力
-        if price <= resistance_level:
-            return None
-
-        # 突破幅度不能太小（避免假突破）
-        break_pct = (price - resistance_level) / resistance_level
-        if break_pct < 0.001:  # 至少突破 0.1%
-            return None
-
-        # ── 放量確認 ─────────────────────────────────────────────
         avg_vol = float(df_a["volume"].tail(21).iloc[:-1].mean())
         last_vol = float(df_a["volume"].iloc[-1])
+
+        # ── 標準路徑：突破 + 放量 ──────────────────────────────
+        breakout_ok = price > resistance_level and \
+                      (price - resistance_level) / resistance_level >= 0.001
         vol_ok = last_vol >= avg_vol * Config.ML_VOL_MULT
 
+        path_breakout = breakout_ok and vol_ok
+
+        # ── ML v2 路徑：Volume Burst 續勢（無需突破）────────────
+        path_burst = False
+        if (getattr(Config, "ML_V2_ENABLED", False)
+                and getattr(Config, "ML_V2_VOL_BURST_ENABLED", True)):
+            burst_mult     = float(getattr(Config, "ML_V2_VOL_BURST_MULT", 3.0))
+            close_pct_min  = float(getattr(Config, "ML_V2_VOL_BURST_CLOSE_PCT", 0.7))
+            cur_high   = float(latest["high"])
+            cur_low    = float(latest["low"])
+            cur_range  = cur_high - cur_low
+            close_pos  = (price - cur_low) / cur_range if cur_range > 0 else 0
+            if last_vol >= avg_vol * burst_mult and close_pos >= close_pct_min:
+                # close 在上 30%、vol >= 3× 均量、price > EMA20（已驗證）
+                path_burst = True
+                log.debug(
+                    f"[{symbol}] ML v2 Volume Burst：vol/avg="
+                    f"{last_vol/avg_vol:.1f}× close@{close_pos*100:.0f}%"
+                )
+
+        if not (path_breakout or path_burst):
+            return None  # 既非突破也非爆量續勢
+
+        # ── ML v2 HTF (4h EMA50) 趨勢過濾 ───────────────────────
+        if getattr(Config, "ML_V2_ENABLED", False) and \
+                getattr(Config, "ML_V2_HTF_ENABLED", True):
+            try:
+                htf_tf     = getattr(Config, "ML_V2_HTF_TIMEFRAME", "4h")
+                htf_period = int(getattr(Config, "ML_V2_HTF_EMA_PERIOD", 50))
+                slope_bars = int(getattr(Config, "ML_V2_HTF_SLOPE_BARS", 5))
+                min_slope  = float(getattr(Config, "ML_V2_HTF_MIN_SLOPE_PCT", 0.003))
+                df_htf = self._get_klines(
+                    symbol, htf_tf, limit=htf_period + slope_bars + 30
+                )
+                if len(df_htf) >= htf_period + slope_bars + 3:
+                    htf_ema = ta.ema(df_htf["close"], length=htf_period)
+                    htf_close = float(df_htf["close"].iloc[-2])
+                    htf_ema_v = float(htf_ema.iloc[-2])
+                    htf_ema_past = float(htf_ema.iloc[-2 - slope_bars])
+                    if not (pd.isna(htf_close) or pd.isna(htf_ema_v) or
+                            pd.isna(htf_ema_past)) and htf_ema_past > 0:
+                        # close 必須在 EMA 上方
+                        if htf_close <= htf_ema_v:
+                            log.debug(
+                                f"[{symbol}] ML v2 HTF 過濾："
+                                f"4h close={htf_close:.4f} ≤ EMA={htf_ema_v:.4f}"
+                            )
+                            return None
+                        # EMA 必須有上行強度
+                        slope_pct = (htf_ema_v - htf_ema_past) / htf_ema_past
+                        if slope_pct < min_slope:
+                            log.debug(
+                                f"[{symbol}] ML v2 HTF 斜率不足："
+                                f"slope={slope_pct*100:+.3f}% < {min_slope*100:.2f}%"
+                            )
+                            return None
+            except Exception as e:
+                log.debug(f"[{symbol}] ML v2 HTF 檢查失敗（fail-open）: {e}")
+
+        # 後續流程沿用既有邏輯（vol_ok 給 score 計算用）
         if not vol_ok:
-            return None  # 突破無量，可能是假突破
+            vol_ok = last_vol >= avg_vol * 1.0  # burst 路徑允許量能標準放寬
 
         # ── 訊號評分 ─────────────────────────────────────────────
         score = self._score_signal(

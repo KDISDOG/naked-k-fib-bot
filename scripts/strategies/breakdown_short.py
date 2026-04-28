@@ -330,6 +330,48 @@ class BreakdownShortStrategy(BaseStrategy):
         if len(df_a) < lookback + 1:
             return None
 
+        # ── BD v2 結構過濾（在突破檢查前，省 CPU）──────────────
+        v2_enabled = bool(getattr(Config, "BD_V2_ENABLED", False))
+
+        # ② v2：拒絕近支撐區進場（不殺底）
+        if v2_enabled and getattr(Config, "BD_V2_REJECT_NEAR_SUPPORT", True):
+            sup_lookback = int(getattr(Config, "BD_V2_SUPPORT_LOOKBACK", 30))
+            sup_mult     = float(getattr(Config, "BD_V2_SUPPORT_ATR_MULT", 1.0))
+            if len(df_a) >= sup_lookback + 1:
+                deepest_low = float(df_a["low"].iloc[-(sup_lookback+1):-1].min())
+                if price - deepest_low < sup_mult * atr_val:
+                    log.debug(
+                        f"[{symbol}] BD v2 拒絕：close {price:.4f} 距 "
+                        f"{sup_lookback} 根支撐 {deepest_low:.4f} 不到 "
+                        f"{sup_mult}×ATR"
+                    )
+                    return None
+
+        # ③ v2：要求「失敗反彈」結構（≥2 個 lower-high）
+        if v2_enabled and getattr(Config, "BD_V2_REQUIRE_LOWER_HIGHS", True):
+            lh_lookback = int(getattr(Config, "BD_V2_LH_LOOKBACK", 30))
+            if len(df_a) >= lh_lookback + 2:
+                window = df_a.iloc[-lh_lookback:].reset_index(drop=True)
+                # 簡單 fractal swing high：左 2 右 2
+                swing_highs = []
+                hs = window["high"].values
+                for k in range(2, len(hs) - 2):
+                    if hs[k] >= hs[k-1] and hs[k] >= hs[k-2] \
+                            and hs[k] >= hs[k+1] and hs[k] >= hs[k+2]:
+                        swing_highs.append(float(hs[k]))
+                if len(swing_highs) < 2:
+                    log.debug(
+                        f"[{symbol}] BD v2 拒絕：近 {lh_lookback} 根 swing high < 2"
+                    )
+                    return None
+                # 至少最後一個比之前的低（lower-high）
+                if swing_highs[-1] >= max(swing_highs[:-1]):
+                    log.debug(
+                        f"[{symbol}] BD v2 拒絕：無 lower-high 結構，"
+                        f"latest sh={swing_highs[-1]:.4f} 不低於 prior max"
+                    )
+                    return None
+
         # 近 N 根的最低點（不含當根）
         recent_lows = df_a["low"].iloc[-(lookback + 1):-1]
         support_level = float(recent_lows.min())
@@ -346,7 +388,40 @@ class BreakdownShortStrategy(BaseStrategy):
         # ── 放量確認 ─────────────────────────────────────────────
         avg_vol = float(df_a["volume"].tail(21).iloc[:-1].mean())
         last_vol = float(df_a["volume"].iloc[-1])
-        vol_ok = last_vol >= avg_vol * Config.BD_VOL_MULT
+
+        # ① v2：multi-bar confirmation
+        # 突破在 i-1（前一根 close < support），i 必須 close 更低
+        if v2_enabled and getattr(Config, "BD_V2_REQUIRE_CONFIRM", True):
+            if len(df_a) < 3:
+                return None
+            prev_close = float(df_a["close"].iloc[-2])
+            prev_low   = float(df_a["low"].iloc[-2])
+            # i-1 必須也跌破 support（兩根連續確認）
+            if prev_close >= support_level:
+                log.debug(
+                    f"[{symbol}] BD v2 拒絕：前一根 close {prev_close:.4f} "
+                    f"未跌破 support {support_level:.4f}"
+                )
+                return None
+            # i 收得比 i-1 更低（持續下行）
+            if price >= prev_close:
+                log.debug(
+                    f"[{symbol}] BD v2 拒絕：當根 close {price:.4f} ≥ "
+                    f"前根 close {prev_close:.4f}（無延續）"
+                )
+                return None
+            # 量能：兩根總量 ≥ 均量 × VOL_MULT × 2
+            prev_vol = float(df_a["volume"].iloc[-2])
+            combined_vol = last_vol + prev_vol
+            if combined_vol < avg_vol * Config.BD_VOL_MULT * 2:
+                log.debug(
+                    f"[{symbol}] BD v2 拒絕：兩根合計量能不足 "
+                    f"{combined_vol:.0f} < {avg_vol * Config.BD_VOL_MULT * 2:.0f}"
+                )
+                return None
+            vol_ok = True
+        else:
+            vol_ok = last_vol >= avg_vol * Config.BD_VOL_MULT
 
         if not vol_ok:
             return None  # 突破無量，可能是假突破

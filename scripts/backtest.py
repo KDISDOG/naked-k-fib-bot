@@ -668,7 +668,52 @@ def run_backtest_ml(client: Client, symbol: str, months: int,
     min_score    = Config.ML_MIN_SCORE
 
     dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0,
-           "regime_block": 0, "signals": 0}
+           "regime_block": 0, "v2_htf_block": 0, "v2_no_entry": 0,
+           "signals": 0}
+
+    # ── ML v2 旗標 + HTF 預計算 ─────────────────────────────────
+    v2_enabled = bool(getattr(Config, "ML_V2_ENABLED", False))
+    v2_burst   = v2_enabled and bool(getattr(Config, "ML_V2_VOL_BURST_ENABLED", True))
+    v2_htf     = v2_enabled and bool(getattr(Config, "ML_V2_HTF_ENABLED", True))
+    burst_mult = float(getattr(Config, "ML_V2_VOL_BURST_MULT", 3.0))
+    burst_close_pct = float(getattr(Config, "ML_V2_VOL_BURST_CLOSE_PCT", 0.7))
+
+    htf_close_arr = None
+    htf_ema_arr   = None
+    htf_slope_arr = None
+    if v2_htf:
+        try:
+            htf_tf      = getattr(Config, "ML_V2_HTF_TIMEFRAME", "4h")
+            htf_period  = int(getattr(Config, "ML_V2_HTF_EMA_PERIOD", 50))
+            htf_slope_n = int(getattr(Config, "ML_V2_HTF_SLOPE_BARS", 5))
+            print(f"  下載 ML HTF {htf_tf} 計算 EMA{htf_period}...", end="", flush=True)
+            df_htf = fetch_klines(client, symbol, htf_tf, months + 2)
+            if len(df_htf) >= htf_period + htf_slope_n + 5:
+                htf_ema = ta.ema(df_htf["close"], length=htf_period)
+                htf_slope = (htf_ema - htf_ema.shift(htf_slope_n)) / htf_ema.shift(htf_slope_n)
+                df_htf_aligned = pd.DataFrame({
+                    "close_time": pd.to_datetime(df_htf["close_time"], unit="ms"),
+                    "htf_close":  df_htf["close"].values,
+                    "htf_ema":    htf_ema.values,
+                    "htf_slope":  htf_slope.values,
+                }).dropna()
+                df_1h_idx = df_tf[["time"]].copy()
+                df_1h_idx["_orig_idx"] = range(len(df_1h_idx))
+                merged = pd.merge_asof(
+                    df_1h_idx.sort_values("time"),
+                    df_htf_aligned.sort_values("close_time"),
+                    left_on="time", right_on="close_time",
+                    direction="backward",
+                )
+                merged = merged.sort_values("_orig_idx").reset_index(drop=True)
+                htf_close_arr = merged["htf_close"].values
+                htf_ema_arr   = merged["htf_ema"].values
+                htf_slope_arr = merged["htf_slope"].values
+                print(" 完成")
+            else:
+                print(" 資料不足，HTF 過濾停用")
+        except Exception as e:
+            print(f" 失敗（{e}），HTF 過濾停用")
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -708,20 +753,42 @@ def run_backtest_ml(client: Client, symbol: str, months: int,
             dbg["no_sig"] += 1
             continue
 
-        # ── 突破偵測：收盤突破近 N 根最高點 ─────────────────────
-        if price <= resistance:
-            dbg["no_sig"] += 1
-            continue
-        break_pct = (price - resistance) / resistance
-        if break_pct < 0.001:
-            dbg["no_sig"] += 1
+        last_vol = float(df_tf["volume"].iloc[i])
+
+        # ── 標準路徑：突破 + 放量 ──────────────────────────────
+        breakout_ok = price > resistance and \
+                      (price - resistance) / resistance >= 0.001
+        vol_ok = last_vol >= float(avg_vol_i) * Config.ML_VOL_MULT
+        path_breakout = breakout_ok and vol_ok
+
+        # ── ML v2 Volume Burst 路徑 ─────────────────────────────
+        path_burst = False
+        if v2_burst:
+            cur_high = float(df_tf["high"].iloc[i])
+            cur_low  = float(df_tf["low"].iloc[i])
+            cur_range = cur_high - cur_low
+            close_pos = (price - cur_low) / cur_range if cur_range > 0 else 0
+            if last_vol >= float(avg_vol_i) * burst_mult and close_pos >= burst_close_pct:
+                path_burst = True
+
+        if not (path_breakout or path_burst):
+            dbg["v2_no_entry"] += 1 if v2_enabled else 0
+            dbg["no_sig"] += 1 if not v2_enabled else 0
             continue
 
-        # ── 放量確認 ─────────────────────────────────────────────
-        last_vol = float(df_tf["volume"].iloc[i])
-        if last_vol < float(avg_vol_i) * Config.ML_VOL_MULT:
-            dbg["no_sig"] += 1
-            continue
+        # ── ML v2 HTF 過濾 ──────────────────────────────────────
+        if v2_htf and htf_close_arr is not None:
+            htf_c = htf_close_arr[i] if i < len(htf_close_arr) else None
+            htf_e = htf_ema_arr[i]   if i < len(htf_ema_arr)   else None
+            htf_s = htf_slope_arr[i] if i < len(htf_slope_arr) else None
+            if htf_c is not None and htf_e is not None and htf_s is not None \
+                    and not pd.isna(htf_c) and not pd.isna(htf_e) and not pd.isna(htf_s):
+                htf_c = float(htf_c); htf_e = float(htf_e); htf_s = float(htf_s)
+                min_slope = float(getattr(Config, "ML_V2_HTF_MIN_SLOPE_PCT", 0.003))
+                # close 必須在 EMA 上方 + EMA 上行 ≥ min_slope
+                if htf_c <= htf_e or htf_s < min_slope:
+                    dbg["v2_htf_block"] += 1
+                    continue
 
         # ── 評分 ─────────────────────────────────────────────────
         score = 1  # 基礎分
@@ -925,7 +992,12 @@ def run_backtest_bd(client: Client, symbol: str, months: int, *,
     timeout_bars = Config.BD_TIMEOUT_BARS
     min_score    = Config.BD_MIN_SCORE
 
-    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0, "signals": 0}
+    dbg = {"cooldown": 0, "no_sig": 0, "low_score": 0, "bad_pos": 0,
+           "v2_near_support": 0, "v2_no_lh": 0, "v2_no_confirm": 0,
+           "signals": 0}
+
+    # BD v2 旗標
+    v2_enabled = bool(getattr(Config, "BD_V2_ENABLED", False))
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -965,6 +1037,29 @@ def run_backtest_bd(client: Client, symbol: str, months: int, *,
             dbg["no_sig"] += 1
             continue
 
+        # ── BD v2 結構過濾 ───────────────────────────────────────
+        if v2_enabled and getattr(Config, "BD_V2_REJECT_NEAR_SUPPORT", True):
+            sup_lookback = int(getattr(Config, "BD_V2_SUPPORT_LOOKBACK", 30))
+            sup_mult     = float(getattr(Config, "BD_V2_SUPPORT_ATR_MULT", 1.0))
+            if i >= sup_lookback + 1:
+                deepest_low = float(df_tf["low"].iloc[i - sup_lookback:i].min())
+                if price - deepest_low < sup_mult * atr_val:
+                    dbg["v2_near_support"] += 1
+                    continue
+
+        if v2_enabled and getattr(Config, "BD_V2_REQUIRE_LOWER_HIGHS", True):
+            lh_lookback = int(getattr(Config, "BD_V2_LH_LOOKBACK", 30))
+            if i >= lh_lookback + 2:
+                hs = df_tf["high"].iloc[i - lh_lookback:i].values
+                swing_highs = []
+                for k in range(2, len(hs) - 2):
+                    if hs[k] >= hs[k-1] and hs[k] >= hs[k-2] \
+                            and hs[k] >= hs[k+1] and hs[k] >= hs[k+2]:
+                        swing_highs.append(float(hs[k]))
+                if len(swing_highs) < 2 or swing_highs[-1] >= max(swing_highs[:-1]):
+                    dbg["v2_no_lh"] += 1
+                    continue
+
         # ── 突破偵測：收盤跌破近 N 根最低點 ─────────────────────
         if price >= support:
             dbg["no_sig"] += 1
@@ -976,9 +1071,26 @@ def run_backtest_bd(client: Client, symbol: str, months: int, *,
 
         # ── 放量確認 ─────────────────────────────────────────────
         last_vol = float(df_tf["volume"].iloc[i])
-        if last_vol < float(avg_vol_i) * Config.BD_VOL_MULT:
-            dbg["no_sig"] += 1
-            continue
+
+        # ── BD v2 multi-bar confirmation ────────────────────────
+        if v2_enabled and getattr(Config, "BD_V2_REQUIRE_CONFIRM", True):
+            if i < 2:
+                continue
+            prev_close = float(df_tf["close"].iloc[i - 1])
+            if prev_close >= support:
+                dbg["v2_no_confirm"] += 1
+                continue
+            if price >= prev_close:
+                dbg["v2_no_confirm"] += 1
+                continue
+            prev_vol = float(df_tf["volume"].iloc[i - 1])
+            if last_vol + prev_vol < float(avg_vol_i) * Config.BD_VOL_MULT * 2:
+                dbg["v2_no_confirm"] += 1
+                continue
+        else:
+            if last_vol < float(avg_vol_i) * Config.BD_VOL_MULT:
+                dbg["no_sig"] += 1
+                continue
 
         # ── 評分 ─────────────────────────────────────────────────
         score = 1  # 基礎分
