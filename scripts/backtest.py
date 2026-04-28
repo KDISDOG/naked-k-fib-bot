@@ -2115,9 +2115,10 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
     res_min_touches = int(Config.MASR_RES_MIN_TOUCHES)
 
     dbg = {"cooldown": 0, "no_ema": 0, "no_resistance": 0,
-           "no_breakout": 0, "no_volume": 0, "atr_hot": 0,
+           "no_breakout": 0, "weak_breakout": 0, "no_volume": 0, "atr_hot": 0,
            "dist_ema50": 0, "low_score": 0, "bad_pos": 0,
            "signals": 0}
+    min_break = float(Config.MASR_MIN_BREAKOUT_PCT)
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -2167,9 +2168,12 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
             dbg["no_resistance"] += 1
             continue
 
-        # 條件 a: close > R
+        # 條件 a: close > R × (1 + MIN_BREAKOUT_PCT)
         if cur_close <= resistance:
             dbg["no_breakout"] += 1
+            continue
+        if cur_close < resistance * (1 + min_break):
+            dbg["weak_breakout"] += 1
             continue
 
         # 條件 c: 量能 > 1.3× 均量
@@ -2253,6 +2257,7 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
         print(f"  ├─ ATR 過熱（前 20%）       ：{dbg['atr_hot']}")
         print(f"  ├─ 找不到阻力位             ：{dbg['no_resistance']}")
         print(f"  ├─ 未突破                   ：{dbg['no_breakout']}")
+        print(f"  ├─ 弱突破（< MIN_BREAKOUT）  ：{dbg['weak_breakout']}")
         print(f"  ├─ 量能不足                 ：{dbg['no_volume']}")
         print(f"  ├─ 評分不足 (<{min_score})  ：{dbg['low_score']}")
         print(f"  ├─ SL 位置異常              ：{dbg['bad_pos']}")

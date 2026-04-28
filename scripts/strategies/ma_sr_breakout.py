@@ -242,10 +242,15 @@ class MaSrBreakoutStrategy(BaseStrategy):
             log.debug(f"[{symbol}] MASR 拒絕：找不到 ≥{Config.MASR_RES_MIN_TOUCHES} 次測試的阻力")
             return None
 
-        # 條件 a: close > R
-        if cur_close <= resistance:
+        # 條件 a: close > R × (1 + MIN_BREAKOUT_PCT)
+        # 加最小突破幅度過濾：避免「貼 R 上方一點點」的假突破
+        # 12m 回測：49.6% SL 命中率主因是這種弱突破
+        min_break = float(getattr(Config, "MASR_MIN_BREAKOUT_PCT", 0.005))
+        if cur_close <= resistance * (1 + min_break):
+            breakout_pct = (cur_close - resistance) / resistance
             log.debug(
-                f"[{symbol}] MASR 拒絕：close {cur_close:.4f} ≤ R {resistance:.4f}"
+                f"[{symbol}] MASR 拒絕：突破幅度 {breakout_pct*100:.2f}% < "
+                f"{min_break*100:.2f}%（close {cur_close:.4f} R {resistance:.4f}）"
             )
             return None
 
