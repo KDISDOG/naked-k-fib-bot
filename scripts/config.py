@@ -257,9 +257,10 @@ class Config:
     MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))
     MASR_RES_MIN_TOUCHES      = int(os.getenv("MASR_RES_MIN_TOUCHES", 2))
     MASR_VOL_MULT             = float(os.getenv("MASR_VOL_MULT", 1.3))
-    # 最小突破幅度：close 至少高過 R × (1 + MIN_BREAKOUT_PCT)
-    # 解 49.6% SL 命中率：假突破多為「貼 R 上方一點點」，加最小幅度過濾
-    MASR_MIN_BREAKOUT_PCT     = float(os.getenv("MASR_MIN_BREAKOUT_PCT", 0.005))  # 0.5%
+    # 最小突破幅度：嘗試 0.005 解 49.6% SL 命中率，但 12m 回測證明無效
+    # （605/+66 → 266/+36，filter 砍掉的是正期望訊號）
+    # 預設 0（關閉）。突破強弱與後續勝率無顯著相關。
+    MASR_MIN_BREAKOUT_PCT     = float(os.getenv("MASR_MIN_BREAKOUT_PCT", 0.0))
     MASR_ATR_PERCENTILE_MAX   = float(os.getenv("MASR_ATR_PERCENTILE_MAX", 0.80))  # ATR 不在前 20%
     MASR_MAX_DIST_FROM_EMA50  = float(os.getenv("MASR_MAX_DIST_FROM_EMA50", 0.08))  # 距 EMA50 < 8%
     # 出場
