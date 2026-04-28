@@ -2117,8 +2117,12 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
     dbg = {"cooldown": 0, "no_ema": 0, "no_resistance": 0,
            "no_breakout": 0, "weak_breakout": 0, "no_volume": 0, "atr_hot": 0,
            "dist_ema50": 0, "low_score": 0, "bad_pos": 0,
-           "signals": 0}
+           "weak_30d": 0, "signals": 0}
     min_break = float(Config.MASR_MIN_BREAKOUT_PCT)
+    # v3 C：30 日漲幅最低門檻（過濾橫盤幣的 4h 突破訊號）
+    min_30d = float(getattr(Config, "MASR_MIN_30D_RETURN_PCT", 0.0))
+    # 4h timeframe → 30 days = 30 × 24 / 4 = 180 bars
+    bars_30d = 180 if tf == "4h" else (30 if tf == "1d" else 30 * 24 * 60 // 60)
 
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
@@ -2143,6 +2147,15 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
         if ema20_v <= ema50_v:
             dbg["no_ema"] += 1
             continue
+
+        # v3 C：30 日漲幅最低門檻（趨勢強度過濾）
+        if min_30d > 0 and i >= bars_30d:
+            old_close = float(df_tf["close"].iloc[i - bars_30d])
+            if old_close > 0:
+                ret_30d = (cur_close - old_close) / old_close
+                if ret_30d < min_30d:
+                    dbg["weak_30d"] += 1
+                    continue
 
         # 距 EMA50 漲幅 < 8%
         if ema50_v <= 0:
@@ -2253,6 +2266,7 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
         print(f"\n  ── MASR 診斷 ──")
         print(f"  總掃描根數：{scanned}")
         print(f"  ├─ EMA20 ≤ EMA50           ：{dbg['no_ema']}")
+        print(f"  ├─ 30d 漲幅 < {min_30d*100:.1f}%      ：{dbg['weak_30d']}")
         print(f"  ├─ 距 EMA50 > 8%（追高）   ：{dbg['dist_ema50']}")
         print(f"  ├─ ATR 過熱（前 20%）       ：{dbg['atr_hot']}")
         print(f"  ├─ 找不到阻力位             ：{dbg['no_resistance']}")
