@@ -250,11 +250,11 @@ class Config:
     MASR_SCREEN_ATR_MIN_PCT   = float(os.getenv("MASR_SCREEN_ATR_MIN_PCT", 2.0))
     MASR_SCREEN_ATR_MAX_PCT   = float(os.getenv("MASR_SCREEN_ATR_MAX_PCT", 8.0))
     MASR_SCREEN_EMA200_MAX_PCT = float(os.getenv("MASR_SCREEN_EMA200_MAX_PCT", 0.50))
-    # 10 → 5：只跟最強 5 名 momentum（v3：強化選幣）
-    MASR_TOP_N                = int(os.getenv("MASR_TOP_N", 5))
+    # 試過 5（v3 C），訊號量砍 53% / PnL -47，revert 回 10
+    MASR_TOP_N                = int(os.getenv("MASR_TOP_N", 10))
     MASR_MIN_LISTING_DAYS     = int(os.getenv("MASR_MIN_LISTING_DAYS", 180))
-    # 30 日漲幅最低門檻（過濾橫盤幣）：5% 才入選
-    MASR_MIN_30D_RETURN_PCT   = float(os.getenv("MASR_MIN_30D_RETURN_PCT", 0.05))
+    # 試過 0.05（v3 C），filter 砍正期望訊號 → 0 = 關閉
+    MASR_MIN_30D_RETURN_PCT   = float(os.getenv("MASR_MIN_30D_RETURN_PCT", 0.0))
     # 進場條件
     MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
     MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))
@@ -267,9 +267,9 @@ class Config:
     MASR_ATR_PERCENTILE_MAX   = float(os.getenv("MASR_ATR_PERCENTILE_MAX", 0.80))  # ATR 不在前 20%
     MASR_MAX_DIST_FROM_EMA50  = float(os.getenv("MASR_MAX_DIST_FROM_EMA50", 0.08))  # 距 EMA50 < 8%
     # 出場
-    # 1.5 → 1.0：嘗試 SL 收緊解 49.6% SL 命中率（v3）
-    # 副作用：TP 距離也同比收緊（R:R 不變）
-    MASR_SL_ATR_MULT          = float(os.getenv("MASR_SL_ATR_MULT", 1.0))
+    # SL 距離倍數。試過 1.0（v3）但 SL% 反升、PnL 僅微正 +2.83。
+    # 1.5 是 baseline 最佳值，revert。code 留 env 給未來嘗試。
+    MASR_SL_ATR_MULT          = float(os.getenv("MASR_SL_ATR_MULT", 1.5))
     MASR_TP1_RR               = float(os.getenv("MASR_TP1_RR", 2.0))
     MASR_TP2_RR               = float(os.getenv("MASR_TP2_RR", 4.0))   # backtest 模擬 trailing 用
     # 評分與通用
