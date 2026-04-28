@@ -1258,13 +1258,17 @@ def calc_position(balance: float, entry: float, sl: float,
 
 # ── 模擬交易結果（逐根比對後續 K 棒）───────────────────────────────
 def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
-                   max_bars: int = 48) -> BtTrade:
+                   max_bars: int = 48,
+                   sl_to_be_after_tp1: bool = False) -> BtTrade:
     """
     從開倉後，逐根 K 棒檢查是否觸發 SL / TP1 / TP2
     max_bars：最多持倉幾根（超過就以市價平倉）
+    sl_to_be_after_tp1：TP1 觸發後 SL 移到 entry（保本）。觸發此 SL
+                        時 result 改為 "TP1+BE"（剩餘 50% 零損失）
     """
     tp1_hit = False
     remaining_qty = trade.qty
+    active_sl = trade.sl  # 可動態調整（TP1 後若 sl_to_be_after_tp1=True 會改為 entry）
 
     for i, (_, bar) in enumerate(df_future.iterrows()):
         if i >= max_bars:
@@ -1287,9 +1291,9 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
         high, low = bar["high"], bar["low"]
 
         if trade.direction == "LONG":
-            # ── SL 觸發 ──
-            if low <= trade.sl:
-                exit_p = trade.sl
+            # ── SL 觸發（用 active_sl，可能已移保本）──
+            if low <= active_sl:
+                exit_p = active_sl
                 sl_qty = remaining_qty
                 pnl = (exit_p - trade.entry) * sl_qty
                 fee = (exit_p * sl_qty + trade.qty * trade.entry) * TAKER_FEE_RATE
@@ -1299,7 +1303,12 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                            if tp1_hit else 0)
                 total_pnl = pnl + tp1_pnl
                 total_fee = fee + tp1_fee
-                trade.result     = "TP1+SL" if tp1_hit else "SL"
+                if tp1_hit:
+                    # 若 SL 已移到 BE（保本）→ 標 TP1+BE，否則 TP1+SL
+                    is_be = sl_to_be_after_tp1 and abs(active_sl - trade.entry) < 1e-8
+                    trade.result = "TP1+BE" if is_be else "TP1+SL"
+                else:
+                    trade.result = "SL"
                 trade.exit_price = exit_p
                 trade.close_bar  = trade.open_bar + i
                 trade.pnl        = round(total_pnl, 4)
@@ -1313,6 +1322,9 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
             if not tp1_hit and high >= trade.tp1:
                 tp1_hit = True
                 remaining_qty = trade.qty_tp2
+                # SL 移到保本（如啟用）
+                if sl_to_be_after_tp1:
+                    active_sl = trade.entry
 
             # ── TP2 觸發（剩餘平倉）──
             if tp1_hit and high >= trade.tp2:
@@ -1332,9 +1344,9 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                 return trade
 
         else:  # SHORT
-            # ── SL 觸發 ──
-            if high >= trade.sl:
-                exit_p = trade.sl
+            # ── SL 觸發（用 active_sl）──
+            if high >= active_sl:
+                exit_p = active_sl
                 sl_qty = remaining_qty
                 pnl = (trade.entry - exit_p) * sl_qty
                 fee = (exit_p * sl_qty + trade.qty * trade.entry) * TAKER_FEE_RATE
@@ -1344,7 +1356,11 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                            if tp1_hit else 0)
                 total_pnl = pnl + tp1_pnl
                 total_fee = fee + tp1_fee
-                trade.result     = "TP1+SL" if tp1_hit else "SL"
+                if tp1_hit:
+                    is_be = sl_to_be_after_tp1 and abs(active_sl - trade.entry) < 1e-8
+                    trade.result = "TP1+BE" if is_be else "TP1+SL"
+                else:
+                    trade.result = "SL"
                 trade.exit_price = exit_p
                 trade.close_bar  = trade.open_bar + i
                 trade.pnl        = round(total_pnl, 4)
@@ -1358,6 +1374,8 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
             if not tp1_hit and low <= trade.tp1:
                 tp1_hit = True
                 remaining_qty = trade.qty_tp2
+                if sl_to_be_after_tp1:
+                    active_sl = trade.entry
 
             # ── TP2 觸發 ──
             if tp1_hit and low <= trade.tp2:
@@ -2249,7 +2267,12 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
         )
 
         df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
-        trade = simulate_trade(trade, df_future, max_bars=timeout_bars)
+        # MASR 規格：TP1 後 SL 移到保本，剩餘 50% 保本退場（取代原 -1R 損失）
+        be_after_tp1 = bool(getattr(Config, "MASR_BE_AFTER_TP1", True))
+        trade = simulate_trade(
+            trade, df_future, max_bars=timeout_bars,
+            sl_to_be_after_tp1=be_after_tp1,
+        )
 
         if trade.result in ("", "OPEN"):
             continue
@@ -2257,7 +2280,7 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
         trades.append(trade)
         dbg["signals"] += 1
 
-        if "SL" in trade.result:
+        if "SL" in trade.result and "BE" not in trade.result:
             cooldown_until = trade.close_bar + COOLDOWN_BARS
 
     print(f" 找到 {len(trades)} 筆訊號")

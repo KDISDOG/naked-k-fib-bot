@@ -272,6 +272,9 @@ class Config:
     MASR_SL_ATR_MULT          = float(os.getenv("MASR_SL_ATR_MULT", 1.5))
     MASR_TP1_RR               = float(os.getenv("MASR_TP1_RR", 2.0))
     MASR_TP2_RR               = float(os.getenv("MASR_TP2_RR", 4.0))   # backtest 模擬 trailing 用
+    # TP1 觸發後 SL 移到 entry（保本）— 規格本意，v1 簡化省略
+    # 預期：剩餘 50% 至少保本（不再吃 -1R）
+    MASR_BE_AFTER_TP1         = os.getenv("MASR_BE_AFTER_TP1", "true").lower() == "true"
     # 評分與通用
     MASR_MIN_SCORE            = int(os.getenv("MASR_MIN_SCORE", 2))
     MASR_TIMEOUT_BARS         = int(os.getenv("MASR_TIMEOUT_BARS", 18))   # 4h × 18 = 3 天
