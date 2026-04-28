@@ -280,6 +280,52 @@ class Config:
     MASR_TIMEOUT_BARS         = int(os.getenv("MASR_TIMEOUT_BARS", 18))   # 4h × 18 = 3 天
     MASR_MIN_RR               = float(os.getenv("MASR_MIN_RR", 1.5))
 
+    # ── MA + S/R Breakdown SHORT 策略（MASR_SHORT）─────────────
+    # 規格本意：絕對不對稱反向 MASR_LONG。SHORT 只在「BTC 偏空 + 個幣
+    # 已破位 + 短時間框架確認」三條件都成立時才放行。
+    #   - 1H timeframe（vs LONG 4H）：抓「破位後續跌」短週期，避免被反彈套
+    #   - BTC 4H EMA50 < EMA200 + BTC 24h < +2% 才開（擋反彈做空陷阱）
+    #   - 7d -5% 且 距 30d 高 < -15%（已是下跌結構，非追頂）
+    #   - 排除 PAXG/XAU 避險資產（與 BTC 反向）
+    #   - 4H RSI > 30、距 EMA200 < 10%、24h 跌幅 < 8%（不殺底）
+    #   - 2-bar 確認：i-1 收 < 支撐 S，i 仍收 < S（過濾單根 wick）
+    #   - SL = entry + 1.2×ATR（比 LONG 1.5 緊，因短時間框架）
+    #   - TP1 RR=2 平 50%，TP2 用 EMA20 trail 50%（漲破即出）
+    MASR_SHORT_TIMEFRAME             = os.getenv("MASR_SHORT_TIMEFRAME", "1h")
+    # 選幣（每次 scan 用日線 / 4h / BTC 大盤判斷）
+    MASR_SHORT_SCREEN_VOL_M          = float(os.getenv("MASR_SHORT_SCREEN_VOL_M", 50.0))   # 30 日均量門檻 (M USDT)
+    MASR_SHORT_SCREEN_7D_DROP_PCT    = float(os.getenv("MASR_SHORT_SCREEN_7D_DROP_PCT", 0.05))   # 7 日跌幅 ≥ 5%
+    MASR_SHORT_SCREEN_DIST_HIGH_PCT  = float(os.getenv("MASR_SHORT_SCREEN_DIST_HIGH_PCT", 0.15))   # 距 30d 高 < -15%
+    MASR_SHORT_TOP_N                 = int(os.getenv("MASR_SHORT_TOP_N", 10))
+    MASR_SHORT_MIN_LISTING_DAYS      = int(os.getenv("MASR_SHORT_MIN_LISTING_DAYS", 180))
+    # 額外排除（避險資產、與 BTC 反向）— 逗號分隔
+    MASR_SHORT_EXCLUDED_SYMBOLS      = os.getenv("MASR_SHORT_EXCLUDED_SYMBOLS", "PAXGUSDT,XAUUSDT")
+    # BTC 大盤過濾（mandatory regime gate）
+    MASR_SHORT_BTC_HTF_TIMEFRAME     = os.getenv("MASR_SHORT_BTC_HTF_TIMEFRAME", "4h")
+    MASR_SHORT_BTC_FAST_EMA          = int(os.getenv("MASR_SHORT_BTC_FAST_EMA", 50))
+    MASR_SHORT_BTC_SLOW_EMA          = int(os.getenv("MASR_SHORT_BTC_SLOW_EMA", 200))
+    MASR_SHORT_BTC_MAX_24H_PCT       = float(os.getenv("MASR_SHORT_BTC_MAX_24H_PCT", 0.02))   # BTC 24h < +2%
+    # 進場條件（1H K 線）
+    MASR_SHORT_RES_LOOKBACK          = int(os.getenv("MASR_SHORT_RES_LOOKBACK", 100))      # 找支撐位回看根數
+    MASR_SHORT_RES_TOL_ATR_MULT      = float(os.getenv("MASR_SHORT_RES_TOL_ATR_MULT", 0.3))
+    MASR_SHORT_RES_MIN_TOUCHES       = int(os.getenv("MASR_SHORT_RES_MIN_TOUCHES", 2))
+    MASR_SHORT_VOL_MULT              = float(os.getenv("MASR_SHORT_VOL_MULT", 1.5))
+    # 反追殺（避免在「已超賣」時做空，殺到底反彈）
+    MASR_SHORT_RSI_MIN               = float(os.getenv("MASR_SHORT_RSI_MIN", 30.0))   # 4H RSI 必須 > 30
+    MASR_SHORT_RSI_HTF_TIMEFRAME     = os.getenv("MASR_SHORT_RSI_HTF_TIMEFRAME", "4h")
+    MASR_SHORT_RSI_PERIOD            = int(os.getenv("MASR_SHORT_RSI_PERIOD", 14))
+    MASR_SHORT_MAX_DIST_FROM_EMA200  = float(os.getenv("MASR_SHORT_MAX_DIST_FROM_EMA200", 0.10))   # 距 EMA200 < 10%（已跌很深不追）
+    MASR_SHORT_MAX_24H_DROP_PCT      = float(os.getenv("MASR_SHORT_MAX_24H_DROP_PCT", 0.08))   # 24h 跌幅 < 8%
+    # 出場
+    MASR_SHORT_SL_ATR_MULT           = float(os.getenv("MASR_SHORT_SL_ATR_MULT", 1.2))   # 1.2（比 LONG 1.5 緊，1H 時間框架）
+    MASR_SHORT_TP1_RR                = float(os.getenv("MASR_SHORT_TP1_RR", 2.0))
+    MASR_SHORT_TP2_RR                = float(os.getenv("MASR_SHORT_TP2_RR", 4.0))   # backtest 模擬 EMA20 trail
+    MASR_SHORT_BE_AFTER_TP1          = os.getenv("MASR_SHORT_BE_AFTER_TP1", "true").lower() == "true"
+    # 評分與通用
+    MASR_SHORT_MIN_SCORE             = int(os.getenv("MASR_SHORT_MIN_SCORE", 2))
+    MASR_SHORT_TIMEOUT_BARS          = int(os.getenv("MASR_SHORT_TIMEOUT_BARS", 24))   # 1h × 24 = 24h 強制平
+    MASR_SHORT_MIN_RR                = float(os.getenv("MASR_SHORT_MIN_RR", 1.5))
+
     # BD 相對弱勢硬門檻（v5）：個幣 24h 必須跑輸 BTC ≥ MIN_DIFF % 才能做空
     # 對應 ML 的 hard block，讓 BD 也只在「相對弱勢」幣做空（不在強勢幣逆勢）
     BD_REL_STRENGTH_ENABLED  = os.getenv("BD_REL_STRENGTH_ENABLED", "true").lower() == "true"
