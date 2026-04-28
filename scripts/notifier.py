@@ -145,10 +145,13 @@ class TelegramNotifier:
                 return (0 if traded else 1, -abs(g.get("net_pnl", 0)))
 
             short_map = {
-                "naked_k_fib": "NKF",
-                "mean_reversion": "MR",
-                "momentum_long": "ML",
+                "naked_k_fib":     "NKF",
+                "mean_reversion":  "MR",
+                "momentum_long":   "ML",
                 "breakdown_short": "BD",
+                "smc_sweep":       "SMC",
+                "ma_sr_breakout":  "MASR",
+                "ma_sr_short":     "MASRS",
             }
             for strat, g in sorted(per_strategy.items(), key=_key):
                 label   = short_map.get(strat, strat[:4].upper())

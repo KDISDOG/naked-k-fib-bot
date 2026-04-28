@@ -307,6 +307,21 @@
       color: #68d391
     }
 
+    .strategy-smc {
+      background: #2d2d1a;
+      color: #f6e05e
+    }
+
+    .strategy-masr {
+      background: #1a2a3a;
+      color: #63b3ed
+    }
+
+    .strategy-masrs {
+      background: #3a1a2d;
+      color: #f687b3
+    }
+
     .strategy-grid {
       display: grid;
       grid-template-columns: 1fr 1fr 1fr 1fr;
@@ -489,6 +504,39 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="ml-avg-pnl" class="stat-val">—</span></div>
       </div>
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-smc">SMC</span>&nbsp; Liquidity Sweep 統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="smc-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="smc-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="smc-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="smc-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="smc-return-pct"
+            class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="smc-avg-pnl" class="stat-val">—</span></div>
+      </div>
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-masr">MASR</span>&nbsp; MA + S/R Breakout (LONG) 統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="masr-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="masr-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="masr-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="masr-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="masr-return-pct"
+            class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="masr-avg-pnl" class="stat-val">—</span></div>
+      </div>
+      <div class="strategy-card">
+        <h4><span class="strategy-badge strategy-masrs">MASRS</span>&nbsp; MA + S/R Breakdown SHORT 統計</h4>
+        <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="masrs-total">—</span></div>
+        <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="masrs-win-rate">—</span></div>
+        <div class="stat-row"><span class="stat-label">總盈虧</span><span id="masrs-pnl" class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">淨盈虧（扣費）</span><span id="masrs-net-pnl" class="stat-val">—</span>
+        </div>
+        <div class="stat-row"><span class="stat-label">報酬率（佔總資金）</span><span id="masrs-return-pct"
+            class="stat-val">—</span></div>
+        <div class="stat-row"><span class="stat-label">平均每筆</span><span id="masrs-avg-pnl" class="stat-val">—</span></div>
+      </div>
 
     </div>
 
@@ -518,10 +566,13 @@
             <select id="strategy-select"
               style="background:#0f1117;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px">
               <option value="all">全部策略</option>
-              <option value="naked_k_fib">裸K + Fib</option>
+              <option value="naked_k_fib">裸K + Fib (NKF)</option>
               <option value="mean_reversion">均值回歸 (MR)</option>
               <option value="breakdown_short">Breakdown Short (BD)</option>
               <option value="momentum_long">Momentum Long (ML)</option>
+              <option value="smc_sweep">SMC Sweep (SMC)</option>
+              <option value="ma_sr_breakout">MA+S/R Breakout (MASR)</option>
+              <option value="ma_sr_short">MA+S/R Breakdown SHORT (MASRS)</option>
             </select>
           </div>
           <button type="button" class="btn btn-primary" onclick="switchStrategy()">套用</button>
@@ -596,9 +647,10 @@
                 <td>{{ t.symbol }}</td>
                 <td class="{% if t.direction=='LONG' %}dir-long{% else %}dir-short{% endif %}">{{ t.direction }}</td>
                 <td><span
-                    class="strategy-badge {% if t.strategy == 'mean_reversion' %}strategy-mr{% elif t.strategy == 'breakdown_short' %}strategy-bd{% elif t.strategy == 'momentum_long' %}strategy-ml{% else %}strategy-nkf{% endif %}">{{
+                    class="strategy-badge {% if t.strategy == 'mean_reversion' %}strategy-mr{% elif t.strategy == 'breakdown_short' %}strategy-bd{% elif t.strategy == 'momentum_long' %}strategy-ml{% elif t.strategy == 'smc_sweep' %}strategy-smc{% elif t.strategy == 'ma_sr_breakout' %}strategy-masr{% elif t.strategy == 'ma_sr_short' %}strategy-masrs{% else %}strategy-nkf{% endif %}">{{
                     'MR' if t.strategy == 'mean_reversion' else ('BD' if t.strategy == 'breakdown_short' else ('ML' if
-                    t.strategy == 'momentum_long' else 'NKF')) }}</span></td>
+                    t.strategy == 'momentum_long' else ('SMC' if t.strategy == 'smc_sweep' else ('MASR' if
+                    t.strategy == 'ma_sr_breakout' else ('MASRS' if t.strategy == 'ma_sr_short' else 'NKF'))))) }}</span></td>
                 <td>{{ t.fib_level }}</td>
                 <td style="font-size:11px">{{ t.pattern }}</td>
                 {% set margin = t.margin if t.margin and t.margin > 0 else (t.entry * t.qty / 3 if t.entry and t.qty
@@ -652,6 +704,9 @@
       if (s === 'mean_reversion') return '<span class="strategy-badge strategy-mr">MR</span>';
       if (s === 'breakdown_short') return '<span class="strategy-badge strategy-bd">BD</span>';
       if (s === 'momentum_long') return '<span class="strategy-badge strategy-ml">ML</span>';
+      if (s === 'smc_sweep') return '<span class="strategy-badge strategy-smc">SMC</span>';
+      if (s === 'ma_sr_breakout') return '<span class="strategy-badge strategy-masr">MASR</span>';
+      if (s === 'ma_sr_short') return '<span class="strategy-badge strategy-masrs">MASRS</span>';
       return '<span class="strategy-badge strategy-nkf">NKF</span>';
     }
     function fmtUsdt(v) {
@@ -846,6 +901,9 @@
         fillStats('mr', data.mean_reversion);
         fillStats('bd', data.breakdown_short);
         fillStats('ml', data.momentum_long);
+        fillStats('smc', data.smc_sweep);
+        fillStats('masr', data.ma_sr_breakout);
+        fillStats('masrs', data.ma_sr_short);
 
         // 合計報酬率顯示在頂部 KPI 欄
         const retKpi = document.getElementById('kpi-return-pct');

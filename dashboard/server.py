@@ -275,6 +275,9 @@ async def api_all_strategy_stats():
         "mean_reversion":  db.get_stats_by_strategy("mean_reversion"),
         "breakdown_short": db.get_stats_by_strategy("breakdown_short"),
         "momentum_long":   db.get_stats_by_strategy("momentum_long"),
+        "smc_sweep":       db.get_stats_by_strategy("smc_sweep"),
+        "ma_sr_breakout":  db.get_stats_by_strategy("ma_sr_breakout"),
+        "ma_sr_short":     db.get_stats_by_strategy("ma_sr_short"),
         "combined":        db.get_stats(),
     }
 
@@ -283,9 +286,12 @@ async def switch_strategy(strategy: str = Form(...)):
     """
     熱切換 ACTIVE_STRATEGY（寫入 .env）。
     已開倉的單不受影響，走完原策略邏輯。
-    有效值：naked_k_fib / mean_reversion / all
+    有效值：naked_k_fib / mean_reversion / breakdown_short / momentum_long /
+            smc_sweep / ma_sr_breakout / ma_sr_short / all
     """
-    valid = {"naked_k_fib", "mean_reversion", "breakdown_short", "momentum_long", "all"}
+    valid = {"naked_k_fib", "mean_reversion", "breakdown_short",
+             "momentum_long", "smc_sweep", "ma_sr_breakout",
+             "ma_sr_short", "all"}
     if strategy not in valid:
         return JSONResponse(
             {"status": "error", "message": f"無效策略：{strategy}"},
