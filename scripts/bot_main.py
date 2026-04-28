@@ -43,6 +43,7 @@ from strategies.mean_reversion import MeanReversionStrategy
 from strategies.breakdown_short import BreakdownShortStrategy
 from strategies.momentum_long import MomentumLongStrategy
 from strategies.smc_sweep import SMCSweepStrategy
+from strategies.ma_sr_breakout import MaSrBreakoutStrategy
 from notifier import notify
 from kline_ws import KlineWSManager
 
@@ -87,6 +88,7 @@ _mr_strategy = MeanReversionStrategy(client, market_ctx=market_ctx)
 _bd_strategy = BreakdownShortStrategy(client, market_ctx=market_ctx)
 _ml_strategy = MomentumLongStrategy(client, market_ctx=market_ctx)
 _smc_strategy = SMCSweepStrategy(client, market_ctx=market_ctx, db=db)
+_masr_strategy = MaSrBreakoutStrategy(client, market_ctx=market_ctx, db=db)
 
 # 全局狀態
 candidate_symbols: dict[str, list[str]] = {}   # strategy_name → symbols
@@ -124,6 +126,7 @@ def _strategy_timeframe(strategy_name: str) -> str:
         "breakdown_short":  Config.BD_TIMEFRAME,
         "momentum_long":    Config.ML_TIMEFRAME,
         "smc_sweep":        Config.SMC_TIMEFRAME,
+        "ma_sr_breakout":   Config.MASR_TIMEFRAME,
     }.get(strategy_name, "1h")
 
 
@@ -160,6 +163,7 @@ def load_strategies() -> list:
         "breakdown_short":  _bd_strategy,
         "momentum_long":    _ml_strategy,
         "smc_sweep":        _smc_strategy,
+        "ma_sr_breakout":   _masr_strategy,
     }
     if active == "all":
         return list(all_strategies.values())
@@ -346,6 +350,11 @@ def check_strategy_timeout():
             "timeframe": Config.SMC_TIMEFRAME,
             "timeout_bars": Config.SMC_TIMEOUT_BARS,
         },
+        {
+            "strategy": "ma_sr_breakout",
+            "timeframe": Config.MASR_TIMEFRAME,
+            "timeout_bars": Config.MASR_TIMEOUT_BARS,
+        },
     ]
 
     now = datetime.now()
@@ -529,6 +538,7 @@ _MIN_SCORE_MAP = {
     "breakdown_short": lambda: Config.BD_MIN_SCORE,
     "momentum_long":   lambda: Config.ML_MIN_SCORE,
     "smc_sweep":       lambda: Config.SMC_MIN_SCORE,
+    "ma_sr_breakout":  lambda: Config.MASR_MIN_SCORE,
 }
 _MIN_RR_MAP = {
     "naked_k_fib":     lambda: Config.NKF_MIN_RR,
@@ -536,14 +546,17 @@ _MIN_RR_MAP = {
     "breakdown_short": lambda: Config.BD_MIN_RR,
     "momentum_long":   lambda: Config.ML_MIN_RR,
     "smc_sweep":       lambda: Config.SMC_MIN_RR,
+    "ma_sr_breakout":  lambda: Config.MASR_MIN_RR,
 }
 # 分倉策略（TP1 成交比例）：
 #   MR 0.7：快速反轉、TP2 鮮少觸及，先鎖利
 #   SMC 0.5：sweep + reversal 命中率中等，半倉鎖利、半倉跑 fat-tail
+#   MASR 0.5：規格明確 TP1 50%、TP2 50% 跑 trailing
 #   BD/ML/NKF 0.3：DB 證據顯示 TP2 貢獻 ~68% 總盈利
 _TP1_SPLIT_MAP = {
     "mean_reversion":  0.7,
     "smc_sweep":       0.5,
+    "ma_sr_breakout":  0.5,
     "breakdown_short": 0.3,
     "momentum_long":   0.3,
     "naked_k_fib":     0.3,
@@ -994,7 +1007,7 @@ def main():
     parser.add_argument("--strategy",
                         choices=["naked_k_fib", "mean_reversion",
                                  "breakdown_short", "momentum_long",
-                                 "smc_sweep", "all"],
+                                 "smc_sweep", "ma_sr_breakout", "all"],
                         default=None,
                         help="覆蓋 .env 的 ACTIVE_STRATEGY")
     args = parser.parse_args()

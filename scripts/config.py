@@ -242,6 +242,32 @@ class Config:
     ML_V2_HTF_MIN_SLOPE_PCT  = float(os.getenv("ML_V2_HTF_MIN_SLOPE_PCT", 0.001))
     ML_V2_HTF_SLOPE_BARS     = int(os.getenv("ML_V2_HTF_SLOPE_BARS", 5))
 
+    # ── MA + S/R Breakout 策略（MASR）──────────────────────────
+    # 多頭趨勢中價格突破近 100 根 4h 至少 2 次測試的水平阻力時做多
+    MASR_TIMEFRAME            = os.getenv("MASR_TIMEFRAME", "4h")
+    # 選幣（每次 scan 用日線判斷）
+    MASR_SCREEN_VOL_M         = float(os.getenv("MASR_SCREEN_VOL_M", 50.0))   # 30 日均量門檻 (M USDT)
+    MASR_SCREEN_ATR_MIN_PCT   = float(os.getenv("MASR_SCREEN_ATR_MIN_PCT", 2.0))
+    MASR_SCREEN_ATR_MAX_PCT   = float(os.getenv("MASR_SCREEN_ATR_MAX_PCT", 8.0))
+    MASR_SCREEN_EMA200_MAX_PCT = float(os.getenv("MASR_SCREEN_EMA200_MAX_PCT", 0.50))
+    MASR_TOP_N                = int(os.getenv("MASR_TOP_N", 10))
+    MASR_MIN_LISTING_DAYS     = int(os.getenv("MASR_MIN_LISTING_DAYS", 180))
+    # 進場條件
+    MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
+    MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))
+    MASR_RES_MIN_TOUCHES      = int(os.getenv("MASR_RES_MIN_TOUCHES", 2))
+    MASR_VOL_MULT             = float(os.getenv("MASR_VOL_MULT", 1.3))
+    MASR_ATR_PERCENTILE_MAX   = float(os.getenv("MASR_ATR_PERCENTILE_MAX", 0.80))  # ATR 不在前 20%
+    MASR_MAX_DIST_FROM_EMA50  = float(os.getenv("MASR_MAX_DIST_FROM_EMA50", 0.08))  # 距 EMA50 < 8%
+    # 出場
+    MASR_SL_ATR_MULT          = float(os.getenv("MASR_SL_ATR_MULT", 1.5))
+    MASR_TP1_RR               = float(os.getenv("MASR_TP1_RR", 2.0))
+    MASR_TP2_RR               = float(os.getenv("MASR_TP2_RR", 4.0))   # backtest 模擬 trailing 用
+    # 評分與通用
+    MASR_MIN_SCORE            = int(os.getenv("MASR_MIN_SCORE", 2))
+    MASR_TIMEOUT_BARS         = int(os.getenv("MASR_TIMEOUT_BARS", 18))   # 4h × 18 = 3 天
+    MASR_MIN_RR               = float(os.getenv("MASR_MIN_RR", 1.5))
+
     # BD 相對弱勢硬門檻（v5）：個幣 24h 必須跑輸 BTC ≥ MIN_DIFF % 才能做空
     # 對應 ML 的 hard block，讓 BD 也只在「相對弱勢」幣做空（不在強勢幣逆勢）
     BD_REL_STRENGTH_ENABLED  = os.getenv("BD_REL_STRENGTH_ENABLED", "true").lower() == "true"

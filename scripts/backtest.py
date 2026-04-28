@@ -2032,6 +2032,234 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
     return trades
 
 
+# ── MASR 阻力位偵測（向量化版）────────────────────────────────
+def _bt_masr_find_resistance(highs_arr, end_idx: int, atr: float,
+                             lookback: int, tol_mult: float, min_touches: int,
+                             cur_close: float) -> Optional[float]:
+    """
+    從 highs_arr[end_idx - lookback : end_idx] 中找至少 min_touches 次測試的水平阻力，
+    取剛被突破的（≤ cur_close + tolerance 的最高水平）。
+    """
+    import numpy as np
+    if end_idx < lookback or atr <= 0:
+        return None
+    window = highs_arr[end_idx - lookback:end_idx]
+    if len(window) < lookback:
+        return None
+    tolerance = atr * tol_mult
+    if tolerance <= 0:
+        return None
+
+    used = np.zeros(len(window), dtype=bool)
+    clusters: list[float] = []
+    for i in range(len(window)):
+        if used[i]:
+            continue
+        cluster = [window[i]]
+        used[i] = True
+        for j in range(i + 1, len(window)):
+            if used[j]:
+                continue
+            if abs(window[i] - window[j]) <= tolerance:
+                cluster.append(window[j])
+                used[j] = True
+        if len(cluster) >= min_touches:
+            clusters.append(float(np.mean(cluster)))
+
+    if not clusters:
+        return None
+    breakable = [l for l in clusters if l <= cur_close + tolerance]
+    if not breakable:
+        return None
+    return max(breakable)
+
+
+# ── MASR 主回測邏輯 ─────────────────────────────────────────────
+def run_backtest_masr(client: Client, symbol: str, months: int,
+                      debug: bool = False, *,
+                      regime_series=None) -> list:
+    """
+    MA + S/R Breakout 策略回測。只做 LONG。
+    regime_series 不適用（MASR 自有 EMA 趨勢判斷）。
+    """
+    tf = Config.MASR_TIMEFRAME
+    print(f"\n[{symbol} MASR {tf}] 回測開始")
+
+    df_tf = fetch_klines(client, symbol, tf, months)
+    lookback = int(Config.MASR_RES_LOOKBACK)
+    if len(df_tf) < lookback + 30:
+        print(f"  資料不足（{len(df_tf)} 根 < {lookback + 30}），跳過")
+        return []
+
+    print("  預計算指標...", end="", flush=True)
+    ema20_s = ta.ema(df_tf["close"], length=20)
+    ema50_s = ta.ema(df_tf["close"], length=50)
+    atr_s   = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    avg_vol_s = df_tf["volume"].rolling(21).mean().shift(1)
+    print(" 完成")
+
+    highs_arr = df_tf["high"].values
+
+    warmup = max(60, lookback + 5)
+    trades: list[BtTrade] = []
+    cooldown_until = -1
+    timeout_bars = int(Config.MASR_TIMEOUT_BARS)
+    min_score    = int(Config.MASR_MIN_SCORE)
+    vol_mult     = float(Config.MASR_VOL_MULT)
+    atr_pct_max  = float(Config.MASR_ATR_PERCENTILE_MAX)
+    max_dist_e50 = float(Config.MASR_MAX_DIST_FROM_EMA50)
+    sl_atr_mult  = float(Config.MASR_SL_ATR_MULT)
+    tp1_rr       = float(Config.MASR_TP1_RR)
+    tp2_rr       = float(Config.MASR_TP2_RR)
+    res_tol_mult = float(Config.MASR_RES_TOL_ATR_MULT)
+    res_min_touches = int(Config.MASR_RES_MIN_TOUCHES)
+
+    dbg = {"cooldown": 0, "no_ema": 0, "no_resistance": 0,
+           "no_breakout": 0, "no_volume": 0, "atr_hot": 0,
+           "dist_ema50": 0, "low_score": 0, "bad_pos": 0,
+           "signals": 0}
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 1):
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+
+        ema20_v = ema20_s.iloc[i] if ema20_s is not None else float("nan")
+        ema50_v = ema50_s.iloc[i] if ema50_s is not None else float("nan")
+        atr_v   = atr_s.iloc[i]   if atr_s   is not None else float("nan")
+        avg_vol = avg_vol_s.iloc[i] if avg_vol_s is not None else float("nan")
+        cur_close = float(df_tf["close"].iloc[i])
+        cur_vol   = float(df_tf["volume"].iloc[i])
+
+        if pd.isna(ema20_v) or pd.isna(ema50_v) or pd.isna(atr_v) \
+                or pd.isna(avg_vol) or float(avg_vol) <= 0:
+            continue
+        ema20_v = float(ema20_v); ema50_v = float(ema50_v); atr_v = float(atr_v)
+
+        # 條件 b: EMA20 > EMA50
+        if ema20_v <= ema50_v:
+            dbg["no_ema"] += 1
+            continue
+
+        # 距 EMA50 漲幅 < 8%
+        if ema50_v <= 0:
+            continue
+        dist_ema50 = (cur_close - ema50_v) / ema50_v
+        if dist_ema50 > max_dist_e50:
+            dbg["dist_ema50"] += 1
+            continue
+
+        # 條件 d: ATR 不在最高 20%
+        atr_window = atr_s.iloc[i - lookback + 1:i + 1]
+        atr_q = float(atr_window.quantile(atr_pct_max))
+        if atr_v >= atr_q:
+            dbg["atr_hot"] += 1
+            continue
+
+        # 找阻力
+        resistance = _bt_masr_find_resistance(
+            highs_arr, i, atr_v, lookback, res_tol_mult,
+            res_min_touches, cur_close
+        )
+        if resistance is None:
+            dbg["no_resistance"] += 1
+            continue
+
+        # 條件 a: close > R
+        if cur_close <= resistance:
+            dbg["no_breakout"] += 1
+            continue
+
+        # 條件 c: 量能 > 1.3× 均量
+        vol_ratio = cur_vol / float(avg_vol)
+        if vol_ratio < vol_mult:
+            dbg["no_volume"] += 1
+            continue
+
+        # SL / TP
+        sl_atr = cur_close - sl_atr_mult * atr_v
+        sl = max(sl_atr, ema50_v)
+        if sl >= cur_close:
+            dbg["bad_pos"] += 1
+            continue
+        sl_dist = cur_close - sl
+        tp1 = cur_close + tp1_rr * sl_dist
+        tp2 = cur_close + tp2_rr * sl_dist
+
+        # 評分
+        score = 1
+        # ADX bonus（從 atr_window 推不出，跳過 ADX bonus 在回測中）
+        ema_gap_pct = (ema20_v - ema50_v) / ema50_v if ema50_v > 0 else 0
+        if ema_gap_pct >= 0.01:
+            score += 1
+        if vol_ratio >= 2.0:
+            score += 1
+        # ATR 處於低位
+        if len(atr_window) >= 50:
+            q40 = float(atr_window.quantile(0.40))
+            if atr_v <= q40:
+                score += 1
+        score = min(score, 5)
+
+        if score < min_score:
+            dbg["low_score"] += 1
+            continue
+
+        # 分倉 50/50
+        qty_total = MARGIN_USDT * LEVERAGE / cur_close
+        qty_tp1 = round(qty_total * 0.5, 4)
+        qty_tp2 = round(qty_total - qty_tp1, 4)
+
+        trade = BtTrade(
+            symbol    = symbol,
+            direction = "LONG",
+            entry     = cur_close,
+            sl        = sl,
+            tp1       = tp1,
+            tp2       = tp2,
+            qty       = qty_total,
+            qty_tp1   = qty_tp1,
+            qty_tp2   = qty_tp2,
+            fib_level = "",
+            pattern   = "MASR_BREAKOUT",
+            score     = score,
+            timeframe = tf,
+            open_bar  = i,
+            open_time = df_tf["time"].iloc[i],
+            strategy  = "ma_sr_breakout",
+        )
+
+        df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
+        trade = simulate_trade(trade, df_future, max_bars=timeout_bars)
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        trades.append(trade)
+        dbg["signals"] += 1
+
+        if "SL" in trade.result:
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+
+    print(f" 找到 {len(trades)} 筆訊號")
+    if debug or len(trades) == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"]
+        print(f"\n  ── MASR 診斷 ──")
+        print(f"  總掃描根數：{scanned}")
+        print(f"  ├─ EMA20 ≤ EMA50           ：{dbg['no_ema']}")
+        print(f"  ├─ 距 EMA50 > 8%（追高）   ：{dbg['dist_ema50']}")
+        print(f"  ├─ ATR 過熱（前 20%）       ：{dbg['atr_hot']}")
+        print(f"  ├─ 找不到阻力位             ：{dbg['no_resistance']}")
+        print(f"  ├─ 未突破                   ：{dbg['no_breakout']}")
+        print(f"  ├─ 量能不足                 ：{dbg['no_volume']}")
+        print(f"  ├─ 評分不足 (<{min_score})  ：{dbg['low_score']}")
+        print(f"  ├─ SL 位置異常              ：{dbg['bad_pos']}")
+        print(f"  └─ 通過全部過濾             ：{dbg['signals']}")
+    return trades
+
+
 # ── 輸出統計 ──────────────────────────────────────────────────────
 def print_stats(trades: list, timeframe: str, symbol: str,
                 initial_balance: float, label: str = ""):
@@ -2423,6 +2651,15 @@ def _run_multi_coin_backtest(
                 tr = []
             results[(sym, "SMC")] = tr
 
+        if run_flags.get("masr"):
+            try:
+                tr = run_backtest_masr(client, sym, args.months, debug=False,
+                                       regime_series=regime_series)
+            except Exception as e:
+                print(f"  [MASR] 失敗：{e}")
+                tr = []
+            results[(sym, "MASR")] = tr
+
     return results
 
 
@@ -2693,9 +2930,10 @@ def main():
     parser.add_argument("--strategy",       default="naked_k_fib",
                         type=str,
                         help=("回測策略：naked_k_fib / mean_reversion / "
-                              "breakdown_short / momentum_long / smc_sweep / all"
-                              "；支援逗號分隔列表（例：bd,ml,smc 或 "
-                              "breakdown_short,momentum_long,smc_sweep）"))
+                              "breakdown_short / momentum_long / smc_sweep / "
+                              "ma_sr_breakout / all"
+                              "；支援逗號分隔列表（例：bd,ml,smc,masr 或 "
+                              "breakdown_short,momentum_long,smc_sweep,ma_sr_breakout）"))
     parser.add_argument("--max-bars",       type=int,   default=48,
                         help="NKF 最大持倉根數（超時平倉，預設 48）")
     parser.add_argument("--testnet",        action="store_true",
@@ -2744,10 +2982,10 @@ def main():
     _ALIAS_MAP = {
         "nkf": "naked_k_fib", "mr": "mean_reversion",
         "bd":  "breakdown_short", "ml": "momentum_long",
-        "smc": "smc_sweep",
+        "smc": "smc_sweep", "masr": "ma_sr_breakout",
     }
     _VALID = {"naked_k_fib", "mean_reversion", "breakdown_short",
-              "momentum_long", "smc_sweep", "all"}
+              "momentum_long", "smc_sweep", "ma_sr_breakout", "all"}
     _raw_strats = [s.strip().lower() for s in args.strategy.split(",") if s.strip()]
     _expanded = []
     for s in _raw_strats:
@@ -2760,11 +2998,12 @@ def main():
     _strats_set = set(_expanded)
     _is_all = "all" in _strats_set
 
-    run_nkf = _is_all or "naked_k_fib"     in _strats_set
-    run_mr  = _is_all or "mean_reversion"  in _strats_set
-    run_bd  = _is_all or "breakdown_short" in _strats_set
-    run_ml  = _is_all or "momentum_long"   in _strats_set
-    run_smc = _is_all or "smc_sweep"       in _strats_set
+    run_nkf  = _is_all or "naked_k_fib"     in _strats_set
+    run_mr   = _is_all or "mean_reversion"  in _strats_set
+    run_bd   = _is_all or "breakdown_short" in _strats_set
+    run_ml   = _is_all or "momentum_long"   in _strats_set
+    run_smc  = _is_all or "smc_sweep"       in _strats_set
+    run_masr = _is_all or "ma_sr_breakout"  in _strats_set
 
     # ── 掃描模式（優先）──────────────────────────────────────────
     if args.scan:
@@ -2778,7 +3017,7 @@ def main():
         symbols = _resolve_symbol_list(args, client)
         run_flags = {
             "nkf": run_nkf, "mr": run_mr, "bd": run_bd,
-            "ml": run_ml, "smc": run_smc,
+            "ml": run_ml, "smc": run_smc, "masr": run_masr,
         }
         active_strats = [k.upper() for k, v in run_flags.items() if v]
         print(f"\n{'='*78}")
@@ -2807,6 +3046,8 @@ def main():
         print(f"  [ML]  時間框架：{Config.ML_TIMEFRAME}  超時：{Config.ML_TIMEOUT_BARS} 根  做多突破策略")
     if run_smc:
         print(f"  [SMC] 時間框架：{Config.SMC_TIMEFRAME}  超時：{Config.SMC_TIMEOUT_BARS} 根  Liquidity Sweep + Reversal")
+    if run_masr:
+        print(f"  [MASR] 時間框架：{Config.MASR_TIMEFRAME}  超時：{Config.MASR_TIMEOUT_BARS} 根  MA + S/R Breakout (LONG only)")
     print(f"  回測期間：最近 {args.months} 個月")
     print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每筆保證金：{MARGIN_USDT:.0f} USDT")
     if run_nkf:
@@ -2818,6 +3059,7 @@ def main():
     all_bd  = []
     all_ml  = []
     all_smc = []
+    all_masr = []
 
     # ── NKF 回測 ──────────────────────────────────────────────────
     if run_nkf:
@@ -2866,15 +3108,23 @@ def main():
                     args.balance, label="SMC")
         all_smc.extend(trades_smc)
 
+    # ── MASR 回測 ─────────────────────────────────────────────────
+    if run_masr:
+        trades_masr = run_backtest_masr(client, args.symbol, args.months,
+                                        debug=args.debug_indicators)
+        print_stats(trades_masr, Config.MASR_TIMEFRAME, args.symbol,
+                    args.balance, label="MASR")
+        all_masr.extend(trades_masr)
+
     # ── 合併統計（only when running all）─────────────────────────
-    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml or all_smc):
-        combined = all_nkf + all_mr + all_bd + all_ml + all_smc
+    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml or all_smc or all_masr):
+        combined = all_nkf + all_mr + all_bd + all_ml + all_smc + all_masr
         combined.sort(key=lambda t: t.open_time or datetime.min)
         strats = "+".join(
             s for s, flag in [
                 ("NKF", bool(all_nkf)), ("MR", bool(all_mr)),
                 ("BD",  bool(all_bd)),  ("ML", bool(all_ml)),
-                ("SMC", bool(all_smc)),
+                ("SMC", bool(all_smc)), ("MASR", bool(all_masr)),
             ] if flag
         )
         print_stats(combined, "ALL", args.symbol, args.balance, label=f"{strats} 合併")
