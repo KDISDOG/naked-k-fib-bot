@@ -227,7 +227,9 @@ class Config:
     #   ② HTF (4h EMA50) confluence — 提升質
     ML_V2_ENABLED            = os.getenv("ML_V2_ENABLED", "true").lower() == "true"
     # ① Volume Burst：cur_vol ≥ MULT × avg_vol + close 在當根高 70%+ + close > EMA20
-    ML_V2_VOL_BURST_ENABLED  = os.getenv("ML_V2_VOL_BURST_ENABLED", "true").lower() == "true"
+    # 預設關閉：回測 38.6% win（vs v1 45.5%），單根爆量但無 follow-through
+    # 訊號太多，反而拖累。保留 code 給未來改進（如加 next-bar 確認）
+    ML_V2_VOL_BURST_ENABLED  = os.getenv("ML_V2_VOL_BURST_ENABLED", "false").lower() == "true"
     ML_V2_VOL_BURST_MULT     = float(os.getenv("ML_V2_VOL_BURST_MULT", 3.0))
     ML_V2_VOL_BURST_CLOSE_PCT = float(os.getenv("ML_V2_VOL_BURST_CLOSE_PCT", 0.7))
     # ② HTF confluence：4h EMA50 上行（slope ≥ 0.3% over 5 bars）才放行

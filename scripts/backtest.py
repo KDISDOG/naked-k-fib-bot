@@ -1076,13 +1076,25 @@ def run_backtest_bd(client: Client, symbol: str, months: int, *,
         if v2_enabled and getattr(Config, "BD_V2_REQUIRE_CONFIRM", True):
             if i < 2:
                 continue
-            prev_close = float(df_tf["close"].iloc[i - 1])
-            if prev_close >= support:
+            # 修：i-1 的 rolling_low 是 min([i-1-N..i-2])，不是 support[i]
+            #    support[i] 包含 low[i-1]，prev_close >= support[i] 恆真 → bug
+            prev_support = (
+                float(rolling_low_s.iloc[i - 1])
+                if i - 1 < len(rolling_low_s) else float("nan")
+            )
+            if pd.isna(prev_support):
                 dbg["v2_no_confirm"] += 1
                 continue
+            prev_close = float(df_tf["close"].iloc[i - 1])
+            # i-1 必須跌破自己的 rolling_low（首次破位）
+            if prev_close >= prev_support:
+                dbg["v2_no_confirm"] += 1
+                continue
+            # i 必須 close 更低（持續下行）
             if price >= prev_close:
                 dbg["v2_no_confirm"] += 1
                 continue
+            # 兩根合計量能
             prev_vol = float(df_tf["volume"].iloc[i - 1])
             if last_vol + prev_vol < float(avg_vol_i) * Config.BD_VOL_MULT * 2:
                 dbg["v2_no_confirm"] += 1

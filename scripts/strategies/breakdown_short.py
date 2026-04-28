@@ -390,17 +390,20 @@ class BreakdownShortStrategy(BaseStrategy):
         last_vol = float(df_a["volume"].iloc[-1])
 
         # ① v2：multi-bar confirmation
-        # 突破在 i-1（前一根 close < support），i 必須 close 更低
+        # 突破在 i-1（前一根 close < 當時的 rolling_low），i 必須 close 更低
         if v2_enabled and getattr(Config, "BD_V2_REQUIRE_CONFIRM", True):
-            if len(df_a) < 3:
+            if len(df_a) < lookback + 2:
                 return None
+            # 修：i-1 自己的 rolling_low（min of [i-1-N..i-2]）
+            #    若用 support_level（含 low[i-1]）會永遠擋掉
+            prev_recent_lows = df_a["low"].iloc[-(lookback + 2):-2]
+            prev_support_level = float(prev_recent_lows.min())
             prev_close = float(df_a["close"].iloc[-2])
-            prev_low   = float(df_a["low"].iloc[-2])
-            # i-1 必須也跌破 support（兩根連續確認）
-            if prev_close >= support_level:
+            # i-1 必須跌破自己的 rolling_low（首次破位）
+            if prev_close >= prev_support_level:
                 log.debug(
                     f"[{symbol}] BD v2 拒絕：前一根 close {prev_close:.4f} "
-                    f"未跌破 support {support_level:.4f}"
+                    f"未跌破 prev support {prev_support_level:.4f}"
                 )
                 return None
             # i 收得比 i-1 更低（持續下行）
