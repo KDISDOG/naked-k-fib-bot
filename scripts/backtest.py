@@ -2567,8 +2567,11 @@ def main():
     parser.add_argument("--skip-vol-rise",  action="store_true", default=BT_SKIP_VOL_RISE,  help="不要求當根成交量>前根")
     parser.add_argument("--no-skip-bad-fib",action="store_true",                   help="包含低R:R的0.236/0.786位")
     parser.add_argument("--strategy",       default="naked_k_fib",
-                        choices=["naked_k_fib", "mean_reversion", "breakdown_short", "momentum_long", "smc_sweep", "all"],
-                        help="回測策略：naked_k_fib / mean_reversion / breakdown_short / momentum_long / smc_sweep / all")
+                        type=str,
+                        help=("回測策略：naked_k_fib / mean_reversion / "
+                              "breakdown_short / momentum_long / smc_sweep / all"
+                              "；支援逗號分隔列表（例：bd,ml,smc 或 "
+                              "breakdown_short,momentum_long,smc_sweep）"))
     parser.add_argument("--max-bars",       type=int,   default=48,
                         help="NKF 最大持倉根數（超時平倉，預設 48）")
     parser.add_argument("--testnet",        action="store_true",
@@ -2613,11 +2616,31 @@ def main():
         testnet=use_testnet,
     )
 
-    run_nkf = args.strategy in ("naked_k_fib", "all")
-    run_mr  = args.strategy in ("mean_reversion", "all")
-    run_bd  = args.strategy in ("breakdown_short", "all")
-    run_ml  = args.strategy in ("momentum_long", "all")
-    run_smc = args.strategy in ("smc_sweep", "all")
+    # 解析 --strategy（支援逗號分隔列表 + 短別名）
+    _ALIAS_MAP = {
+        "nkf": "naked_k_fib", "mr": "mean_reversion",
+        "bd":  "breakdown_short", "ml": "momentum_long",
+        "smc": "smc_sweep",
+    }
+    _VALID = {"naked_k_fib", "mean_reversion", "breakdown_short",
+              "momentum_long", "smc_sweep", "all"}
+    _raw_strats = [s.strip().lower() for s in args.strategy.split(",") if s.strip()]
+    _expanded = []
+    for s in _raw_strats:
+        s = _ALIAS_MAP.get(s, s)
+        if s not in _VALID:
+            parser.error(
+                f"無效策略名稱：{s}（有效：{', '.join(sorted(_VALID))}）"
+            )
+        _expanded.append(s)
+    _strats_set = set(_expanded)
+    _is_all = "all" in _strats_set
+
+    run_nkf = _is_all or "naked_k_fib"     in _strats_set
+    run_mr  = _is_all or "mean_reversion"  in _strats_set
+    run_bd  = _is_all or "breakdown_short" in _strats_set
+    run_ml  = _is_all or "momentum_long"   in _strats_set
+    run_smc = _is_all or "smc_sweep"       in _strats_set
 
     # ── 掃描模式（優先）──────────────────────────────────────────
     if args.scan:
