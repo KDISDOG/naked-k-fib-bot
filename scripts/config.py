@@ -234,7 +234,8 @@ class Config:
     ML_V2_HTF_ENABLED        = os.getenv("ML_V2_HTF_ENABLED", "true").lower() == "true"
     ML_V2_HTF_TIMEFRAME      = os.getenv("ML_V2_HTF_TIMEFRAME", "4h")
     ML_V2_HTF_EMA_PERIOD     = int(os.getenv("ML_V2_HTF_EMA_PERIOD", 50))
-    ML_V2_HTF_MIN_SLOPE_PCT  = float(os.getenv("ML_V2_HTF_MIN_SLOPE_PCT", 0.003))
+    # 0.003 過嚴（回測訊號 -60% 且 PnL 反降），放寬到 0.001 只擋明顯下行
+    ML_V2_HTF_MIN_SLOPE_PCT  = float(os.getenv("ML_V2_HTF_MIN_SLOPE_PCT", 0.001))
     ML_V2_HTF_SLOPE_BARS     = int(os.getenv("ML_V2_HTF_SLOPE_BARS", 5))
 
     # BD 相對弱勢硬門檻（v5）：個幣 24h 必須跑輸 BTC ≥ MIN_DIFF % 才能做空
@@ -252,7 +253,9 @@ class Config:
     # ① Multi-bar confirmation：要求 i-1 突破 + i 收更低
     BD_V2_REQUIRE_CONFIRM     = os.getenv("BD_V2_REQUIRE_CONFIRM", "true").lower() == "true"
     # ② 拒絕距支撐區太近：close 距最近 N 根 swing low < ATR_MULT × ATR 拒絕
-    BD_V2_REJECT_NEAR_SUPPORT = os.getenv("BD_V2_REJECT_NEAR_SUPPORT", "true").lower() == "true"
+    # 註：對突破策略概念衝突（觸發時 price < support 必然接近 deepest_low），
+    # 預設關閉。保留 code 給左側策略借用。
+    BD_V2_REJECT_NEAR_SUPPORT = os.getenv("BD_V2_REJECT_NEAR_SUPPORT", "false").lower() == "true"
     BD_V2_SUPPORT_LOOKBACK    = int(os.getenv("BD_V2_SUPPORT_LOOKBACK", 30))
     BD_V2_SUPPORT_ATR_MULT    = float(os.getenv("BD_V2_SUPPORT_ATR_MULT", 1.0))
     # ③ 要求近 N 根至少 2 個 lower-high（失敗反彈確認）
