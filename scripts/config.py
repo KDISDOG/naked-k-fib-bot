@@ -264,7 +264,9 @@ class Config:
     MASR_ATR_PERCENTILE_MAX   = float(os.getenv("MASR_ATR_PERCENTILE_MAX", 0.80))  # ATR 不在前 20%
     MASR_MAX_DIST_FROM_EMA50  = float(os.getenv("MASR_MAX_DIST_FROM_EMA50", 0.08))  # 距 EMA50 < 8%
     # 出場
-    MASR_SL_ATR_MULT          = float(os.getenv("MASR_SL_ATR_MULT", 1.5))
+    # 1.5 → 1.0：嘗試 SL 收緊解 49.6% SL 命中率（v3）
+    # 副作用：TP 距離也同比收緊（R:R 不變）
+    MASR_SL_ATR_MULT          = float(os.getenv("MASR_SL_ATR_MULT", 1.0))
     MASR_TP1_RR               = float(os.getenv("MASR_TP1_RR", 2.0))
     MASR_TP2_RR               = float(os.getenv("MASR_TP2_RR", 4.0))   # backtest 模擬 trailing 用
     # 評分與通用
