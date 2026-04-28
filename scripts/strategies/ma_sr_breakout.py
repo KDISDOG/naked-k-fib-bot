@@ -153,7 +153,7 @@ class MaSrBreakoutStrategy(BaseStrategy):
                 if not (atr_min <= atr_pct <= atr_max):
                     continue
 
-                # 4. 30 日累積漲幅（排序用）
+                # 4. 30 日累積漲幅（排序用 + 最低門檻）
                 if len(close_d) < 31:
                     continue
                 old_price = float(close_d.iloc[-31])
@@ -161,13 +161,20 @@ class MaSrBreakoutStrategy(BaseStrategy):
                     continue
                 pct_30d = (price_d - old_price) / old_price * 100
 
+                # v3：30 日漲幅最低門檻過濾（過濾橫盤幣）
+                min_30d_pct = float(
+                    getattr(Config, "MASR_MIN_30D_RETURN_PCT", 0.05)
+                ) * 100
+                if pct_30d < min_30d_pct:
+                    continue
+
                 scored.append((sym, pct_30d))
             except Exception as e:
                 log.debug(f"[MASR 篩選] {sym} 失敗: {e}")
 
         # 按 30 日漲幅排序由高到低
         scored.sort(key=lambda x: x[1], reverse=True)
-        top_n = int(getattr(Config, "MASR_TOP_N", 10))
+        top_n = int(getattr(Config, "MASR_TOP_N", 5))
         selected = [s[0] for s in scored[:top_n]]
         log.info(
             f"[MASR] 選幣完成：{len(selected)} 支入選 "

@@ -250,8 +250,11 @@ class Config:
     MASR_SCREEN_ATR_MIN_PCT   = float(os.getenv("MASR_SCREEN_ATR_MIN_PCT", 2.0))
     MASR_SCREEN_ATR_MAX_PCT   = float(os.getenv("MASR_SCREEN_ATR_MAX_PCT", 8.0))
     MASR_SCREEN_EMA200_MAX_PCT = float(os.getenv("MASR_SCREEN_EMA200_MAX_PCT", 0.50))
-    MASR_TOP_N                = int(os.getenv("MASR_TOP_N", 10))
+    # 10 → 5：只跟最強 5 名 momentum（v3：強化選幣）
+    MASR_TOP_N                = int(os.getenv("MASR_TOP_N", 5))
     MASR_MIN_LISTING_DAYS     = int(os.getenv("MASR_MIN_LISTING_DAYS", 180))
+    # 30 日漲幅最低門檻（過濾橫盤幣）：5% 才入選
+    MASR_MIN_30D_RETURN_PCT   = float(os.getenv("MASR_MIN_30D_RETURN_PCT", 0.05))
     # 進場條件
     MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
     MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))
