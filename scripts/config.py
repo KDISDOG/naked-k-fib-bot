@@ -326,6 +326,38 @@ class Config:
     MASR_SHORT_TIMEOUT_BARS          = int(os.getenv("MASR_SHORT_TIMEOUT_BARS", 24))   # 1h × 24 = 24h 強制平
     MASR_SHORT_MIN_RR                = float(os.getenv("MASR_SHORT_MIN_RR", 1.5))
 
+    # ── MASR Short v2（分級大盤 + 鬆綁，目標訊號量 30-60 / 12m）─────
+    # 解 v1 訊號量過少（7 / 12m / 30 幣）。三層改造：
+    #   1. 分級大盤過濾：強做空（BTC 1D EMA50<EMA200，正常倉）+
+    #      弱做空（BTC 4H close<EMA50 且 24h<+1%，半倉）
+    #   2. 選幣放寬：30M 量 / 4H EMA 趨勢 / 7d<+3% / 距 30d 高>8%
+    #   3. 進場放寬：量能 1.2× / RSI>35 / 距 EMA200<12%
+    # 同時提供 fast/slow 兩個 variant（fast=1-bar 確認、slow=2-bar+ATR offset）
+    MASR_SHORT_V2_VARIANT             = os.getenv("MASR_SHORT_V2_VARIANT", "fast")  # fast | slow
+    # 分級大盤閾值
+    MASR_SHORT_V2_STRONG_TIMEFRAME    = os.getenv("MASR_SHORT_V2_STRONG_TIMEFRAME", "1d")
+    MASR_SHORT_V2_STRONG_FAST_EMA     = int(os.getenv("MASR_SHORT_V2_STRONG_FAST_EMA", 50))
+    MASR_SHORT_V2_STRONG_SLOW_EMA     = int(os.getenv("MASR_SHORT_V2_STRONG_SLOW_EMA", 200))
+    MASR_SHORT_V2_WEAK_TIMEFRAME      = os.getenv("MASR_SHORT_V2_WEAK_TIMEFRAME", "4h")
+    MASR_SHORT_V2_WEAK_EMA            = int(os.getenv("MASR_SHORT_V2_WEAK_EMA", 50))
+    MASR_SHORT_V2_WEAK_BTC_24H_MAX    = float(os.getenv("MASR_SHORT_V2_WEAK_BTC_24H_MAX", 0.01))
+    MASR_SHORT_V2_WEAK_QTY_MULT       = float(os.getenv("MASR_SHORT_V2_WEAK_QTY_MULT", 0.5))   # 弱模式半倉
+    # 選幣
+    MASR_SHORT_V2_VOL_M               = float(os.getenv("MASR_SHORT_V2_VOL_M", 30.0))   # 30M
+    MASR_SHORT_V2_TREND_TIMEFRAME     = os.getenv("MASR_SHORT_V2_TREND_TIMEFRAME", "4h")  # 4H EMA 結構
+    MASR_SHORT_V2_TREND_FAST_EMA      = int(os.getenv("MASR_SHORT_V2_TREND_FAST_EMA", 50))
+    MASR_SHORT_V2_TREND_SLOW_EMA      = int(os.getenv("MASR_SHORT_V2_TREND_SLOW_EMA", 200))
+    MASR_SHORT_V2_7D_MAX_RETURN       = float(os.getenv("MASR_SHORT_V2_7D_MAX_RETURN", 0.03))  # 7d 漲幅 < +3%
+    MASR_SHORT_V2_DIST_HIGH_PCT       = float(os.getenv("MASR_SHORT_V2_DIST_HIGH_PCT", 0.08))  # 距 30d 高 < -8%
+    MASR_SHORT_V2_TOP_N               = int(os.getenv("MASR_SHORT_V2_TOP_N", 50))
+    MASR_SHORT_V2_MIN_LISTING_DAYS    = int(os.getenv("MASR_SHORT_V2_MIN_LISTING_DAYS", 180))
+    MASR_SHORT_V2_EXCLUDED_SYMBOLS    = os.getenv("MASR_SHORT_V2_EXCLUDED_SYMBOLS", "PAXGUSDT,XAUUSDT")
+    # 進場
+    MASR_SHORT_V2_VOL_MULT            = float(os.getenv("MASR_SHORT_V2_VOL_MULT", 1.2))   # 量能 1.2×
+    MASR_SHORT_V2_RSI_MIN             = float(os.getenv("MASR_SHORT_V2_RSI_MIN", 35.0))   # 4H RSI > 35
+    MASR_SHORT_V2_MAX_DIST_FROM_EMA200 = float(os.getenv("MASR_SHORT_V2_MAX_DIST_FROM_EMA200", 0.12))
+    MASR_SHORT_V2_SLOW_OFFSET_ATR     = float(os.getenv("MASR_SHORT_V2_SLOW_OFFSET_ATR", 0.2))  # slow variant: i+1 close < S - 0.2×ATR
+
     # BD 相對弱勢硬門檻（v5）：個幣 24h 必須跑輸 BTC ≥ MIN_DIFF % 才能做空
     # 對應 ML 的 hard block，讓 BD 也只在「相對弱勢」幣做空（不在強勢幣逆勢）
     BD_REL_STRENGTH_ENABLED  = os.getenv("BD_REL_STRENGTH_ENABLED", "true").lower() == "true"

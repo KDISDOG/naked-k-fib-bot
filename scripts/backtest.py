@@ -2673,6 +2673,433 @@ def run_backtest_masr_short(client: Client, symbol: str, months: int,
     return trades
 
 
+# ── MASR Short v2 主回測（分級大盤 + 鬆綁 + fast/slow variant）─────
+def run_backtest_masr_short_v2(client: Client, symbol: str, months: int,
+                                debug: bool = False, *,
+                                variant: Optional[str] = None,
+                                regime_series=None) -> list:
+    """
+    v2：解 v1 訊號量過少（7/12m/30 幣）。三層改造：
+      1. 分級 BTC 大盤 gate：
+         - 強做空（BTC 1D EMA50<EMA200）→ 正常倉
+         - 弱做空（BTC 4H close<EMA50 且 24h<+1%）→ 半倉
+         - 兩者皆不滿足 → 不做空
+      2. 個幣選幣放寬：30M 量 / 4H EMA50<EMA200 / 7d 漲<+3% / 距 30d 高>8%
+      3. 進場放寬：量能 1.2× / 4H RSI>35 / 距 EMA200<12%
+    variant: "fast" = 1-bar 確認、"slow" = i+1 close < S - 0.2×ATR
+
+    Trades 會被附上動態屬性 trade.regime_mode = "strong" / "weak"
+    （半倉 weak 模式 qty × MASR_SHORT_V2_WEAK_QTY_MULT）。
+    """
+    var = (variant or Config.MASR_SHORT_V2_VARIANT).lower()
+    if var not in ("fast", "slow"):
+        var = "fast"
+
+    tf = Config.MASR_SHORT_TIMEFRAME  # 1H
+    print(f"\n[{symbol} MASR_SHORT_V2:{var} {tf}] 回測開始")
+
+    # ── 抓資料 ─────────────────────────────────────────────────
+    df_tf = fetch_klines(client, symbol, tf, months)
+    lookback = int(Config.MASR_SHORT_RES_LOOKBACK)
+    if len(df_tf) < lookback + 30:
+        print(f"  資料不足（{len(df_tf)} 根 < {lookback + 30}），跳過")
+        return []
+
+    # SYMBOL 4H（給 RSI + 個幣 4H 趨勢結構）
+    df_4h = fetch_klines(client, symbol, "4h", months)
+    if len(df_4h) < 200:
+        print(f"  4H 資料不足（{len(df_4h)} < 200），跳過")
+        return []
+
+    # SYMBOL 1D（給 7d / 30d high / 24h % 用）
+    df_1d = fetch_klines(client, symbol, "1d", months + 1)
+    if len(df_1d) < 30:
+        print(f"  1D 資料不足，跳過")
+        return []
+
+    # BTC 1D（強做空 gate）+ BTC 4H（弱做空 gate）+ BTC 1D 24h pct
+    df_btc_1d = fetch_klines(client, "BTCUSDT", "1d", months + 1)
+    df_btc_4h = fetch_klines(client, "BTCUSDT", "4h", months)
+    if len(df_btc_1d) < 200 or len(df_btc_4h) < 50:
+        print(f"  BTC 大盤資料不足，跳過")
+        return []
+
+    print(f"  預計算指標 ({var} variant)...", end="", flush=True)
+    # 1H 指標
+    ema20_s = ta.ema(df_tf["close"], length=20)
+    ema50_s = ta.ema(df_tf["close"], length=50)
+    atr_s   = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
+    avg_vol_s = df_tf["volume"].rolling(21).mean().shift(1)
+
+    # 4H RSI + 4H EMA 趨勢
+    rsi_period = int(Config.MASR_SHORT_RSI_PERIOD)
+    rsi_4h_s = ta.rsi(df_4h["close"], length=rsi_period)
+    ema_4h_fast = ta.ema(df_4h["close"], length=int(Config.MASR_SHORT_V2_TREND_FAST_EMA))
+    ema_4h_slow = ta.ema(df_4h["close"], length=int(Config.MASR_SHORT_V2_TREND_SLOW_EMA))
+    rsi_4h_a = _align_higher_to_lower(df_tf, df_4h, rsi_4h_s)
+    ema_4h_fast_a = _align_higher_to_lower(df_tf, df_4h, ema_4h_fast)
+    ema_4h_slow_a = _align_higher_to_lower(df_tf, df_4h, ema_4h_slow)
+
+    # 1D：用日線算 EMA200（給「距 EMA200」過濾）+ 7d / 30d high / 24h
+    ema200_d = ta.ema(df_1d["close"], length=200) if len(df_1d) >= 200 else None
+    close_7d_prev_s = df_1d["close"].shift(7)
+    high_30d_s = df_1d["high"].rolling(30).max()
+    close_prev_d_s = df_1d["close"].shift(1)
+    ema200_d_a = _align_higher_to_lower(df_tf, df_1d, ema200_d)
+    close_7d_prev_a = _align_higher_to_lower(df_tf, df_1d, close_7d_prev_s)
+    high_30d_a = _align_higher_to_lower(df_tf, df_1d, high_30d_s)
+    close_d_a = _align_higher_to_lower(df_tf, df_1d, df_1d["close"])
+    close_prev_d_a = _align_higher_to_lower(df_tf, df_1d, close_prev_d_s)
+
+    # ── BTC 大盤分級指標 ─────────────────────────────────────
+    # 強做空：BTC 1D EMA50<EMA200
+    btc_d_fast = ta.ema(df_btc_1d["close"], length=int(Config.MASR_SHORT_V2_STRONG_FAST_EMA))
+    btc_d_slow = ta.ema(df_btc_1d["close"], length=int(Config.MASR_SHORT_V2_STRONG_SLOW_EMA))
+    btc_d_fast_a = _align_higher_to_lower(df_tf, df_btc_1d, btc_d_fast)
+    btc_d_slow_a = _align_higher_to_lower(df_tf, df_btc_1d, btc_d_slow)
+    # 弱做空：BTC 4H close<EMA50
+    btc_4h_ema50 = ta.ema(df_btc_4h["close"], length=int(Config.MASR_SHORT_V2_WEAK_EMA))
+    btc_4h_ema50_a = _align_higher_to_lower(df_tf, df_btc_4h, btc_4h_ema50)
+    btc_4h_close_a = _align_higher_to_lower(df_tf, df_btc_4h, df_btc_4h["close"])
+    # 弱做空：BTC 24h pct
+    btc_d_close_s = df_btc_1d["close"]
+    btc_d_prev_s = df_btc_1d["close"].shift(1)
+    btc_24h_pct_s = (btc_d_close_s - btc_d_prev_s) / btc_d_prev_s
+    btc_24h_a = _align_higher_to_lower(df_tf, df_btc_1d, btc_24h_pct_s)
+    print(" 完成")
+
+    lows_arr = df_tf["low"].values
+    closes_arr = df_tf["close"].values
+
+    warmup = max(60, lookback + 5)
+    trades: list[BtTrade] = []
+    cooldown_until = -1
+    timeout_bars = int(Config.MASR_SHORT_TIMEOUT_BARS)
+    min_score    = int(Config.MASR_SHORT_MIN_SCORE)
+    vol_mult     = float(Config.MASR_SHORT_V2_VOL_MULT)
+    sl_atr_mult  = float(Config.MASR_SHORT_SL_ATR_MULT)
+    tp1_rr       = float(Config.MASR_SHORT_TP1_RR)
+    tp2_rr       = float(Config.MASR_SHORT_TP2_RR)
+    res_tol_mult = float(Config.MASR_SHORT_RES_TOL_ATR_MULT)
+    res_min_touches = int(Config.MASR_SHORT_RES_MIN_TOUCHES)
+    rsi_min      = float(Config.MASR_SHORT_V2_RSI_MIN)
+    max_dist_e200 = float(Config.MASR_SHORT_V2_MAX_DIST_FROM_EMA200)
+    max_7d_pct   = float(Config.MASR_SHORT_V2_7D_MAX_RETURN)
+    min_dist_high = float(Config.MASR_SHORT_V2_DIST_HIGH_PCT)
+    weak_btc_24h_max = float(Config.MASR_SHORT_V2_WEAK_BTC_24H_MAX)
+    weak_qty_mult = float(Config.MASR_SHORT_V2_WEAK_QTY_MULT)
+    slow_offset_atr = float(Config.MASR_SHORT_V2_SLOW_OFFSET_ATR)
+
+    dbg = {
+        "cooldown": 0, "no_regime": 0, "no_4h_trend": 0, "no_support": 0,
+        "no_breakdown": 0, "no_breakdown_slow": 0, "no_volume": 0,
+        "no_ema_1h": 0, "rsi_oversold": 0, "deep_below_ema200": 0,
+        "weak_7d": 0, "weak_dist_high": 0, "low_score": 0, "bad_pos": 0,
+        "signals_strong": 0, "signals_weak": 0,
+    }
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 2):  # -2 因 slow variant 需要 i+1 K 棒
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+
+        # ── 分級 BTC regime ─────────────────────────────────
+        bd_fast = btc_d_fast_a[i]; bd_slow = btc_d_slow_a[i]
+        b4_close = btc_4h_close_a[i]; b4_ema = btc_4h_ema50_a[i]
+        b_24h = btc_24h_a[i]
+
+        strong_short = (not np.isnan(bd_fast) and not np.isnan(bd_slow)
+                        and bd_fast < bd_slow)
+        weak_short = (not np.isnan(b4_close) and not np.isnan(b4_ema)
+                      and not np.isnan(b_24h)
+                      and b4_close < b4_ema
+                      and b_24h < weak_btc_24h_max)
+
+        if not (strong_short or weak_short):
+            dbg["no_regime"] += 1
+            continue
+        regime_mode = "strong" if strong_short else "weak"
+
+        # ── 個幣 4H 趨勢結構 ────────────────────────────────
+        e4f = ema_4h_fast_a[i]; e4s = ema_4h_slow_a[i]
+        if np.isnan(e4f) or np.isnan(e4s) or e4f >= e4s:
+            dbg["no_4h_trend"] += 1
+            continue
+
+        # ── 7d 漲幅 < +3% + 距 30d 高 > 8% ──────────────────
+        c_d = close_d_a[i]; c_7d = close_7d_prev_a[i]; h_30 = high_30d_a[i]
+        if np.isnan(c_d) or np.isnan(c_7d) or np.isnan(h_30) or c_7d <= 0 or h_30 <= 0:
+            continue
+        pct_7d = (c_d - c_7d) / c_7d
+        if pct_7d > max_7d_pct:
+            dbg["weak_7d"] += 1
+            continue
+        dist_high = (c_d - h_30) / h_30
+        if dist_high > -min_dist_high:
+            dbg["weak_dist_high"] += 1
+            continue
+
+        # ── 1H 指標 ──────────────────────────────────────────
+        ema20_v = ema20_s.iloc[i] if ema20_s is not None else float("nan")
+        ema50_v = ema50_s.iloc[i] if ema50_s is not None else float("nan")
+        atr_v   = atr_s.iloc[i]   if atr_s   is not None else float("nan")
+        avg_vol = avg_vol_s.iloc[i] if avg_vol_s is not None else float("nan")
+        cur_close = float(closes_arr[i])
+        cur_vol   = float(df_tf["volume"].iloc[i])
+
+        if pd.isna(ema20_v) or pd.isna(ema50_v) or pd.isna(atr_v) \
+                or pd.isna(avg_vol) or float(avg_vol) <= 0:
+            continue
+        ema20_v = float(ema20_v); ema50_v = float(ema50_v); atr_v = float(atr_v)
+
+        if ema20_v >= ema50_v:
+            dbg["no_ema_1h"] += 1
+            continue
+
+        # 找支撐
+        support = _bt_masr_short_find_support(
+            lows_arr, i, atr_v, lookback, res_tol_mult,
+            res_min_touches, cur_close
+        )
+        if support is None:
+            dbg["no_support"] += 1
+            continue
+
+        # 1-bar 確認（fast 與 slow 都要這道）
+        if cur_close >= support:
+            dbg["no_breakdown"] += 1
+            continue
+
+        # slow variant：i+1 close < S - 0.2×ATR
+        if var == "slow":
+            next_close = float(closes_arr[i + 1])
+            if next_close >= (support - slow_offset_atr * atr_v):
+                dbg["no_breakdown_slow"] += 1
+                continue
+
+        # 量能 > 1.2×
+        vol_ratio = cur_vol / float(avg_vol)
+        if vol_ratio < vol_mult:
+            dbg["no_volume"] += 1
+            continue
+
+        # 4H RSI > 35
+        rsi_v = rsi_4h_a[i]
+        if np.isnan(rsi_v) or rsi_v <= rsi_min:
+            dbg["rsi_oversold"] += 1
+            continue
+
+        # 距日線 EMA200 < 12%
+        e200_d = ema200_d_a[i]
+        if not np.isnan(e200_d) and e200_d > 0:
+            dist_e200 = (cur_close - e200_d) / e200_d
+            if dist_e200 < -max_dist_e200:
+                dbg["deep_below_ema200"] += 1
+                continue
+
+        # ── SL / TP（SHORT）─────────────────────────────────
+        # 入場價：fast = i 收盤、slow = i+1 收盤
+        if var == "slow":
+            entry_idx = i + 1
+            entry = float(closes_arr[entry_idx])
+        else:
+            entry_idx = i
+            entry = cur_close
+
+        sl = entry + sl_atr_mult * atr_v
+        if sl <= entry:
+            dbg["bad_pos"] += 1
+            continue
+        sl_dist = sl - entry
+        tp1 = entry - tp1_rr * sl_dist
+        tp2 = entry - tp2_rr * sl_dist
+        if tp1 <= 0 or tp2 <= 0:
+            dbg["bad_pos"] += 1
+            continue
+
+        # ── 評分 ─────────────────────────────────────────────
+        score = 1
+        ema_gap_pct = (ema50_v - ema20_v) / ema20_v if ema20_v > 0 else 0
+        if ema_gap_pct >= 0.01:
+            score += 1
+        if vol_ratio >= 2.0:
+            score += 1
+        if 35 <= float(rsi_v) <= 55:
+            score += 1
+        score = min(score, 5)
+        if score < min_score:
+            dbg["low_score"] += 1
+            continue
+
+        # 倉位（弱模式半倉）
+        qty_mult = weak_qty_mult if regime_mode == "weak" else 1.0
+        qty_total = (MARGIN_USDT * LEVERAGE / entry) * qty_mult
+        qty_tp1 = round(qty_total * 0.5, 6)
+        qty_tp2 = round(qty_total - qty_tp1, 6)
+
+        trade = BtTrade(
+            symbol    = symbol,
+            direction = "SHORT",
+            entry     = entry,
+            sl        = sl,
+            tp1       = tp1,
+            tp2       = tp2,
+            qty       = qty_total,
+            qty_tp1   = qty_tp1,
+            qty_tp2   = qty_tp2,
+            fib_level = "",
+            pattern   = f"MASR_BREAKDOWN_V2_{var.upper()}",
+            score     = score,
+            timeframe = tf,
+            open_bar  = entry_idx,
+            open_time = df_tf["time"].iloc[entry_idx],
+            strategy  = "ma_sr_short_v2",
+        )
+        # 動態屬性：regime mode（用於後續模式拆分統計）
+        setattr(trade, "regime_mode", regime_mode)
+
+        df_future = df_tf.iloc[entry_idx + 1:].reset_index(drop=True)
+        be_after_tp1 = bool(getattr(Config, "MASR_SHORT_BE_AFTER_TP1", True))
+        trade = simulate_trade(
+            trade, df_future, max_bars=timeout_bars,
+            sl_to_be_after_tp1=be_after_tp1,
+        )
+        # simulate_trade 會回傳新 trade 但保留所有屬性（同物件）
+        if not hasattr(trade, "regime_mode"):
+            setattr(trade, "regime_mode", regime_mode)
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        trades.append(trade)
+        if regime_mode == "strong":
+            dbg["signals_strong"] += 1
+        else:
+            dbg["signals_weak"] += 1
+
+        if "SL" in trade.result and "BE" not in trade.result:
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+
+    total_signals = dbg["signals_strong"] + dbg["signals_weak"]
+    print(f" 找到 {total_signals} 筆訊號 "
+          f"(強做空 {dbg['signals_strong']} + 弱做空 {dbg['signals_weak']})")
+    if debug or total_signals == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"]
+        print(f"\n  ── MASR_SHORT_V2:{var} 診斷 ──")
+        print(f"  總掃描根數：{scanned}")
+        print(f"  ├─ 大盤兩條都不允許做空        ：{dbg['no_regime']}")
+        print(f"  ├─ 4H EMA50≥EMA200            ：{dbg['no_4h_trend']}")
+        print(f"  ├─ 7 日漲幅 > {max_7d_pct*100:.0f}%        ：{dbg['weak_7d']}")
+        print(f"  ├─ 距 30d 高跌 < {min_dist_high*100:.0f}%      ：{dbg['weak_dist_high']}")
+        print(f"  ├─ 1H EMA20 ≥ EMA50           ：{dbg['no_ema_1h']}")
+        print(f"  ├─ 找不到支撐位                ：{dbg['no_support']}")
+        print(f"  ├─ 1-bar 確認失敗 (close ≥ S)  ：{dbg['no_breakdown']}")
+        if var == "slow":
+            print(f"  ├─ slow: i+1 ≥ S-{slow_offset_atr}×ATR  ：{dbg['no_breakdown_slow']}")
+        print(f"  ├─ 量能 < {vol_mult}×                ：{dbg['no_volume']}")
+        print(f"  ├─ 4H RSI ≤ {rsi_min:.0f}                ：{dbg['rsi_oversold']}")
+        print(f"  ├─ 距 EMA200 跌 > {max_dist_e200*100:.0f}%       ：{dbg['deep_below_ema200']}")
+        print(f"  ├─ 評分不足 (<{min_score})           ：{dbg['low_score']}")
+        print(f"  ├─ SL 位置異常                ：{dbg['bad_pos']}")
+        print(f"  ├─ 通過（強做空）              ：{dbg['signals_strong']}")
+        print(f"  └─ 通過（弱做空，半倉）        ：{dbg['signals_weak']}")
+    return trades
+
+
+# ── MASR Short v2 每日做空池使用率 ───────────────────────────
+def print_masr_short_v2_daily_pool(results: dict, v2_variants: list,
+                                    n_symbols: int) -> None:
+    """
+    每日「實際進場的幣數」（近似做空池使用率，非池內候選數）。
+    完整 pool size 需另跑 daily screen simulation；這裡用「當日有訊號的幣數」當代理。
+    """
+    by_day_v: dict[tuple, set] = {}
+    for v in v2_variants:
+        key = f"MASR_SHORT_V2_{v.upper()}"
+        for (sym, k), trades in results.items():
+            if k != key:
+                continue
+            for t in trades:
+                if not t.open_time:
+                    continue
+                day = t.open_time.strftime("%Y-%m-%d")
+                by_day_v.setdefault((day, v), set()).add(sym)
+    if not by_day_v:
+        return
+    print(f"\n{'='*78}")
+    print(f"  每日做空進場幣數（{n_symbols} 幣中當日真正開倉數，非池內候選數）")
+    print(f"{'='*78}")
+    # 拆 variant 分別印
+    for v in v2_variants:
+        rows = [((d, vv), syms) for (d, vv), syms in by_day_v.items() if vv == v]
+        if not rows:
+            continue
+        rows.sort(key=lambda x: -len(x[1]))
+        top = rows[:15]
+        print(f"\n  ── {v} variant：top 15 活躍日 ──")
+        for (day, _), syms in sorted(top, key=lambda x: x[0][0]):
+            n = len(syms)
+            bar = "█" * n
+            print(f"  {day}: {n:>2}/{n_symbols}  {bar}  ({', '.join(sorted(syms))[:60]})")
+        # 統計
+        all_days = {d for (d, vv) in by_day_v if vv == v}
+        days_active = len(all_days)
+        max_concurrent = max((len(s) for s in by_day_v.values() if True), default=0)
+        print(f"  {v} 摘要：活躍 {days_active} 天、單日最高同時開 {max_concurrent} 幣")
+
+
+# ── MASR Short v2 月度與模式拆分 ──────────────────────────────
+def print_masr_short_v2_breakdown(trades: list, label: str = "v2") -> None:
+    """印出 v2 trades 的月度分布 + 強/弱模式拆分。"""
+    closed = [t for t in trades if t.result not in ("", "OPEN")]
+    if not closed:
+        print(f"\n[MASR_SHORT_{label}] 無已結算交易")
+        return
+
+    print(f"\n{'='*70}")
+    print(f"  MASR_SHORT_{label}：月度訊號分布")
+    print(f"{'='*70}")
+    monthly: dict[str, list] = {}
+    for t in closed:
+        if not t.open_time:
+            continue
+        key = t.open_time.strftime("%Y-%m")
+        monthly.setdefault(key, []).append(t)
+    if monthly:
+        max_cnt = max(len(v) for v in monthly.values())
+        for month in sorted(monthly.keys()):
+            ts = monthly[month]
+            n = len(ts)
+            pnl = sum(t.net_pnl for t in ts)
+            wins = sum(1 for t in ts if t.net_pnl > 0)
+            wr = wins / n * 100
+            bar = "█" * max(1, int(n / max_cnt * 30))
+            sgn = "+" if pnl >= 0 else ""
+            print(f"  {month}: {n:>3}筆  WR={wr:>5.1f}%  PnL={sgn}{pnl:>+7.2f}  {bar}")
+
+    # 強/弱模式拆分
+    print(f"\n{'='*70}")
+    print(f"  MASR_SHORT_{label}：大盤模式拆分（strong vs weak）")
+    print(f"{'='*70}")
+    for mode in ("strong", "weak"):
+        ms = [t for t in closed if getattr(t, "regime_mode", "") == mode]
+        if not ms:
+            print(f"  {mode:<8}: 無交易")
+            continue
+        n = len(ms)
+        wins = sum(1 for t in ms if t.net_pnl > 0)
+        wr = wins / n * 100
+        pnl = sum(t.net_pnl for t in ms)
+        avg = pnl / n
+        sl = sum(1 for t in ms if "SL" in t.result and "BE" not in t.result)
+        tp = sum(1 for t in ms if "TP" in t.result)
+        to = sum(1 for t in ms if t.result == "TIMEOUT")
+        print(f"  {mode:<8}: {n} 筆  WR={wr:.1f}%  PnL={pnl:+.2f}  AvgPnL={avg:+.3f}  "
+              f"SL={sl} TP={tp} TIMEOUT={to}")
+
+
 # ── 輸出統計 ──────────────────────────────────────────────────────
 def print_stats(trades: list, timeframe: str, symbol: str,
                 initial_balance: float, label: str = ""):
@@ -3082,6 +3509,19 @@ def _run_multi_coin_backtest(
                 tr = []
             results[(sym, "MASR_SHORT")] = tr
 
+        if run_flags.get("masr_short_v2"):
+            v2_variants = run_flags.get("masr_short_v2_variants") or ["fast"]
+            for v in v2_variants:
+                key = f"MASR_SHORT_V2_{v.upper()}"
+                try:
+                    tr = run_backtest_masr_short_v2(
+                        client, sym, args.months, debug=False, variant=v,
+                    )
+                except Exception as e:
+                    print(f"  [{key}] 失敗：{e}")
+                    tr = []
+                results[(sym, key)] = tr
+
     return results
 
 
@@ -3375,6 +3815,15 @@ def main():
     parser.add_argument("--no-regime",       dest="use_regime",
                         action="store_false", default=True,
                         help="多幣模式關閉 regime 模擬（預設 ON，對齊 live）")
+    # MASR Short v2 控制
+    parser.add_argument("--masrs-v2-variant", default=None,
+                        choices=["fast", "slow", "both"],
+                        help="MASR Short v2 變體：fast=1-bar、slow=2-bar+0.2×ATR offset、"
+                             "both=同時跑兩者比較（預設讀 .env MASR_SHORT_V2_VARIANT）")
+    parser.add_argument("--masrs-compare",   action="store_true",
+                        help="同時跑 v1 + v2 並比對訊號量（含月度分布 + 模式拆分）")
+    parser.add_argument("--masrs-pool",      action="store_true",
+                        help="多幣模式：每日輸出做空池幣數變化")
     args = parser.parse_args()
 
     timeframes = args.tf or DEFAULT_TF
@@ -3406,10 +3855,13 @@ def main():
         "bd":  "breakdown_short", "ml": "momentum_long",
         "smc": "smc_sweep", "masr": "ma_sr_breakout",
         "masrs": "ma_sr_short", "masr_short": "ma_sr_short",
+        # v2 別名（fast/slow 由 --masrs-v2-variant 控制；別名統一指向 v2）
+        "masrs2": "ma_sr_short_v2", "masr_short_v2": "ma_sr_short_v2",
+        "masrsv2": "ma_sr_short_v2",
     }
     _VALID = {"naked_k_fib", "mean_reversion", "breakdown_short",
               "momentum_long", "smc_sweep", "ma_sr_breakout",
-              "ma_sr_short", "all"}
+              "ma_sr_short", "ma_sr_short_v2", "all"}
     _raw_strats = [s.strip().lower() for s in args.strategy.split(",") if s.strip()]
     _expanded = []
     for s in _raw_strats:
@@ -3429,6 +3881,7 @@ def main():
     run_smc  = _is_all or "smc_sweep"       in _strats_set
     run_masr = _is_all or "ma_sr_breakout"  in _strats_set
     run_masr_short = _is_all or "ma_sr_short" in _strats_set
+    run_masr_short_v2 = "ma_sr_short_v2" in _strats_set  # v2 不入 all（避免重複跑）
 
     # ── 掃描模式（優先）──────────────────────────────────────────
     if args.scan:
@@ -3440,12 +3893,19 @@ def main():
     multi_mode = bool(args.symbols) or (args.top_n and args.top_n > 0)
     if multi_mode:
         symbols = _resolve_symbol_list(args, client)
+        # v2 variants（支援 fast/slow/both，預設讀 .env）
+        v2_var_arg = args.masrs_v2_variant or Config.MASR_SHORT_V2_VARIANT
+        v2_variants = (["fast", "slow"] if v2_var_arg == "both"
+                       else [v2_var_arg])
         run_flags = {
             "nkf": run_nkf, "mr": run_mr, "bd": run_bd,
             "ml": run_ml, "smc": run_smc, "masr": run_masr,
             "masr_short": run_masr_short,
+            "masr_short_v2": run_masr_short_v2 or args.masrs_compare,
+            "masr_short_v2_variants": v2_variants,
         }
-        active_strats = [k.upper() for k, v in run_flags.items() if v]
+        active_strats = [k.upper() for k, v in run_flags.items()
+                         if v and k != "masr_short_v2_variants"]
         print(f"\n{'='*78}")
         print(f"  多幣多策略回測  共 {len(symbols)} 幣 × "
               f"{len(active_strats)} 策略 = {len(symbols)*len(active_strats)} 組合")
@@ -3457,6 +3917,52 @@ def main():
         print(f"{'='*78}")
         results = _run_multi_coin_backtest(client, symbols, args, run_flags)
         _print_multi_summary(results, args.balance)
+
+        # ── v2 額外輸出：月度分布 + 模式拆分（每 variant）─────────
+        if run_flags.get("masr_short_v2"):
+            for v in v2_variants:
+                key = f"MASR_SHORT_V2_{v.upper()}"
+                merged: list = []
+                for sym in symbols:
+                    merged.extend(results.get((sym, key), []))
+                if merged:
+                    print(f"\n{'='*78}")
+                    print(f"  跨幣彙整：{key}（{len(merged)} 筆）")
+                    print(f"{'='*78}")
+                    print_masr_short_v2_breakdown(merged, label=f"V2:{v} ALL")
+            # 每日做空池使用率（粗略代理：當日真正開倉幣數）
+            if args.masrs_pool:
+                print_masr_short_v2_daily_pool(results, v2_variants, len(symbols))
+
+            # ── v1 vs v2 對照 ─────────────────────────────────────
+            v1_all = []
+            for sym in symbols:
+                v1_all.extend(results.get((sym, "MASR_SHORT"), []))
+            v2_alls = {}
+            for v in v2_variants:
+                key = f"MASR_SHORT_V2_{v.upper()}"
+                v2_alls[key] = []
+                for sym in symbols:
+                    v2_alls[key].extend(results.get((sym, key), []))
+            if v1_all or any(v2_alls.values()):
+                print(f"\n{'='*78}")
+                print(f"  v1 vs v2 對照")
+                print(f"{'='*78}")
+                print(f"  {'Variant':<22} {'Trades':>7} {'Win%':>7} "
+                      f"{'PnL':>10} {'AvgPnL':>9}")
+                print(f"  {'-'*65}")
+                for label, ts in [("MASR_SHORT (v1 baseline)", v1_all),
+                                  *[(k, v) for k, v in v2_alls.items()]]:
+                    closed = [t for t in ts if t.result not in ("", "OPEN")]
+                    if not closed:
+                        print(f"  {label:<22} {0:>7} {'—':>7} {'—':>10} {'—':>9}")
+                        continue
+                    wins = [t for t in closed if t.net_pnl > 0]
+                    pnl = sum(t.net_pnl for t in closed)
+                    wr = len(wins) / len(closed) * 100
+                    avg = pnl / len(closed)
+                    print(f"  {label:<22} {len(closed):>7} {wr:>6.1f}% "
+                          f"{pnl:>+10.2f} {avg:>+9.3f}")
         return
 
     print(f"\n{'='*60}")
@@ -3552,6 +4058,19 @@ def main():
         print_stats(trades_masr_s, Config.MASR_SHORT_TIMEFRAME, args.symbol,
                     args.balance, label="MASR_SHORT")
         all_masr_short.extend(trades_masr_s)
+
+    # ── MASR_SHORT v2 回測（fast / slow / both）─────────────────
+    if run_masr_short_v2 or args.masrs_compare:
+        v2_variant = args.masrs_v2_variant or Config.MASR_SHORT_V2_VARIANT
+        variants = ["fast", "slow"] if v2_variant == "both" else [v2_variant]
+        for v in variants:
+            trades_v2 = run_backtest_masr_short_v2(
+                client, args.symbol, args.months,
+                debug=args.debug_indicators, variant=v,
+            )
+            print_stats(trades_v2, Config.MASR_SHORT_TIMEFRAME, args.symbol,
+                        args.balance, label=f"MASR_SHORT_V2:{v}")
+            print_masr_short_v2_breakdown(trades_v2, label=f"V2:{v}")
 
     # ── 合併統計（only when running all）─────────────────────────
     if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml or all_smc or all_masr or all_masr_short):
