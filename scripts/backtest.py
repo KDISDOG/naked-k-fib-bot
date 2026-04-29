@@ -1336,7 +1336,20 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
     remaining_qty = trade.qty
     active_sl = trade.sl  # 可動態調整（TP1 後若 sl_to_be_after_tp1=True 會改為 entry）
 
+    # MFE/MAE 追蹤（給根因分析用）：開倉後最佳 / 最差價格
+    max_fav_price = trade.entry  # LONG: 最高 high；SHORT: 最低 low
+    max_adv_price = trade.entry
+
     for i, (_, bar) in enumerate(df_future.iterrows()):
+        # 更新 MFE/MAE
+        bh, bl = bar["high"], bar["low"]
+        if trade.direction == "LONG":
+            if bh > max_fav_price: max_fav_price = bh
+            if bl < max_adv_price: max_adv_price = bl
+        else:
+            if bl < max_fav_price: max_fav_price = bl
+            if bh > max_adv_price: max_adv_price = bh
+
         if i >= max_bars:
             # 超時平倉
             exit_p = bar["close"]
@@ -1352,6 +1365,8 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
             trade.net_pnl    = round(pnl - fee, 4)
             trade.close_time = bar["time"]
             trade.tp1_hit    = tp1_hit
+            setattr(trade, "max_favorable_price", max_fav_price)
+            setattr(trade, "max_adverse_price", max_adv_price)
             return trade
 
         high, low = bar["high"], bar["low"]
@@ -1382,6 +1397,8 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                 trade.net_pnl    = round(total_pnl - total_fee, 4)
                 trade.close_time = bar["time"]
                 trade.tp1_hit    = tp1_hit
+                setattr(trade, "max_favorable_price", max_fav_price)
+                setattr(trade, "max_adverse_price", max_adv_price)
                 return trade
 
             # ── TP1 觸發（部分平倉）──
@@ -1407,6 +1424,8 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                 trade.net_pnl    = round(tp1_pnl + tp2_pnl - fee, 4)
                 trade.close_time = bar["time"]
                 trade.tp1_hit    = True
+                setattr(trade, "max_favorable_price", max_fav_price)
+                setattr(trade, "max_adverse_price", max_adv_price)
                 return trade
 
         else:  # SHORT
@@ -1434,6 +1453,8 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                 trade.net_pnl    = round(total_pnl - total_fee, 4)
                 trade.close_time = bar["time"]
                 trade.tp1_hit    = tp1_hit
+                setattr(trade, "max_favorable_price", max_fav_price)
+                setattr(trade, "max_adverse_price", max_adv_price)
                 return trade
 
             # ── TP1 觸發 ──
@@ -1458,10 +1479,14 @@ def simulate_trade(trade: BtTrade, df_future: pd.DataFrame,
                 trade.net_pnl    = round(tp1_pnl + tp2_pnl - fee, 4)
                 trade.close_time = bar["time"]
                 trade.tp1_hit    = True
+                setattr(trade, "max_favorable_price", max_fav_price)
+                setattr(trade, "max_adverse_price", max_adv_price)
                 return trade
 
     # 沒撞到任何條件（資料不夠）
     trade.result = "OPEN"
+    setattr(trade, "max_favorable_price", max_fav_price)
+    setattr(trade, "max_adverse_price", max_adv_price)
     return trade
 
 
