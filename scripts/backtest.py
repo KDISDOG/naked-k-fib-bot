@@ -3074,20 +3074,42 @@ def run_backtest_masr_short_v2(client: Client, symbol: str, months: int,
     return trades
 
 
+# ── BTC 60 日波動率 series（給 Granville 根因分析的 regime 切片用）──
+def btc_60d_vol_series(client: Client, months: int) -> pd.DataFrame:
+    """
+    回傳 DataFrame[time, btc_60d_vol_pct]。
+    定義：BTC 1d 收盤的 log return 60 日 rolling std × √365 × 100 (年化 %)
+    用 disk cache 避免重抓。
+    """
+    df = fetch_klines(client, "BTCUSDT", "1d", months + 3)
+    if len(df) < 70:
+        return pd.DataFrame(columns=["time", "btc_60d_vol_pct"])
+    log_ret = np.log(df["close"] / df["close"].shift(1))
+    vol = log_ret.rolling(60).std() * (365 ** 0.5) * 100
+    return pd.DataFrame({"time": df["time"], "btc_60d_vol_pct": vol}).dropna()
+
+
 # ── Granville 葛蘭碧主回測（4H + EMA60 + 4 法則）────────────
 def run_backtest_granville(client: Client, symbol: str, months: int,
                             debug: bool = False, *,
-                            regime_series=None) -> list:
+                            regime_series=None,
+                            config_overrides: dict | None = None,
+                            config_label: str = "default") -> list:
     """
     Granville 4 法則回測（1, 2, 5, 6）。
-    關鍵差異 vs 其他策略：
-      - 4H timeframe，需要 EMA60 + ATR(14) + ADX(14) + 20 根均量
-      - 嚴格 AND 條件，訊號頻率本來就低（~ 4 幣 / 週 2-3 訊號）
-      - max_hold_bars=30 強制平倉、TP1 後 EMA60 trailing
-      - 連虧 3 筆暫停 12h（回測模擬）
-      - ATR-based exits：SL 1.5×、TP1 2.0×、TP2 4.0×
-    regime_series 不適用（Granville 自有 ADX 過濾）。
+
+    新增（給根因分析用）：
+      config_overrides: dict 覆蓋 Config 欄位（例 {'GRANVILLE_ADX_MIN': 25.0}）
+      config_label:     寫入 trade.config_label 區分多輪結果
+      診斷欄位：每筆 trade 會 setattr 上 adx_at_entry / atr_pct_at_entry /
+                ema60_slope_at_entry / rule_triggered / next_bar_close /
+                config_label，供 analyze_granville.py 切片
     """
+    # config 取值器：先看 overrides，否則回 Config
+    def _cv(key: str):
+        if config_overrides is not None and key in config_overrides:
+            return config_overrides[key]
+        return getattr(Config, key)
     tf = Config.GRANVILLE_TIMEFRAME
     print(f"\n[{symbol} GRANVILLE {tf}] 回測開始")
 
@@ -3112,28 +3134,28 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
     #         + 24h vol>100M (2) + ATR/price 1.5-4% (1)
     # 用 6 根 4H rolling sum 算 24h quote volume；qav 取 4H 該根的成交額。
     qav_24h_s = (df_tf["volume"] * df_tf["close"]).rolling(6).sum().shift(1)
-    same_side_n = int(Config.GRANVILLE_SCREEN_PRICE_SAME_SIDE_BARS)
-    slope_min_pct = float(Config.GRANVILLE_SCREEN_SLOPE_MIN_PCT)
-    vol_threshold = float(Config.GRANVILLE_SCREEN_VOL_M) * 1_000_000
-    atr_pct_min = float(Config.GRANVILLE_SCREEN_ATR_MIN_PCT)
-    atr_pct_max = float(Config.GRANVILLE_SCREEN_ATR_MAX_PCT)
-    screen_min = int(Config.GRANVILLE_SCREEN_MIN_SCORE)
+    same_side_n = int(_cv("GRANVILLE_SCREEN_PRICE_SAME_SIDE_BARS"))
+    slope_min_pct = float(_cv("GRANVILLE_SCREEN_SLOPE_MIN_PCT"))
+    vol_threshold = float(_cv("GRANVILLE_SCREEN_VOL_M")) * 1_000_000
+    atr_pct_min = float(_cv("GRANVILLE_SCREEN_ATR_MIN_PCT"))
+    atr_pct_max = float(_cv("GRANVILLE_SCREEN_ATR_MAX_PCT"))
+    screen_min = int(_cv("GRANVILLE_SCREEN_MIN_SCORE"))
     print(" 完成")
 
     warmup = max(ema_period + 10, 70)
     trades: list[BtTrade] = []
     cooldown_until = -1
-    timeout_bars = int(Config.GRANVILLE_MAX_HOLD_BARS)
+    timeout_bars = int(_cv("GRANVILLE_MAX_HOLD_BARS"))
 
-    breakout_mult = float(Config.GRANVILLE_BREAKOUT_ATR_MULT)
-    adx_min = float(Config.GRANVILLE_ADX_MIN)
-    vol_min_mult = float(Config.GRANVILLE_VOL_MIN_MULT)
-    slope_n = int(Config.GRANVILLE_SLOPE_LOOKBACK)
-    sl_mult = float(Config.GRANVILLE_SL_ATR_MULT)
-    tp1_mult = float(Config.GRANVILLE_TP1_ATR_MULT)
-    tp2_mult = float(Config.GRANVILLE_TP2_ATR_MULT)
-    consec_limit = int(Config.GRANVILLE_CONSEC_LOSS_LIMIT)
-    pause_bars = int(float(Config.GRANVILLE_PAUSE_HOURS) / 4)   # 4H × N
+    breakout_mult = float(_cv("GRANVILLE_BREAKOUT_ATR_MULT"))
+    adx_min = float(_cv("GRANVILLE_ADX_MIN"))
+    vol_min_mult = float(_cv("GRANVILLE_VOL_MIN_MULT"))
+    slope_n = int(_cv("GRANVILLE_SLOPE_LOOKBACK"))
+    sl_mult = float(_cv("GRANVILLE_SL_ATR_MULT"))
+    tp1_mult = float(_cv("GRANVILLE_TP1_ATR_MULT"))
+    tp2_mult = float(_cv("GRANVILLE_TP2_ATR_MULT"))
+    consec_limit = int(_cv("GRANVILLE_CONSEC_LOSS_LIMIT"))
+    pause_bars = int(float(_cv("GRANVILLE_PAUSE_HOURS")) / 4)   # 4H × N
 
     dbg = {
         "cooldown": 0, "paused": 0, "no_indicators": 0,
@@ -3301,6 +3323,25 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
             open_time=df_tf["time"].iloc[i],
             strategy="granville",
         )
+
+        # ── 診斷欄位（給 analyze_granville.py 切片用）─────────
+        ema60_window = ema60_s.iloc[i - slope_n:i + 1]
+        slope_pct = 0.0
+        if len(ema60_window) >= 2 and float(ema60_window.iloc[0]) > 0:
+            slope_pct = (
+                (float(ema60_window.iloc[-1]) - float(ema60_window.iloc[0]))
+                / float(ema60_window.iloc[0])
+            )
+        atr_pct = atr_v / cur_close * 100 if cur_close > 0 else 0
+        next_bar_close = (float(df_tf["close"].iloc[i + 1])
+                          if i + 1 < len(df_tf) else float("nan"))
+        setattr(trade, "adx_at_entry", round(adx_v, 2))
+        setattr(trade, "atr_pct_at_entry", round(atr_pct, 3))
+        setattr(trade, "ema60_slope_at_entry", round(slope_pct * 100, 3))
+        setattr(trade, "rule_triggered", "rule_1" if side == "LONG" else "rule_5")
+        setattr(trade, "next_bar_close", next_bar_close)
+        setattr(trade, "config_label", config_label)
+        setattr(trade, "screen_score", screen_score)
 
         df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
         # GRANVILLE 規格：TP1 後 SL 移到 entry（保本，trailing 改用 EMA60 在 live）
