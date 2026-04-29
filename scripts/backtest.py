@@ -3107,6 +3107,17 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
     adx_s = adx_df["ADX_14"] if (adx_df is not None
                                   and "ADX_14" in adx_df.columns) else None
     avg_vol_s = df_tf["volume"].rolling(20).mean().shift(1)
+    # ── Granville Screener 評分（per-bar，用 4H 資料推算）─────
+    # 滿分 10：ADX>25 (3) + 連 5 根同側 (2) + EMA20 斜率 >0.5% (2)
+    #         + 24h vol>100M (2) + ATR/price 1.5-4% (1)
+    # 用 6 根 4H rolling sum 算 24h quote volume；qav 取 4H 該根的成交額。
+    qav_24h_s = (df_tf["volume"] * df_tf["close"]).rolling(6).sum().shift(1)
+    same_side_n = int(Config.GRANVILLE_SCREEN_PRICE_SAME_SIDE_BARS)
+    slope_min_pct = float(Config.GRANVILLE_SCREEN_SLOPE_MIN_PCT)
+    vol_threshold = float(Config.GRANVILLE_SCREEN_VOL_M) * 1_000_000
+    atr_pct_min = float(Config.GRANVILLE_SCREEN_ATR_MIN_PCT)
+    atr_pct_max = float(Config.GRANVILLE_SCREEN_ATR_MAX_PCT)
+    screen_min = int(Config.GRANVILLE_SCREEN_MIN_SCORE)
     print(" 完成")
 
     warmup = max(ema_period + 10, 70)
@@ -3128,7 +3139,7 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
         "cooldown": 0, "paused": 0, "no_indicators": 0,
         "no_break_long": 0, "no_break_short": 0,
         "no_slope": 0, "no_volume": 0, "low_adx": 0,
-        "bad_pos": 0,
+        "bad_pos": 0, "low_screen_score": 0,
         "signals_long": 0, "signals_short": 0,
     }
 
@@ -3164,6 +3175,39 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
         cur_close = float(df_tf["close"].iloc[i])
         prev_close = float(df_tf["close"].iloc[i - 1])
         cur_vol = float(df_tf["volume"].iloc[i])
+
+        # ── Granville Screener 評分（per-bar）─────────────
+        screen_score = 0
+        # 1) ADX > 25 → 3 分
+        if adx_v > 25:
+            screen_score += 3
+        # 2) 連續 N 根 close 與 EMA60 同側 → 2 分
+        recent_close = df_tf["close"].iloc[i - same_side_n + 1:i + 1]
+        recent_ema = ema60_s.iloc[i - same_side_n + 1:i + 1]
+        if len(recent_close) >= same_side_n:
+            up = bool((recent_close > recent_ema).all())
+            dn = bool((recent_close < recent_ema).all())
+            if up or dn:
+                screen_score += 2
+        # 3) EMA20 過去 N 根斜率 |slope/price| > 0.5% → 2 分
+        if ema20_s is not None and cur_close > 0:
+            ema20_window = ema20_s.iloc[i - same_side_n + 1:i + 1]
+            if len(ema20_window) >= 2:
+                slope = float(ema20_window.iloc[-1]) - float(ema20_window.iloc[0])
+                if abs(slope / cur_close) > slope_min_pct:
+                    screen_score += 2
+        # 4) 24h quote volume > 100M → 2 分（用 6 根 4H rolling sum 估）
+        qav_24h = float(qav_24h_s.iloc[i]) if not pd.isna(qav_24h_s.iloc[i]) else 0
+        if qav_24h > vol_threshold:
+            screen_score += 2
+        # 5) ATR/price 在 1.5-4% → 1 分
+        atr_pct = atr_v / cur_close * 100 if cur_close > 0 else 0
+        if atr_pct_min <= atr_pct <= atr_pct_max:
+            screen_score += 1
+
+        if screen_score < screen_min:
+            dbg["low_screen_score"] += 1
+            continue
 
         # ADX 過濾
         if adx_v <= adx_min:
@@ -3293,6 +3337,7 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
         print(f"\n  ── GRANVILLE 診斷 ──")
         print(f"  總掃描：{scanned}（cooldown={dbg['cooldown']}, paused={dbg['paused']}）")
         print(f"  ├─ 指標未備                ：{dbg['no_indicators']}")
+        print(f"  ├─ Screener score < {screen_min}    ：{dbg['low_screen_score']}")
         print(f"  ├─ ADX ≤ {adx_min}               ：{dbg['low_adx']}")
         print(f"  ├─ 量能不足               ：{dbg['no_volume']}")
         print(f"  ├─ 多空都未突破            ：{dbg['no_break_long'] + dbg['no_break_short']}")
