@@ -28,8 +28,8 @@ granville.py — 葛蘭碧 Granville 策略（精簡 4 法則：1, 2, 5, 6）
   max_hold_bars = 30 根 4H（5 天）強制平倉
 
 風控：
-  單筆倉位 = 帳戶 5%（< 1000 USDT 不要 3% 太小）
-  同時最多 2 倉
+  倉位數受全局 MAX_POSITIONS 約束（不另設 per-strategy 上限）
+  倉位大小由 RiskManager.calc_position 算（MARGIN_USDT × leverage）
   連續虧 3 筆暫停 12 小時
 """
 import logging
@@ -143,19 +143,6 @@ class GranvilleStrategy(BaseStrategy):
             )
             return True
         return False
-
-    # ── 倉位上限檢查 ─────────────────────────────────────────
-    def _can_open_more(self) -> bool:
-        from config import Config
-        if self._db is None:
-            return True
-        try:
-            n = self._db.count_positions_by_strategy(self.name)
-            cap = int(Config.GRANVILLE_MAX_POSITIONS)
-            return n < cap
-        except Exception as e:
-            log.debug(f"Granville 查持倉數失敗: {e}")
-            return True
 
     # ── 出場價計算 ───────────────────────────────────────────
     def calculate_exit_levels(self, entry_price: float, atr: float,
@@ -499,10 +486,7 @@ class GranvilleStrategy(BaseStrategy):
             # 已持倉時不檢查反向主訊號（避免亂開單）
             return None
 
-        # 2. 主訊號（無持倉）— 倉位上限檢查
-        if not self._can_open_more():
-            return None
-
+        # 2. 主訊號（無持倉）— 倉位上限交由全局 MAX_POSITIONS 約束，不再 per-strategy
         sig = self.check_rule_1(prepped, symbol=symbol)
         if sig:
             return sig

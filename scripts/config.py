@@ -380,9 +380,6 @@ class Config:
     GRANVILLE_TP2_ATR_MULT           = float(os.getenv("GRANVILLE_TP2_ATR_MULT", 4.0))
     GRANVILLE_TRAILING_AFTER_TP1     = os.getenv("GRANVILLE_TRAILING_AFTER_TP1", "true").lower() == "true"
     GRANVILLE_MAX_HOLD_BARS          = int(os.getenv("GRANVILLE_MAX_HOLD_BARS", 30))   # 4H × 30 = 5 天
-    # 倉位 / 資金
-    GRANVILLE_MAX_POSITIONS          = int(os.getenv("GRANVILLE_MAX_POSITIONS", 2))   # 同時最多 2 倉
-    GRANVILLE_POSITION_PCT           = float(os.getenv("GRANVILLE_POSITION_PCT", 0.05))   # 單筆 = 帳戶 5%
     # 連虧暫停
     GRANVILLE_CONSEC_LOSS_LIMIT      = int(os.getenv("GRANVILLE_CONSEC_LOSS_LIMIT", 3))
     GRANVILLE_PAUSE_HOURS            = float(os.getenv("GRANVILLE_PAUSE_HOURS", 12.0))

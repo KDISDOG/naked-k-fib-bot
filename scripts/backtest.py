@@ -3282,7 +3282,7 @@ def run_backtest_granville(client: Client, symbol: str, months: int,
         score += 1   # 主訊號 bonus
         score = min(score, 5)
 
-        # 倉位 50/50（與 v2 / MASR 等保持一致；GRANVILLE_POSITION_PCT 在 live 才用）
+        # 倉位 50/50（與 v2 / MASR 等保持一致，回測用 MARGIN_USDT × leverage）
         qty_total = MARGIN_USDT * LEVERAGE / entry
         qty_tp1 = round(qty_total * 0.5, 6)
         qty_tp2 = round(qty_total - qty_tp1, 6)
