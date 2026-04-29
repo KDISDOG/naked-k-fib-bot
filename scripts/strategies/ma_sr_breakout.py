@@ -66,8 +66,10 @@ class MaSrBreakoutStrategy(BaseStrategy):
         if self._market_ctx is not None and hasattr(
                 self._market_ctx, "get_klines"):
             return self._market_ctx.get_klines(symbol, interval, limit)
-        raw = self._client.futures_klines(
-            symbol=symbol, interval=interval, limit=limit
+        from api_retry import weight_aware_call, klines_weight
+        raw = weight_aware_call(
+            self._client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
         )
         df = pd.DataFrame(raw, columns=[
             "time", "open", "high", "low", "close", "volume",
@@ -87,7 +89,8 @@ class MaSrBreakoutStrategy(BaseStrategy):
         # 嘗試從 client 取得交易對 onboardDate（過濾上市時間）
         onboard_map: dict[str, int] = {}
         try:
-            info = self._client.futures_exchange_info()
+            from api_retry import get_exchange_info_cached
+            info = get_exchange_info_cached(self._client)
             for s in info.get("symbols", []):
                 onboard_map[s["symbol"]] = int(s.get("onboardDate", 0))
         except Exception as e:

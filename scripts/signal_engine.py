@@ -86,8 +86,10 @@ class SignalEngine:
 
     def _get_klines(self, symbol: str, interval: str,
                     limit=200) -> pd.DataFrame:
-        raw = self.client.futures_klines(
-            symbol=symbol, interval=interval, limit=limit
+        from api_retry import weight_aware_call, klines_weight
+        raw = weight_aware_call(
+            self.client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
         )
         df = pd.DataFrame(raw, columns=[
             "time", "open", "high", "low", "close", "volume",

@@ -37,7 +37,8 @@ class OrderExecutor:
             return self._symbol_info_cache[symbol]
 
         try:
-            info = retry_api(self.client.futures_exchange_info)
+            from api_retry import get_exchange_info_cached
+            info = get_exchange_info_cached(self.client)
             for s in info["symbols"]:
                 if s["symbol"] == symbol:
                     # 找數量精度和價格精度

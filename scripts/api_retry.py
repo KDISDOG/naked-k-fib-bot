@@ -10,16 +10,170 @@ API retry wrapper — 為所有幣安 API 呼叫加上指數退避重試
   寫入類操作（futures_create_order / futures_cancel_order）禁止用 retry_api，
   因為網路超時時訂單可能已送達幣安，盲目重試會下重複單。請用：
     - create_order_safe()：附 clientOrderId，重試前先確認訂單存在與否
+
+# WeightLimiter（process 全域）
+  幣安 futures REST 上限 2400 weight/分鐘 / IP（不分 process）。
+  回測 + live bot 同 IP 共享 quota，回測 burst 會把 live bot 一起 ban。
+  WeightLimiter 用 deque 追蹤近 60 秒累積 weight，達上限 sleep 到視窗滑開。
+
+  使用：
+    from api_retry import limiter, weight_aware_call
+    limiter.acquire(10)               # 顯式扣 weight
+    raw = weight_aware_call(client.futures_klines, weight=10,
+                            symbol="BTCUSDT", interval="1h", limit=1500)
+    # weight_aware_call 會在打 API 前 acquire、回應後讀 X-MBX-USED-WEIGHT-1M
+    # 自動回校真實 used；超 2000 自動退讓 30 秒。
 """
 import time
 import uuid
 import logging
+import threading
+from collections import deque
 
 log = logging.getLogger("api_retry")
 
 # 預設重試 3 次，退避 1s → 2s → 4s
 _MAX_RETRIES = 3
 _BASE_DELAY = 1.0
+
+
+# ── Weight Limiter（thread-safe，process 全域單例）─────────────
+class WeightLimiter:
+    """
+    滑動視窗 rate limiter — 60 秒內累積 weight 不超過 max_weight。
+
+    Binance futures REST 限制 2400 weight/分（IP）；預設 1800 留 25% 緩衝給
+    burst error 重試與其他工具（dashboard / scan_coins / live signal check 等
+    都共用這個 limiter，不會互相吃量）。
+    """
+
+    def __init__(self, max_weight: int = 1800, window: float = 60.0):
+        self.max = int(max_weight)
+        self.window = float(window)
+        self._log: deque = deque()  # (ts, weight)
+        self._lock = threading.Lock()
+        # 真實 used 由 X-MBX-USED-WEIGHT-1M header 回校（雙保險）
+        self._real_used: int = 0
+        self._real_used_ts: float = 0.0
+
+    def acquire(self, weight: int) -> None:
+        """阻塞至少夠送 weight 個 unit 進視窗為止。"""
+        while True:
+            with self._lock:
+                now = time.time()
+                # 清掉視窗外
+                while self._log and self._log[0][0] < now - self.window:
+                    self._log.popleft()
+                current = sum(w for _, w in self._log)
+                # 真實 used header 校正：以兩者較大為準
+                effective = max(current, self._real_used)
+                if effective + weight <= self.max:
+                    self._log.append((now, weight))
+                    return
+                # 視窗滿：算還要等多久
+                if self._log:
+                    sleep_for = self.window - (now - self._log[0][0]) + 0.5
+                else:
+                    sleep_for = 1.0
+                sleep_for = max(sleep_for, 0.5)
+            log.info(
+                f"WeightLimiter 滿載（內部累積 {current} + 真實 used {self._real_used} "
+                f"+ 本次 {weight} > {self.max}），sleep {sleep_for:.1f}s"
+            )
+            time.sleep(sleep_for)
+
+    def report_header(self, used_weight_1m: int) -> None:
+        """API 回應後從 X-MBX-USED-WEIGHT-1M 回校真實 used。"""
+        with self._lock:
+            self._real_used = int(used_weight_1m)
+            self._real_used_ts = time.time()
+
+    def used(self) -> tuple[int, int]:
+        """回傳 (內部追蹤 weight, 真實 X-MBX-USED-WEIGHT-1M)"""
+        with self._lock:
+            now = time.time()
+            while self._log and self._log[0][0] < now - self.window:
+                self._log.popleft()
+            internal = sum(w for _, w in self._log)
+            # 真實 used 過 70 秒視為失效
+            real = self._real_used if (now - self._real_used_ts) < 70 else 0
+            return internal, real
+
+
+# Process 全域單例（live bot + backtest + scan_coins 共用）
+limiter = WeightLimiter(max_weight=1800, window=60.0)
+
+
+# ── 包裝：自動 acquire + 讀 header 回校 ─────────────────────────
+def weight_aware_call(client_method, *args, weight: int = 1,
+                       used_header_threshold: int = 2000,
+                       throttle_sleep: float = 30.0, **kwargs):
+    """
+    打 client_method(*args, **kwargs) 之前 acquire(weight)。
+    打完後讀 client_method.__self__.response.headers['X-MBX-USED-WEIGHT-1M']
+    若 > used_header_threshold 主動 sleep throttle_sleep 秒退讓，
+    並把 limiter._real_used 校到該值。
+
+    若 client 沒掛 .response（例如 binance-futures-connector）安靜略過 header。
+    """
+    limiter.acquire(weight)
+    result = client_method(*args, **kwargs)
+
+    try:
+        # python-binance：client.response 是 requests.Response
+        client_obj = getattr(client_method, "__self__", None)
+        resp = getattr(client_obj, "response", None) if client_obj else None
+        if resp is not None and getattr(resp, "headers", None):
+            used = int(resp.headers.get("X-MBX-USED-WEIGHT-1M", 0))
+            if used > 0:
+                limiter.report_header(used)
+                if used > used_header_threshold:
+                    log.warning(
+                        f"X-MBX-USED-WEIGHT-1M={used} > {used_header_threshold}，"
+                        f"主動 sleep {throttle_sleep}s 退讓"
+                    )
+                    time.sleep(throttle_sleep)
+    except Exception as e:
+        log.debug(f"讀 X-MBX-USED-WEIGHT 失敗（忽略）: {e}")
+
+    return result
+
+
+def klines_weight(limit: int) -> int:
+    """
+    futures_klines 的 weight 規則（依 Binance docs）：
+      limit ≤ 100  : 1
+      limit ≤ 500  : 2
+      limit ≤ 1000 : 5
+      limit ≤ 1500 : 10
+    """
+    if limit <= 100:
+        return 1
+    if limit <= 500:
+        return 2
+    if limit <= 1000:
+        return 5
+    return 10
+
+
+# ── exchange_info 1 小時 cache（symbol list 又不會 15 分鐘變）─────
+_EXCHANGE_INFO_CACHE: dict = {"data": None, "ts": 0.0}
+_EXCHANGE_INFO_TTL_SEC = 3600
+
+
+def get_exchange_info_cached(client, ttl: int = _EXCHANGE_INFO_TTL_SEC) -> dict:
+    """
+    取得 futures_exchange_info 並 cache 1 小時。
+    全 process 共用（live bot 各模組 + scan_coins + 多策略都打同一份）。
+    """
+    now = time.time()
+    if (_EXCHANGE_INFO_CACHE["data"] is not None
+            and now - _EXCHANGE_INFO_CACHE["ts"] < ttl):
+        return _EXCHANGE_INFO_CACHE["data"]
+    info = weight_aware_call(client.futures_exchange_info, weight=1)
+    _EXCHANGE_INFO_CACHE["data"] = info
+    _EXCHANGE_INFO_CACHE["ts"] = now
+    return info
 
 
 def retry_api(func, *args, max_retries: int = _MAX_RETRIES,

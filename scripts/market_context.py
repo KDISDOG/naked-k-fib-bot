@@ -16,6 +16,8 @@ import numpy as np
 import urllib.request
 import json
 
+from api_retry import weight_aware_call, klines_weight
+
 log = logging.getLogger("market_ctx")
 
 _TTL_SEC = 3600  # 1 小時快取（長期：BTC dom / weekly / correlation / OI）
@@ -59,8 +61,9 @@ class MarketContext:
             # 回傳 copy，避免呼叫方修改 cached DataFrame
             return entry["df"].copy()
 
-        raw = self.client.futures_klines(
-            symbol=symbol, interval=interval, limit=limit
+        raw = weight_aware_call(
+            self.client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
         )
         df = pd.DataFrame(raw, columns=[
             "time", "open", "high", "low", "close", "volume",
@@ -114,8 +117,9 @@ class MarketContext:
         if cached is not None:
             return cached
         try:
-            raw = self.client.futures_klines(
-                symbol="BTCUSDT", interval="1w", limit=30
+            raw = weight_aware_call(
+                self.client.futures_klines, weight=klines_weight(30),
+                symbol="BTCUSDT", interval="1w", limit=30,
             )
             closes = [float(k[4]) for k in raw]
             if len(closes) < 20:
@@ -149,11 +153,13 @@ class MarketContext:
             self._set_cached(key, 1.0)
             return 1.0
         try:
-            btc_raw = self.client.futures_klines(
-                symbol="BTCUSDT", interval=interval, limit=window + 1
+            btc_raw = weight_aware_call(
+                self.client.futures_klines, weight=klines_weight(window + 1),
+                symbol="BTCUSDT", interval=interval, limit=window + 1,
             )
-            sym_raw = self.client.futures_klines(
-                symbol=symbol, interval=interval, limit=window + 1
+            sym_raw = weight_aware_call(
+                self.client.futures_klines, weight=klines_weight(window + 1),
+                symbol=symbol, interval=interval, limit=window + 1,
             )
             btc_close = np.array([float(k[4]) for k in btc_raw])
             sym_close = np.array([float(k[4]) for k in sym_raw])
@@ -194,8 +200,9 @@ class MarketContext:
             return cached
         try:
             # 4h ADX
-            raw4h = self.client.futures_klines(
-                symbol="BTCUSDT", interval="4h", limit=60
+            raw4h = weight_aware_call(
+                self.client.futures_klines, weight=klines_weight(60),
+                symbol="BTCUSDT", interval="4h", limit=60,
             )
             if len(raw4h) < 30:
                 return "CHOPPY"
@@ -211,8 +218,9 @@ class MarketContext:
             adx_val = float(adx_df["ADX_14"].iloc[-1]) if adx_df is not None else 0.0
 
             # 日線 MA50
-            rawD = self.client.futures_klines(
-                symbol="BTCUSDT", interval="1d", limit=60
+            rawD = weight_aware_call(
+                self.client.futures_klines, weight=klines_weight(60),
+                symbol="BTCUSDT", interval="1d", limit=60,
             )
             if len(rawD) < 50:
                 return "CHOPPY"
@@ -274,7 +282,10 @@ class MarketContext:
         if cached is not None:
             return cached
         try:
-            t = self.client.futures_ticker(symbol=symbol)
+            # futures_ticker（單 symbol） weight = 2
+            t = weight_aware_call(
+                self.client.futures_ticker, weight=2, symbol=symbol,
+            )
             # futures_ticker 可能回傳 list 或 dict，統一處理
             if isinstance(t, list):
                 t = t[0] if t else {}
@@ -288,8 +299,9 @@ class MarketContext:
 
         # fallback：用 1h×25 klines 算
         try:
-            raw = self.client.futures_klines(
-                symbol=symbol, interval="1h", limit=25
+            raw = weight_aware_call(
+                self.client.futures_klines, weight=klines_weight(25),
+                symbol=symbol, interval="1h", limit=25,
             )
             if not raw or len(raw) < 24:
                 return None
@@ -320,9 +332,10 @@ class MarketContext:
         if cached is not None:
             return cached
         try:
-            # openInterestHist 需要 period 參數
-            hist = self.client.futures_open_interest_hist(
-                symbol=symbol, period="5m", limit=288
+            # openInterestHist 需要 period 參數（weight = 1，與一般 GET 同級）
+            hist = weight_aware_call(
+                self.client.futures_open_interest_hist, weight=1,
+                symbol=symbol, period="5m", limit=288,
             )
             if not hist or len(hist) < 10:
                 return None

@@ -258,7 +258,8 @@ def scan_coins():
     # 先取得全市場 USDT 合約列表（所有策略共用）
     # 統一過濾：黑名單 + 30 天新幣（新幣流動性差、MM 操縱風險高）
     try:
-        info = client.futures_exchange_info()
+        from api_retry import get_exchange_info_cached
+        info = get_exchange_info_cached(client)
         now_ms = int(time.time() * 1000)
         new_coin_days = int(getattr(Config, "NEW_COIN_MIN_DAYS", 60))
         new_coin_ms = new_coin_days * 24 * 60 * 60 * 1000

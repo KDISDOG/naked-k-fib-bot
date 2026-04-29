@@ -55,9 +55,10 @@ class CoinScreener:
         # 優先走 MarketContext 共用 cache
         if self.market_ctx is not None and hasattr(self.market_ctx, "get_klines"):
             return self.market_ctx.get_klines(symbol, interval, limit)
-        raw = retry_api(
-            self.client.futures_klines,
-            symbol=symbol, interval=interval, limit=limit
+        from api_retry import weight_aware_call, klines_weight
+        raw = weight_aware_call(
+            self.client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
         )
         df = pd.DataFrame(raw, columns=[
             "time", "open", "high", "low", "close", "volume",
@@ -468,7 +469,8 @@ class CoinScreener:
         else:
             # 全市場掃描：保留原有黑名單 + 30 天新幣過濾
             log.info("開始全市場掃描（裸K+Fib 專用選幣）...")
-            info = retry_api(self.client.futures_exchange_info)
+            from api_retry import get_exchange_info_cached
+            info = get_exchange_info_cached(self.client)
             base_symbols = [
                 s["symbol"] for s in info["symbols"]
                 if s["quoteAsset"] == "USDT"

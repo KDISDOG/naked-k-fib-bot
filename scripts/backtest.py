@@ -33,6 +33,7 @@ from signal_engine import (
     FIB_LONG_MAP, FIB_SHORT_MAP, _normalize_fib_key
 )
 from config import Config
+from api_retry import weight_aware_call, klines_weight, limiter
 
 load_dotenv()
 
@@ -324,17 +325,19 @@ def fetch_klines(client: Client, symbol: str, interval: str,
               f"{len(disk_df)} 根 (disk cached)")
         return disk_df.copy()
 
-    # Tier 3：API
+    # Tier 3：API（透過 weight_aware_call 計重 + 讀 header 自動退讓）
     start = datetime.now(timezone.utc) - timedelta(days=30 * months)
     start_ms = int(start.timestamp() * 1000)
     all_klines = []
     limit = 1500
+    w_per_call = klines_weight(limit)
 
     print(f"  下載 {symbol} {interval} {months}個月歷史資料...", end="", flush=True)
     while True:
-        raw = client.futures_klines(
+        raw = weight_aware_call(
+            client.futures_klines, weight=w_per_call,
             symbol=symbol, interval=interval,
-            startTime=start_ms, limit=limit
+            startTime=start_ms, limit=limit,
         )
         if not raw:
             break

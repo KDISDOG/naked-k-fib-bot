@@ -61,8 +61,10 @@ class MomentumLongStrategy(BaseStrategy):
                     limit: int = 200) -> pd.DataFrame:
         if self._market_ctx is not None and hasattr(self._market_ctx, "get_klines"):
             return self._market_ctx.get_klines(symbol, interval, limit)
-        raw = self._client.futures_klines(
-            symbol=symbol, interval=interval, limit=limit
+        from api_retry import weight_aware_call, klines_weight
+        raw = weight_aware_call(
+            self._client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
         )
         df = pd.DataFrame(raw, columns=[
             "time", "open", "high", "low", "close", "volume",

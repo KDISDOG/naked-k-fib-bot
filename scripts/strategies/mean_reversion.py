@@ -54,8 +54,10 @@ class MeanReversionStrategy(BaseStrategy):
         # 優先走 MarketContext 共用 cache，避免跨策略/跨呼叫重複抓
         if self._market_ctx is not None and hasattr(self._market_ctx, "get_klines"):
             return self._market_ctx.get_klines(symbol, interval, limit)
-        raw = self._client.futures_klines(
-            symbol=symbol, interval=interval, limit=limit
+        from api_retry import weight_aware_call, klines_weight
+        raw = weight_aware_call(
+            self._client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
         )
         df = pd.DataFrame(raw, columns=[
             "time", "open", "high", "low", "close", "volume",
