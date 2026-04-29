@@ -465,7 +465,7 @@
 
     <!-- 策略分項統計 -->
     <div class="strategy-grid">
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="naked_k_fib">
         <h4><span class="strategy-badge strategy-nkf">NKF</span>&nbsp; 裸K + Fib 統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="nkf-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="nkf-win-rate">—</span></div>
@@ -476,7 +476,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="nkf-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="mean_reversion">
         <h4><span class="strategy-badge strategy-mr">MR</span>&nbsp; 均值回歸統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="mr-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="mr-win-rate">—</span></div>
@@ -487,7 +487,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="mr-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="breakdown_short">
         <h4><span class="strategy-badge strategy-bd">BD</span>&nbsp; Breakdown Short 統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="bd-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="bd-win-rate">—</span></div>
@@ -498,7 +498,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="bd-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="momentum_long">
         <h4><span class="strategy-badge strategy-ml">ML</span>&nbsp; Momentum Long 統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="ml-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="ml-win-rate">—</span></div>
@@ -509,7 +509,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="ml-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="smc_sweep">
         <h4><span class="strategy-badge strategy-smc">SMC</span>&nbsp; Liquidity Sweep 統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="smc-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="smc-win-rate">—</span></div>
@@ -520,7 +520,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="smc-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="ma_sr_breakout">
         <h4><span class="strategy-badge strategy-masr">MASR</span>&nbsp; MA + S/R Breakout (LONG) 統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="masr-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="masr-win-rate">—</span></div>
@@ -531,7 +531,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="masr-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="ma_sr_short">
         <h4><span class="strategy-badge strategy-masrs">MASRS</span>&nbsp; MA + S/R Breakdown SHORT 統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="masrs-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="masrs-win-rate">—</span></div>
@@ -542,7 +542,7 @@
             class="stat-val">—</span></div>
         <div class="stat-row"><span class="stat-label">平均每筆</span><span id="masrs-avg-pnl" class="stat-val">—</span></div>
       </div>
-      <div class="strategy-card">
+      <div class="strategy-card" data-strategy="granville">
         <h4><span class="strategy-badge strategy-grv">GRV</span>&nbsp; Granville 葛蘭碧 4 法則統計</h4>
         <div class="stat-row"><span class="stat-label">交易數</span><span class="stat-val" id="grv-total">—</span></div>
         <div class="stat-row"><span class="stat-label">勝率</span><span class="stat-val" id="grv-win-rate">—</span></div>
@@ -880,8 +880,23 @@
     }
 
     // ── 策略統計 ─────────────────────────────────────────────
+    // ── 策略卡顯示過濾：只顯示 ACTIVE_STRATEGY 內的策略 ─────
+    async function applyActiveStrategyFilter() {
+      try {
+        const r = await fetch('/api/active_strategy').then(r => r.json());
+        const active = (r.active_strategy || 'all').toLowerCase().trim();
+        const showAll = active === 'all' || active === '';
+        const activeSet = showAll ? null : new Set(active.split(',').map(s => s.trim()));
+        document.querySelectorAll('.strategy-card[data-strategy]').forEach(card => {
+          const name = card.getAttribute('data-strategy');
+          card.style.display = (showAll || activeSet.has(name)) ? '' : 'none';
+        });
+      } catch (e) { /* fail-soft */ }
+    }
+
     async function refreshStrategyStats() {
       try {
+        applyActiveStrategyFilter();
         const [data, balData] = await Promise.all([
           fetch('/api/stats/all_strategies').then(r => r.json()),
           fetch('/api/balance').then(r => r.json()),
