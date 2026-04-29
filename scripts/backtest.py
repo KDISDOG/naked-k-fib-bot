@@ -261,10 +261,23 @@ def _regime_allows(regime: str, strategy: str) -> bool:
     return False
 
 
-# ── K 線下載（幣安期貨）──────────────────────────────────────────
+# ── K 線下載（幣安期貨）+ in-process cache ──────────────────────
+# 多幣回測時 BTC 大盤資料會被重複抓 30+ 次 → 觸發 rate limit。
+# 用 (symbol, interval, months) 為 key cache 在記憶體；單次回測不會跑超過幾分鐘，
+# 資料新鮮度足夠。回傳 .copy() 避免 caller 改到 cache。
+_KLINE_CACHE: dict[tuple, pd.DataFrame] = {}
+
+
 def fetch_klines(client: Client, symbol: str, interval: str,
                  months: int) -> pd.DataFrame:
-    """下載最近 N 個月的期貨 K 線"""
+    """下載最近 N 個月的期貨 K 線（同一回測 session 內 cached）"""
+    cache_key = (symbol, interval, months)
+    if cache_key in _KLINE_CACHE:
+        cached = _KLINE_CACHE[cache_key]
+        print(f"  下載 {symbol} {interval} {months}個月歷史資料... "
+              f"{len(cached)} 根 (cached)")
+        return cached.copy()
+
     start = datetime.now(timezone.utc) - timedelta(days=30 * months)
     start_ms = int(start.timestamp() * 1000)
     all_klines = []
@@ -293,7 +306,9 @@ def fetch_klines(client: Client, symbol: str, interval: str,
     for col in ["open", "high", "low", "close", "volume", "qav"]:
         df[col] = df[col].astype(float)
     df["time"] = pd.to_datetime(df["time"], unit="ms")
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    _KLINE_CACHE[cache_key] = df
+    return df.copy()
 
 
 # ── 複用 SignalEngine 的核心方法（不需真實 client）───────────────
