@@ -2346,15 +2346,17 @@ def _bt_masr_short_find_support(lows_arr, end_idx: int, atr: float,
 
 def _align_higher_to_lower(df_lower: pd.DataFrame,
                            df_higher: pd.DataFrame,
-                           series: pd.Series) -> np.ndarray:
+                           series) -> np.ndarray:
     """
     將 higher-tf 的指標 series 對齊到 lower-tf 的 row index 上：
     對每根 lower 的時間 t，回傳最近已收盤的 higher bar 對應 series 值。
     用 searchsorted 找 higher.time ≤ t 的最後一根。
+    series 為 None（pandas_ta 在資料不足時會回 None）→ 回傳全 NaN。
     """
-    higher_times = df_higher["time"].values
     lower_times = df_lower["time"].values
-    # 找每個 lower_t 在 higher 中的插入點（right=False 表示插入位置使其保持有序）
+    if series is None:
+        return np.full(len(lower_times), np.nan, dtype=float)
+    higher_times = df_higher["time"].values
     idx = np.searchsorted(higher_times, lower_times, side="right") - 1
     out = np.full(len(lower_times), np.nan, dtype=float)
     valid = idx >= 0
@@ -2395,9 +2397,10 @@ def run_backtest_masr_short(client: Client, symbol: str, months: int,
         return []
 
     # SYMBOL 1D（給 EMA50/200 結構、7d、30d high、24h % 用）
+    # 需 ≥ 200 根 1D 才能算 EMA200（不夠的幣種策略本來就不該開）
     df_1d = fetch_klines(client, symbol, "1d", months + 1)
-    if len(df_1d) < 30:
-        print(f"  1D 資料不足，跳過")
+    if len(df_1d) < 200:
+        print(f"  1D 資料不足（{len(df_1d)} < 200，無法算 EMA200），跳過")
         return []
 
     # BTC 4H + 1D（regime gate）
