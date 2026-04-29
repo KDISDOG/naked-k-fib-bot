@@ -277,6 +277,7 @@ async def api_all_strategy_stats():
         "smc_sweep":       db.get_stats_by_strategy("smc_sweep"),
         "ma_sr_breakout":  db.get_stats_by_strategy("ma_sr_breakout"),
         "ma_sr_short":     db.get_stats_by_strategy("ma_sr_short"),
+        "granville":       db.get_stats_by_strategy("granville"),
         "combined":        db.get_stats(),
     }
 
@@ -290,7 +291,7 @@ async def switch_strategy(strategy: str = Form(...)):
     """
     valid = {"naked_k_fib", "mean_reversion", "breakdown_short",
              "momentum_long", "smc_sweep", "ma_sr_breakout",
-             "ma_sr_short", "all"}
+             "ma_sr_short", "granville", "all"}
     if strategy not in valid:
         return JSONResponse(
             {"status": "error", "message": f"無效策略：{strategy}"},

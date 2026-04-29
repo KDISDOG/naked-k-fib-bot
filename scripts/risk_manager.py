@@ -96,6 +96,69 @@ class RiskManager:
             return False
         return True
 
+    # ── Layer 2：方向中性護欄（多空名目 3:1 不能再開同向）─────
+    def check_directional_balance(self, direction: str) -> bool:
+        """
+        檢查現有未平倉的多/空名目（USDT）比例。
+        若擬開方向會讓比例超過 DIRECTIONAL_BALANCE_RATIO_MAX（預設 3:1），
+        拒絕開倉。讓帳戶在 strategy-mix 下保持自動 beta 中性。
+
+        例：總多 600U / 總空 100U = 6:1，再開多會更失衡 → 拒絕；
+            開空會收斂 → 允許。
+        """
+        try:
+            longs = self.db.get_open_trades_by_direction("LONG")
+            shorts = self.db.get_open_trades_by_direction("SHORT")
+        except Exception as e:
+            log.warning(f"查多空倉位失敗（放行）: {e}")
+            return True
+
+        notional_long = sum(
+            float(t.get("entry", 0)) * float(t.get("qty", 0)) for t in longs
+        )
+        notional_short = sum(
+            float(t.get("entry", 0)) * float(t.get("qty", 0)) for t in shorts
+        )
+
+        ratio_max = float(getattr(Config, "DIRECTIONAL_BALANCE_RATIO_MAX", 3.0))
+
+        # 雙邊都很小（< 50 USDT）無實質風險，放行
+        if notional_long < 50 and notional_short < 50:
+            return True
+
+        if direction == "LONG":
+            # 開多會讓 long 變更多；只有當 short==0 或 long/short 已超 ratio 才擋
+            if notional_short == 0 and notional_long > 0:
+                log.warning(
+                    f"[directional-balance] 已有 {notional_long:.0f}U 多單但 0U 空單，"
+                    f"再開多會單向過度集中（拒絕）"
+                )
+                return False
+            if (notional_short > 0
+                    and notional_long / notional_short >= ratio_max):
+                log.warning(
+                    f"[directional-balance] long/short = "
+                    f"{notional_long:.0f}/{notional_short:.0f} = "
+                    f"{notional_long/notional_short:.2f} ≥ {ratio_max}，拒絕再開多"
+                )
+                return False
+        else:   # SHORT
+            if notional_long == 0 and notional_short > 0:
+                log.warning(
+                    f"[directional-balance] 已有 {notional_short:.0f}U 空單但 0U 多單，"
+                    f"再開空會單向過度集中（拒絕）"
+                )
+                return False
+            if (notional_long > 0
+                    and notional_short / notional_long >= ratio_max):
+                log.warning(
+                    f"[directional-balance] short/long = "
+                    f"{notional_short:.0f}/{notional_long:.0f} = "
+                    f"{notional_short/notional_long:.2f} ≥ {ratio_max}，拒絕再開空"
+                )
+                return False
+        return True
+
     # ── 餘額查詢 ─────────────────────────────────────────────────
 
     def _get_available_balance(self) -> float:

@@ -597,6 +597,31 @@ class StateManager:
             )
             return [float(r[0]) for r in rows if r[0] is not None]
 
+    def get_strategy_recent_outcomes(
+        self,
+        strategy: str,
+        limit: int = 5,
+    ) -> list[tuple[float, "datetime"]]:
+        """
+        查詢特定 strategy 近 limit 筆已平倉交易的 (net_pnl, closed_at)。
+        最新先回傳。Granville 等需要連虧暫停的策略使用。
+        """
+        with self.Session() as session:
+            rows = (
+                session.query(Trade.net_pnl, Trade.closed_at)
+                .filter(
+                    Trade.strategy == strategy,
+                    Trade.status == "closed",
+                )
+                .order_by(Trade.closed_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [
+                (float(r[0]) if r[0] is not None else 0.0, r[1])
+                for r in rows
+            ]
+
     def increment_timeout_bars(self, trade_id: int) -> int:
         """持倉 K 棒數 +1，回傳新的 timeout_bars 值（均值回歸超時用）"""
         with self.Session() as session:

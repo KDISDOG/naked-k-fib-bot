@@ -358,6 +358,49 @@ class Config:
     MASR_SHORT_V2_MAX_DIST_FROM_EMA200 = float(os.getenv("MASR_SHORT_V2_MAX_DIST_FROM_EMA200", 0.12))
     MASR_SHORT_V2_SLOW_OFFSET_ATR     = float(os.getenv("MASR_SHORT_V2_SLOW_OFFSET_ATR", 0.2))  # slow variant: i+1 close < S - 0.2×ATR
 
+    # ── Granville 葛蘭碧策略（精簡 4 法則：1, 2, 5, 6）──────────
+    # 規格：4H + EMA60 + ATR-based exits + 嚴格進場條件
+    # 目標：< 1000 USDT 帳戶趨勢跟隨備案
+    GRANVILLE_TIMEFRAME              = os.getenv("GRANVILLE_TIMEFRAME", "4h")
+    GRANVILLE_EMA_PERIOD             = int(os.getenv("GRANVILLE_EMA_PERIOD", 60))   # 主均線
+    GRANVILLE_EMA_SHORT              = int(os.getenv("GRANVILLE_EMA_SHORT", 20))    # 斜率均線
+    GRANVILLE_ATR_PERIOD             = int(os.getenv("GRANVILLE_ATR_PERIOD", 14))
+    GRANVILLE_ADX_PERIOD             = int(os.getenv("GRANVILLE_ADX_PERIOD", 14))
+    # 進場
+    GRANVILLE_BREAKOUT_ATR_MULT      = float(os.getenv("GRANVILLE_BREAKOUT_ATR_MULT", 0.3))   # 突破幅度 > 0.3×ATR
+    GRANVILLE_ADX_MIN                = float(os.getenv("GRANVILLE_ADX_MIN", 20.0))
+    GRANVILLE_VOL_MIN_MULT           = float(os.getenv("GRANVILLE_VOL_MIN_MULT", 1.0))   # 量 > 20 根均量
+    GRANVILLE_SLOPE_LOOKBACK         = int(os.getenv("GRANVILLE_SLOPE_LOOKBACK", 5))  # EMA60 過去 N 根斜率檢查
+    # 加碼（法則 2/6）
+    GRANVILLE_RETRACE_ATR_MULT       = float(os.getenv("GRANVILLE_RETRACE_ATR_MULT", 0.5))   # 回測在 EMA ± 0.5×ATR
+    GRANVILLE_ADD_SIZE_MULT          = float(os.getenv("GRANVILLE_ADD_SIZE_MULT", 0.5))   # 加碼倉位 = 原 50%
+    # 出場（ATR-based）
+    GRANVILLE_SL_ATR_MULT            = float(os.getenv("GRANVILLE_SL_ATR_MULT", 1.5))
+    GRANVILLE_TP1_ATR_MULT           = float(os.getenv("GRANVILLE_TP1_ATR_MULT", 2.0))
+    GRANVILLE_TP2_ATR_MULT           = float(os.getenv("GRANVILLE_TP2_ATR_MULT", 4.0))
+    GRANVILLE_TRAILING_AFTER_TP1     = os.getenv("GRANVILLE_TRAILING_AFTER_TP1", "true").lower() == "true"
+    GRANVILLE_MAX_HOLD_BARS          = int(os.getenv("GRANVILLE_MAX_HOLD_BARS", 30))   # 4H × 30 = 5 天
+    # 倉位 / 資金
+    GRANVILLE_MAX_POSITIONS          = int(os.getenv("GRANVILLE_MAX_POSITIONS", 2))   # 同時最多 2 倉
+    GRANVILLE_POSITION_PCT           = float(os.getenv("GRANVILLE_POSITION_PCT", 0.05))   # 單筆 = 帳戶 5%
+    # 連虧暫停
+    GRANVILLE_CONSEC_LOSS_LIMIT      = int(os.getenv("GRANVILLE_CONSEC_LOSS_LIMIT", 3))
+    GRANVILLE_PAUSE_HOURS            = float(os.getenv("GRANVILLE_PAUSE_HOURS", 12.0))
+    # 選幣（granville 專屬，趨勢友好）
+    GRANVILLE_SCREEN_MIN_SCORE       = int(os.getenv("GRANVILLE_SCREEN_MIN_SCORE", 7))
+    GRANVILLE_SCREEN_VOL_M           = float(os.getenv("GRANVILLE_SCREEN_VOL_M", 100.0))   # 24h ≥ 100M
+    GRANVILLE_SCREEN_ATR_MIN_PCT     = float(os.getenv("GRANVILLE_SCREEN_ATR_MIN_PCT", 1.5))
+    GRANVILLE_SCREEN_ATR_MAX_PCT     = float(os.getenv("GRANVILLE_SCREEN_ATR_MAX_PCT", 4.0))
+    GRANVILLE_SCREEN_PRICE_SAME_SIDE_BARS = int(os.getenv("GRANVILLE_SCREEN_PRICE_SAME_SIDE_BARS", 5))
+    GRANVILLE_SCREEN_SLOPE_MIN_PCT   = float(os.getenv("GRANVILLE_SCREEN_SLOPE_MIN_PCT", 0.005))   # 0.5%
+    GRANVILLE_SCREEN_TOP_N           = int(os.getenv("GRANVILLE_SCREEN_TOP_N", 4))
+    # 通用
+    GRANVILLE_MIN_RR                 = float(os.getenv("GRANVILLE_MIN_RR", 1.3))   # TP1 RR=2.0/SL=1.5=1.33
+    GRANVILLE_MIN_SCORE              = int(os.getenv("GRANVILLE_MIN_SCORE", 1))   # 通過進場條件即 1，max 5
+
+    # ── Layer 2：方向中性護欄（多空美元名目 3:1 禁同向新單）──
+    DIRECTIONAL_BALANCE_RATIO_MAX    = float(os.getenv("DIRECTIONAL_BALANCE_RATIO_MAX", 3.0))
+
     # BD 相對弱勢硬門檻（v5）：個幣 24h 必須跑輸 BTC ≥ MIN_DIFF % 才能做空
     # 對應 ML 的 hard block，讓 BD 也只在「相對弱勢」幣做空（不在強勢幣逆勢）
     BD_REL_STRENGTH_ENABLED  = os.getenv("BD_REL_STRENGTH_ENABLED", "true").lower() == "true"

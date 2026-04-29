@@ -3074,6 +3074,235 @@ def run_backtest_masr_short_v2(client: Client, symbol: str, months: int,
     return trades
 
 
+# ── Granville 葛蘭碧主回測（4H + EMA60 + 4 法則）────────────
+def run_backtest_granville(client: Client, symbol: str, months: int,
+                            debug: bool = False, *,
+                            regime_series=None) -> list:
+    """
+    Granville 4 法則回測（1, 2, 5, 6）。
+    關鍵差異 vs 其他策略：
+      - 4H timeframe，需要 EMA60 + ATR(14) + ADX(14) + 20 根均量
+      - 嚴格 AND 條件，訊號頻率本來就低（~ 4 幣 / 週 2-3 訊號）
+      - max_hold_bars=30 強制平倉、TP1 後 EMA60 trailing
+      - 連虧 3 筆暫停 12h（回測模擬）
+      - ATR-based exits：SL 1.5×、TP1 2.0×、TP2 4.0×
+    regime_series 不適用（Granville 自有 ADX 過濾）。
+    """
+    tf = Config.GRANVILLE_TIMEFRAME
+    print(f"\n[{symbol} GRANVILLE {tf}] 回測開始")
+
+    df_tf = fetch_klines(client, symbol, tf, months)
+    ema_period = int(Config.GRANVILLE_EMA_PERIOD)
+    if len(df_tf) < ema_period + 30:
+        print(f"  資料不足（{len(df_tf)} 根 < {ema_period + 30}），跳過")
+        return []
+
+    print("  預計算指標...", end="", flush=True)
+    ema60_s = ta.ema(df_tf["close"], length=ema_period)
+    ema20_s = ta.ema(df_tf["close"], length=int(Config.GRANVILLE_EMA_SHORT))
+    atr_s = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"],
+                   length=int(Config.GRANVILLE_ATR_PERIOD))
+    adx_df = ta.adx(df_tf["high"], df_tf["low"], df_tf["close"],
+                     length=int(Config.GRANVILLE_ADX_PERIOD))
+    adx_s = adx_df["ADX_14"] if (adx_df is not None
+                                  and "ADX_14" in adx_df.columns) else None
+    avg_vol_s = df_tf["volume"].rolling(20).mean().shift(1)
+    print(" 完成")
+
+    warmup = max(ema_period + 10, 70)
+    trades: list[BtTrade] = []
+    cooldown_until = -1
+    timeout_bars = int(Config.GRANVILLE_MAX_HOLD_BARS)
+
+    breakout_mult = float(Config.GRANVILLE_BREAKOUT_ATR_MULT)
+    adx_min = float(Config.GRANVILLE_ADX_MIN)
+    vol_min_mult = float(Config.GRANVILLE_VOL_MIN_MULT)
+    slope_n = int(Config.GRANVILLE_SLOPE_LOOKBACK)
+    sl_mult = float(Config.GRANVILLE_SL_ATR_MULT)
+    tp1_mult = float(Config.GRANVILLE_TP1_ATR_MULT)
+    tp2_mult = float(Config.GRANVILLE_TP2_ATR_MULT)
+    consec_limit = int(Config.GRANVILLE_CONSEC_LOSS_LIMIT)
+    pause_bars = int(float(Config.GRANVILLE_PAUSE_HOURS) / 4)   # 4H × N
+
+    dbg = {
+        "cooldown": 0, "paused": 0, "no_indicators": 0,
+        "no_break_long": 0, "no_break_short": 0,
+        "no_slope": 0, "no_volume": 0, "low_adx": 0,
+        "bad_pos": 0,
+        "signals_long": 0, "signals_short": 0,
+    }
+
+    pause_until = -1   # 連虧暫停（bar index）
+    consec_losses = 0
+
+    print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
+
+    for i in range(warmup, len(df_tf) - 1):
+        if i <= cooldown_until:
+            dbg["cooldown"] += 1
+            continue
+        if i <= pause_until:
+            dbg["paused"] += 1
+            continue
+
+        # 指標可用性
+        if (ema60_s is None or atr_s is None or adx_s is None or avg_vol_s is None):
+            dbg["no_indicators"] += 1
+            continue
+        ema60_v = ema60_s.iloc[i]
+        atr_v = atr_s.iloc[i]
+        adx_v = adx_s.iloc[i]
+        avg_vol = avg_vol_s.iloc[i]
+        if any(pd.isna(x) for x in (ema60_v, atr_v, adx_v, avg_vol)):
+            dbg["no_indicators"] += 1
+            continue
+        ema60_v = float(ema60_v); atr_v = float(atr_v); adx_v = float(adx_v)
+        avg_vol = float(avg_vol)
+        if avg_vol <= 0:
+            continue
+
+        cur_close = float(df_tf["close"].iloc[i])
+        prev_close = float(df_tf["close"].iloc[i - 1])
+        cur_vol = float(df_tf["volume"].iloc[i])
+
+        # ADX 過濾
+        if adx_v <= adx_min:
+            dbg["low_adx"] += 1
+            continue
+        # 量
+        if cur_vol <= avg_vol * vol_min_mult:
+            dbg["no_volume"] += 1
+            continue
+
+        # EMA60 斜率
+        ema60_window = ema60_s.iloc[i - slope_n:i + 1]
+        slope_ok_long = (
+            len(ema60_window) >= 2
+            and float(ema60_window.iloc[-1]) >= float(ema60_window.iloc[0])
+        )
+        slope_ok_short = (
+            len(ema60_window) >= 2
+            and float(ema60_window.iloc[-1]) <= float(ema60_window.iloc[0])
+        )
+
+        side = None
+        # 法則 1
+        if (prev_close <= ema60_v
+                and (cur_close - ema60_v) > breakout_mult * atr_v
+                and slope_ok_long):
+            side = "LONG"
+        # 法則 5
+        elif (prev_close >= ema60_v
+                and (ema60_v - cur_close) > breakout_mult * atr_v
+                and slope_ok_short):
+            side = "SHORT"
+        else:
+            if (cur_close - ema60_v) > 0:
+                dbg["no_break_long"] += 1
+            else:
+                dbg["no_break_short"] += 1
+            if not (slope_ok_long or slope_ok_short):
+                dbg["no_slope"] += 1
+            continue
+
+        # SL / TP
+        sl_d = sl_mult * atr_v
+        tp1_d = tp1_mult * atr_v
+        tp2_d = tp2_mult * atr_v
+        if side == "LONG":
+            entry = cur_close
+            sl = entry - sl_d
+            tp1 = entry + tp1_d
+            tp2 = entry + tp2_d
+            if sl >= entry:
+                dbg["bad_pos"] += 1
+                continue
+        else:
+            entry = cur_close
+            sl = entry + sl_d
+            tp1 = entry - tp1_d
+            tp2 = entry - tp2_d
+            if sl <= entry or tp1 <= 0:
+                dbg["bad_pos"] += 1
+                continue
+
+        # 評分（max 5）
+        score = 1
+        if adx_v > 30:
+            score += 1
+        if cur_vol >= avg_vol * 2.0:
+            score += 1
+        move = abs(cur_close - ema60_v)
+        if move >= 0.6 * atr_v:
+            score += 1
+        score += 1   # 主訊號 bonus
+        score = min(score, 5)
+
+        # 倉位 50/50（與 v2 / MASR 等保持一致；GRANVILLE_POSITION_PCT 在 live 才用）
+        qty_total = MARGIN_USDT * LEVERAGE / entry
+        qty_tp1 = round(qty_total * 0.5, 6)
+        qty_tp2 = round(qty_total - qty_tp1, 6)
+
+        trade = BtTrade(
+            symbol=symbol,
+            direction=side,
+            entry=entry,
+            sl=sl, tp1=tp1, tp2=tp2,
+            qty=qty_total, qty_tp1=qty_tp1, qty_tp2=qty_tp2,
+            fib_level="",
+            pattern="GRANVILLE_RULE_1" if side == "LONG" else "GRANVILLE_RULE_5",
+            score=score,
+            timeframe=tf,
+            open_bar=i,
+            open_time=df_tf["time"].iloc[i],
+            strategy="granville",
+        )
+
+        df_future = df_tf.iloc[i + 1:].reset_index(drop=True)
+        # GRANVILLE 規格：TP1 後 SL 移到 entry（保本，trailing 改用 EMA60 在 live）
+        trade = simulate_trade(
+            trade, df_future, max_bars=timeout_bars,
+            sl_to_be_after_tp1=True,
+        )
+
+        if trade.result in ("", "OPEN"):
+            continue
+
+        trades.append(trade)
+        if side == "LONG":
+            dbg["signals_long"] += 1
+        else:
+            dbg["signals_short"] += 1
+
+        # 連虧暫停（≥ N 連敗 → 暫停 PAUSE_HOURS / 4 根）
+        if "SL" in trade.result and "BE" not in trade.result:
+            consec_losses += 1
+            cooldown_until = trade.close_bar + COOLDOWN_BARS
+            if consec_losses >= consec_limit:
+                pause_until = trade.close_bar + pause_bars
+                consec_losses = 0   # reset
+        else:
+            consec_losses = 0
+
+    total = dbg["signals_long"] + dbg["signals_short"]
+    print(f" 找到 {total} 筆訊號 "
+          f"(LONG {dbg['signals_long']} / SHORT {dbg['signals_short']})")
+
+    if debug or total == 0:
+        scanned = len(df_tf) - warmup - dbg["cooldown"] - dbg["paused"]
+        print(f"\n  ── GRANVILLE 診斷 ──")
+        print(f"  總掃描：{scanned}（cooldown={dbg['cooldown']}, paused={dbg['paused']}）")
+        print(f"  ├─ 指標未備                ：{dbg['no_indicators']}")
+        print(f"  ├─ ADX ≤ {adx_min}               ：{dbg['low_adx']}")
+        print(f"  ├─ 量能不足               ：{dbg['no_volume']}")
+        print(f"  ├─ 多空都未突破            ：{dbg['no_break_long'] + dbg['no_break_short']}")
+        print(f"  ├─ 斜率不對                ：{dbg['no_slope']}")
+        print(f"  ├─ SL 位置異常             ：{dbg['bad_pos']}")
+        print(f"  ├─ 通過 LONG               ：{dbg['signals_long']}")
+        print(f"  └─ 通過 SHORT              ：{dbg['signals_short']}")
+    return trades
+
+
 # ── MASR Short v2 每日做空池使用率 ───────────────────────────
 def print_masr_short_v2_daily_pool(results: dict, v2_variants: list,
                                     n_symbols: int) -> None:
@@ -3588,6 +3817,15 @@ def _run_multi_coin_backtest(
                     tr = []
                 results[(sym, key)] = tr
 
+        if run_flags.get("granville"):
+            try:
+                tr = run_backtest_granville(client, sym, args.months,
+                                             debug=False)
+            except Exception as e:
+                print(f"  [GRANVILLE] 失敗：{e}")
+                tr = []
+            results[(sym, "GRANVILLE")] = tr
+
     return results
 
 
@@ -3924,10 +4162,11 @@ def main():
         # v2 別名（fast/slow 由 --masrs-v2-variant 控制；別名統一指向 v2）
         "masrs2": "ma_sr_short_v2", "masr_short_v2": "ma_sr_short_v2",
         "masrsv2": "ma_sr_short_v2",
+        "grv": "granville", "grav": "granville",
     }
     _VALID = {"naked_k_fib", "mean_reversion", "breakdown_short",
               "momentum_long", "smc_sweep", "ma_sr_breakout",
-              "ma_sr_short", "ma_sr_short_v2", "all"}
+              "ma_sr_short", "ma_sr_short_v2", "granville", "all"}
     _raw_strats = [s.strip().lower() for s in args.strategy.split(",") if s.strip()]
     _expanded = []
     for s in _raw_strats:
@@ -3948,6 +4187,7 @@ def main():
     run_masr = _is_all or "ma_sr_breakout"  in _strats_set
     run_masr_short = _is_all or "ma_sr_short" in _strats_set
     run_masr_short_v2 = "ma_sr_short_v2" in _strats_set  # v2 不入 all（避免重複跑）
+    run_granville = _is_all or "granville" in _strats_set
 
     # ── 掃描模式（優先）──────────────────────────────────────────
     if args.scan:
@@ -3969,6 +4209,7 @@ def main():
             "masr_short": run_masr_short,
             "masr_short_v2": run_masr_short_v2 or args.masrs_compare,
             "masr_short_v2_variants": v2_variants,
+            "granville": run_granville,
         }
         active_strats = [k.upper() for k, v in run_flags.items()
                          if v and k != "masr_short_v2_variants"]
@@ -4048,6 +4289,8 @@ def main():
         print(f"  [MASR] 時間框架：{Config.MASR_TIMEFRAME}  超時：{Config.MASR_TIMEOUT_BARS} 根  MA + S/R Breakout (LONG only)")
     if run_masr_short:
         print(f"  [MASR_SHORT] 時間框架：{Config.MASR_SHORT_TIMEFRAME}  超時：{Config.MASR_SHORT_TIMEOUT_BARS} 根  MA + S/R Breakdown SHORT（BTC regime gated）")
+    if run_granville:
+        print(f"  [GRANVILLE] 時間框架：{Config.GRANVILLE_TIMEFRAME}  超時：{Config.GRANVILLE_MAX_HOLD_BARS} 根  葛蘭碧 4 法則（雙向）")
     print(f"  回測期間：最近 {args.months} 個月")
     print(f"  起始資金：{args.balance} USDT  槓桿：{LEVERAGE}x  每筆保證金：{MARGIN_USDT:.0f} USDT")
     if run_nkf:
@@ -4061,6 +4304,7 @@ def main():
     all_smc = []
     all_masr = []
     all_masr_short = []
+    all_granville = []
 
     # ── NKF 回測 ──────────────────────────────────────────────────
     if run_nkf:
@@ -4125,6 +4369,14 @@ def main():
                     args.balance, label="MASR_SHORT")
         all_masr_short.extend(trades_masr_s)
 
+    # ── GRANVILLE 回測 ─────────────────────────────────────────
+    if run_granville:
+        trades_grv = run_backtest_granville(client, args.symbol, args.months,
+                                             debug=args.debug_indicators)
+        print_stats(trades_grv, Config.GRANVILLE_TIMEFRAME, args.symbol,
+                    args.balance, label="GRANVILLE")
+        all_granville.extend(trades_grv)
+
     # ── MASR_SHORT v2 回測（fast / slow / both）─────────────────
     if run_masr_short_v2 or args.masrs_compare:
         v2_variant = args.masrs_v2_variant or Config.MASR_SHORT_V2_VARIANT
@@ -4139,9 +4391,9 @@ def main():
             print_masr_short_v2_breakdown(trades_v2, label=f"V2:{v}")
 
     # ── 合併統計（only when running all）─────────────────────────
-    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml or all_smc or all_masr or all_masr_short):
+    if args.strategy == "all" and (all_nkf or all_mr or all_bd or all_ml or all_smc or all_masr or all_masr_short or all_granville):
         combined = (all_nkf + all_mr + all_bd + all_ml + all_smc
-                    + all_masr + all_masr_short)
+                    + all_masr + all_masr_short + all_granville)
         combined.sort(key=lambda t: t.open_time or datetime.min)
         strats = "+".join(
             s for s, flag in [
@@ -4149,6 +4401,7 @@ def main():
                 ("BD",  bool(all_bd)),  ("ML", bool(all_ml)),
                 ("SMC", bool(all_smc)), ("MASR", bool(all_masr)),
                 ("MASR_SHORT", bool(all_masr_short)),
+                ("GRANVILLE", bool(all_granville)),
             ] if flag
         )
         print_stats(combined, "ALL", args.symbol, args.balance, label=f"{strats} 合併")

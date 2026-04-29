@@ -151,6 +151,7 @@ class TelegramNotifier:
                 "smc_sweep":       "SMC",
                 "ma_sr_breakout":  "MASR",
                 "ma_sr_short":     "MASRS",
+                "granville":       "GRV",
             }
             for strat, g in sorted(per_strategy.items(), key=_key):
                 label   = short_map.get(strat, strat[:4].upper())
