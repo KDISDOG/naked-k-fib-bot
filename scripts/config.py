@@ -338,7 +338,9 @@ class Config:
     #   2. 選幣放寬：30M 量 / 4H EMA 趨勢 / 7d<+3% / 距 30d 高>8%
     #   3. 進場放寬：量能 1.2× / RSI>35 / 距 EMA200<12%
     # 同時提供 fast/slow 兩個 variant（fast=1-bar 確認、slow=2-bar+ATR offset）
-    MASR_SHORT_V2_VARIANT             = os.getenv("MASR_SHORT_V2_VARIANT", "fast")  # fast | slow
+    MASR_SHORT_V2_VARIANT             = os.getenv("MASR_SHORT_V2_VARIANT", "fast")  # fast | slow (backtest only)
+    # P12B：live MASR_SHORT v2 variant 預設（slow ROBUST adj +24.15U > fast +11.66U）
+    MASR_SHORT_VARIANT                = os.getenv("MASR_SHORT_VARIANT", "slow")  # fast | slow (live default)
     # 分級大盤閾值
     MASR_SHORT_V2_STRONG_TIMEFRAME    = os.getenv("MASR_SHORT_V2_STRONG_TIMEFRAME", "1d")
     MASR_SHORT_V2_STRONG_FAST_EMA     = int(os.getenv("MASR_SHORT_V2_STRONG_FAST_EMA", 50))

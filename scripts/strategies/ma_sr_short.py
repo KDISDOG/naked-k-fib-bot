@@ -1,39 +1,66 @@
 """
 ma_sr_short.py — MA + 水平支撐破位做空策略（MASR Short）
 
-核心設計原則（來自規格，絕對不對稱反向 MASR Long）：
-  1. 只在「BTC 偏空 + 個幣已破位 + 短時間框架確認」三條件都成立才開倉
-  2. 1H 時間框架（vs MASR Long 4H）：抓「破位後續跌」短週期
-  3. 移動停利更積極（SL 1.2×ATR vs Long 1.5×ATR）
-  4. 24h 強制平倉，不過夜套
+────────────────────────────────────────────────────────────────────────
+P12B 版本變更（2026-04-30）— v1 → v2 移植
+────────────────────────────────────────────────────────────────────────
+HISTORY:
+  v1 (2026-04-30 之前): 5 條 mandatory filter（BTC regime + 個幣日線 EMA cross
+    + 7d 跌≥5% + 距 30d 高≤-15% + 反追殺保險），39m × 10 幣只 3 trades 全部 dead。
+    audit reports/p12_masr_short_diagnosis_*.md。
+  v2 (本檔案 2026-04-30 起): 從 backtest.run_backtest_masr_short_v2 移植。
+    - mandatory BTC regime → tiered (strong/weak)，弱做空 0.5× 半倉
+    - 個幣日線 EMA cross → 4H EMA fast/slow gate
+    - 7d 跌≥-5% → 7d 漲≤+3%（放寬 + 翻方向）
+    - 距 30d 高≤-15% → ≤-8%（放寬）
+    - 2-bar 破位 → 1-bar (fast) / 1-bar + i+1 offset (slow)
+    - vol 1.5× → 1.2×；4H RSI>30 → >35；距 EMA200<10% → <12%
 
-選幣（每次 scan，日線 + BTC 大盤）：
-  1. BTC 4H EMA50 < EMA200 且 BTC 24h 漲幅 < +2%（mandatory regime gate）
-  2. 流動性：30 日均量 > 50M USDT、上市 ≥ 6 個月
-  3. 趨勢結構：日線 EMA50 < EMA200
-  4. 已破位：過去 7 日跌幅 > 5% 且 距 30 日高已下跌 > 15%
-  5. 排除避險資產（PAXGUSDT/XAUUSDT）、穩定幣、槓桿代幣
+  v1 logic 仍保留在 scripts/backtest.py:run_backtest_masr_short（歷史證據）+
+  本檔案的 MaSrShortV1Deprecated（純 archive，不註冊 bot_main / 不暴露為 live）。
+  bot_main.py 透過 `from strategies.ma_sr_short import MaSrShortStrategy` 自動拿到 v2。
 
-進場（1H K 線）：
-  a. 找支撐位 S：近 100 根 1H 至少 2 次測試（容差 ATR×0.3）
-  b. 上一根 1H close < S（破位）
-  c. 當前 1H close < S（2-bar 確認）
-  d. EMA20 < EMA50（短期空頭排列）
-  e. 量能 > 20 根均量 × 1.5
-  f. ATR 不在近 100 根的最高 20%
+  P12 audit 證據：
+    - v2_slow baseline: ROBUST, adj +24.15U
+    - v2_fast baseline: ROBUST, adj +11.66U
+    - default variant = "slow"（adj 高 ~2x）
 
-避免錯誤做空（追殺保險）：
-  - 4H RSI > 30（不在超賣做空）
-  - 距日線 EMA200 跌幅 < 10%（不追深殺）
-  - 24h 跌幅 < 8%（不追加速殺）
+────────────────────────────────────────────────────────────────────────
+v2 規範摘要（active path）
+────────────────────────────────────────────────────────────────────────
+進場 timeframe: 1H
 
-出場：
-  SL  = entry + 1.2×ATR（比 Long 1.5 緊）
-  TP1 = entry - 2×sl_dist（50%）
-  TP2 = entry - 4×sl_dist（50%，live 改用 EMA20 trail；
-        backtest 用 fixed 4R 模擬「漲破 EMA20 出場」的近似）
+BTC 大盤 tiered gate（任一觸發即可）:
+  - strong：BTC 1D EMA50 < EMA200 → 全倉
+  - weak：BTC 4H close < EMA50 且 BTC 24h<+1% → 半倉
+  二者都不成立 → 不做空
+
+個幣 4H 趨勢: EMA fast(50) < EMA slow(200)
+
+個幣日線結構（放寬版）:
+  - 7d 漲幅 ≤ +3%（不做最近大漲幣）
+  - 距 30d 高 ≤ -8%
+
+進場（1H K 線）:
+  a. 找支撐 S：近 100 根至少 2 次測試
+  b. close < S（1-bar 確認）；slow variant 加 i+1 close < S - 0.2×ATR
+  c. EMA20 < EMA50（短期空頭排列）
+  d. ATR 不在前 20%
+  e. vol > 20 根均量 × 1.2
+  f. 4H RSI > 35
+  g. 距日線 EMA200 < 12%
+
+出場（同 v1）:
+  SL = entry + MASR_SHORT_SL_ATR_MULT × ATR
+  TP1 = entry - TP1_RR × sl_dist
+  TP2 = entry - TP2_RR × sl_dist
   TP1 後 SL → entry（保本）
-  24h 強制平倉
+  TIMEOUT_BARS 強制平倉
+
+backlog（不在本輪做）:
+  - sweep v2 SL/TP/lookback (P12C)
+  - shadow comparison hook (P12D)
+  - testnet checklist short pair (P12E)
 """
 import logging
 import numpy as np
@@ -51,7 +78,11 @@ _LEVERAGE_TAGS  = ("UP", "DOWN", "BULL", "BEAR")
 _STABLE_PREFIX  = ("USDC", "FDUSD", "TUSD", "BUSD", "DAI")
 
 
-class MaSrShortStrategy(BaseStrategy):
+class MaSrShortV1Deprecated(BaseStrategy):
+    """Deprecated 2026-04-30 (P12B): 5 條 mandatory filter 過嚴 → 39m only 3 trades.
+    Logic preserved for archeology only. Not registered in bot_main; not callable.
+    See reports/p12_masr_short_diagnosis_*.md.
+    """
 
     def __init__(self, client: Client, market_ctx=None, db=None):
         self._client = client
@@ -63,7 +94,7 @@ class MaSrShortStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
-        return "ma_sr_short"
+        return "ma_sr_short_v1_deprecated"
 
     @property
     def default_timeframe(self) -> str:
@@ -562,3 +593,516 @@ class MaSrShortStrategy(BaseStrategy):
             score += 1
 
         return min(score, 5)
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2 (live-grade，從 backtest.run_backtest_masr_short_v2 移植)
+# 任何邏輯變更必須同步更新 backtest.py 並重跑 P12 audit。
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _align_higher_to_lower_value(df_higher: pd.DataFrame, series: pd.Series,
+                                   target_time) -> float:
+    """從 higher-TF series 取出 time <= target_time 的最後一個值。
+    mirror backtest.py:_align_higher_to_lower 的單點版本。
+    """
+    if series is None or df_higher is None or len(df_higher) == 0:
+        return float("nan")
+    times = df_higher["time"].values
+    target_np = np.datetime64(pd.Timestamp(target_time))
+    idx = np.searchsorted(times, target_np, side="right") - 1
+    if idx < 0:
+        return float("nan")
+    val = series.iloc[idx]
+    if pd.isna(val):
+        return float("nan")
+    return float(val)
+
+
+def _v2_find_support(lows_arr: np.ndarray, end_idx: int, atr: float,
+                      lookback: int, tol_mult: float, min_touches: int,
+                      cur_close: float) -> Optional[float]:
+    """mirror backtest.py:_bt_masr_short_find_support。
+    從 lows_arr[end_idx-lookback:end_idx] 找出 ≥min_touches 次測試的水平支撐，
+    取剛被跌破的（≥ cur_close - tolerance 的最低一個）。
+    """
+    if end_idx < lookback or atr <= 0:
+        return None
+    window = lows_arr[end_idx - lookback:end_idx]
+    if len(window) < lookback:
+        return None
+    tolerance = atr * tol_mult
+    if tolerance <= 0:
+        return None
+
+    used = np.zeros(len(window), dtype=bool)
+    clusters: list[float] = []
+    for i in range(len(window)):
+        if used[i]:
+            continue
+        cluster = [window[i]]
+        used[i] = True
+        for j in range(i + 1, len(window)):
+            if used[j]:
+                continue
+            if abs(window[i] - window[j]) <= tolerance:
+                cluster.append(window[j])
+                used[j] = True
+        if len(cluster) >= min_touches:
+            clusters.append(float(np.mean(cluster)))
+
+    if not clusters:
+        return None
+    breakable = [s for s in clusters if s >= cur_close - tolerance]
+    if not breakable:
+        return None
+    return min(breakable)
+
+
+def _v2_check_at_bar(
+    df_1h: pd.DataFrame,
+    df_4h: pd.DataFrame,
+    df_1d: pd.DataFrame,
+    df_btc_1d: pd.DataFrame,
+    df_btc_4h: pd.DataFrame,
+    bar_idx_1h: int,
+    variant: str = "slow",
+) -> Optional[dict]:
+    """
+    對 df_1h 在 bar_idx_1h 跑 MASR Short v2 進場邏輯。
+
+    這是 source-of-truth port from scripts/backtest.py:run_backtest_masr_short_v2
+    （該 fn line 2846+），逐條件對應。任何 logic 變更必須兩邊同步並重跑 P12 audit。
+
+    bar_idx_1h: 已收盤的目標 1H bar index（bar 收盤後產生 signal）。
+    回傳 Signal-shaped dict 或 None。
+
+    fast variant: 1-bar 確認
+    slow variant: 1-bar 確認 + i+1 close < S - SLOW_OFFSET_ATR × ATR
+    """
+    from config import Config
+
+    if df_1h is None or len(df_1h) == 0:
+        return None
+    if bar_idx_1h < 60:
+        return None
+    lookback = int(Config.MASR_SHORT_RES_LOOKBACK)
+    if bar_idx_1h < lookback + 5:
+        return None
+    # slow variant 要求 i+1 在範圍內
+    if variant == "slow" and bar_idx_1h + 1 >= len(df_1h):
+        return None
+    if bar_idx_1h >= len(df_1h):
+        return None
+
+    bar_time = df_1h["time"].iloc[bar_idx_1h]
+
+    # ── 1H 指標 ──────────────────────────────────────────────────
+    ema20_s = ta.ema(df_1h["close"], length=20)
+    ema50_s = ta.ema(df_1h["close"], length=50)
+    atr_s = ta.atr(df_1h["high"], df_1h["low"], df_1h["close"], length=14)
+    avg_vol_s = df_1h["volume"].rolling(21).mean().shift(1)
+    if ema20_s is None or ema50_s is None or atr_s is None:
+        return None
+
+    ema20_v = ema20_s.iloc[bar_idx_1h]
+    ema50_v = ema50_s.iloc[bar_idx_1h]
+    atr_v = atr_s.iloc[bar_idx_1h]
+    avg_vol = avg_vol_s.iloc[bar_idx_1h]
+    cur_close = float(df_1h["close"].iloc[bar_idx_1h])
+    cur_vol = float(df_1h["volume"].iloc[bar_idx_1h])
+
+    if pd.isna(ema20_v) or pd.isna(ema50_v) or pd.isna(atr_v) \
+            or pd.isna(avg_vol) or float(avg_vol) <= 0:
+        return None
+    ema20_v = float(ema20_v)
+    ema50_v = float(ema50_v)
+    atr_v = float(atr_v)
+
+    # ── 分級 BTC regime ──────────────────────────────────────────
+    btc_d_fast_s = ta.ema(df_btc_1d["close"],
+                            length=int(Config.MASR_SHORT_V2_STRONG_FAST_EMA))
+    btc_d_slow_s = ta.ema(df_btc_1d["close"],
+                            length=int(Config.MASR_SHORT_V2_STRONG_SLOW_EMA))
+    bd_fast = _align_higher_to_lower_value(df_btc_1d, btc_d_fast_s, bar_time)
+    bd_slow = _align_higher_to_lower_value(df_btc_1d, btc_d_slow_s, bar_time)
+
+    btc_4h_ema_s = ta.ema(df_btc_4h["close"],
+                           length=int(Config.MASR_SHORT_V2_WEAK_EMA))
+    b4_close = _align_higher_to_lower_value(df_btc_4h, df_btc_4h["close"], bar_time)
+    b4_ema = _align_higher_to_lower_value(df_btc_4h, btc_4h_ema_s, bar_time)
+
+    btc_d_close = df_btc_1d["close"]
+    btc_d_prev = df_btc_1d["close"].shift(1)
+    btc_24h_pct_s = (btc_d_close - btc_d_prev) / btc_d_prev
+    b_24h = _align_higher_to_lower_value(df_btc_1d, btc_24h_pct_s, bar_time)
+
+    weak_btc_24h_max = float(Config.MASR_SHORT_V2_WEAK_BTC_24H_MAX)
+
+    strong_short = (not np.isnan(bd_fast) and not np.isnan(bd_slow)
+                    and bd_fast < bd_slow)
+    weak_short = (not np.isnan(b4_close) and not np.isnan(b4_ema)
+                  and not np.isnan(b_24h)
+                  and b4_close < b4_ema
+                  and b_24h < weak_btc_24h_max)
+
+    if not (strong_short or weak_short):
+        return None
+    regime_mode = "strong" if strong_short else "weak"
+
+    # ── 個幣 4H 趨勢結構 ──────────────────────────────────────────
+    e4f_s = ta.ema(df_4h["close"],
+                    length=int(Config.MASR_SHORT_V2_TREND_FAST_EMA))
+    e4s_s = ta.ema(df_4h["close"],
+                    length=int(Config.MASR_SHORT_V2_TREND_SLOW_EMA))
+    e4f = _align_higher_to_lower_value(df_4h, e4f_s, bar_time)
+    e4s = _align_higher_to_lower_value(df_4h, e4s_s, bar_time)
+    if np.isnan(e4f) or np.isnan(e4s) or e4f >= e4s:
+        return None
+
+    # ── 7d 漲幅 ≤ +3% + 距 30d 高 ≤ -8% ─────────────────────────
+    close_7d_prev_s = df_1d["close"].shift(7)
+    high_30d_s = df_1d["high"].rolling(30).max()
+    c_d = _align_higher_to_lower_value(df_1d, df_1d["close"], bar_time)
+    c_7d = _align_higher_to_lower_value(df_1d, close_7d_prev_s, bar_time)
+    h_30 = _align_higher_to_lower_value(df_1d, high_30d_s, bar_time)
+    if np.isnan(c_d) or np.isnan(c_7d) or np.isnan(h_30) or c_7d <= 0 or h_30 <= 0:
+        return None
+    pct_7d = (c_d - c_7d) / c_7d
+    max_7d_pct = float(Config.MASR_SHORT_V2_7D_MAX_RETURN)
+    if pct_7d > max_7d_pct:
+        return None
+    dist_high = (c_d - h_30) / h_30
+    min_dist_high = float(Config.MASR_SHORT_V2_DIST_HIGH_PCT)
+    if dist_high > -min_dist_high:
+        return None
+
+    # ── 1H EMA20 < EMA50 ─────────────────────────────────────────
+    if ema20_v >= ema50_v:
+        return None
+
+    # ── 找支撐 ───────────────────────────────────────────────────
+    lows_arr = df_1h["low"].values
+    res_tol_mult = float(Config.MASR_SHORT_RES_TOL_ATR_MULT)
+    res_min_touches = int(Config.MASR_SHORT_RES_MIN_TOUCHES)
+    support = _v2_find_support(
+        lows_arr, bar_idx_1h, atr_v, lookback,
+        res_tol_mult, res_min_touches, cur_close,
+    )
+    if support is None:
+        return None
+
+    # ── 1-bar 確認 + slow variant 額外 ───────────────────────────
+    if cur_close >= support:
+        return None
+    if variant == "slow":
+        slow_offset_atr = float(Config.MASR_SHORT_V2_SLOW_OFFSET_ATR)
+        next_close = float(df_1h["close"].iloc[bar_idx_1h + 1])
+        if next_close >= (support - slow_offset_atr * atr_v):
+            return None
+
+    # ── 量能 > 1.2× ──────────────────────────────────────────────
+    vol_mult = float(Config.MASR_SHORT_V2_VOL_MULT)
+    vol_ratio = cur_vol / float(avg_vol)
+    if vol_ratio < vol_mult:
+        return None
+
+    # ── 4H RSI > 35 ──────────────────────────────────────────────
+    rsi_period = int(Config.MASR_SHORT_RSI_PERIOD)
+    rsi_4h_s = ta.rsi(df_4h["close"], length=rsi_period)
+    rsi_v = _align_higher_to_lower_value(df_4h, rsi_4h_s, bar_time)
+    rsi_min = float(Config.MASR_SHORT_V2_RSI_MIN)
+    if np.isnan(rsi_v) or rsi_v <= rsi_min:
+        return None
+
+    # ── 距日線 EMA200 < 12% ──────────────────────────────────────
+    if len(df_1d) >= 200:
+        ema200_d_s = ta.ema(df_1d["close"], length=200)
+        e200_d = _align_higher_to_lower_value(df_1d, ema200_d_s, bar_time)
+        max_dist_e200 = float(Config.MASR_SHORT_V2_MAX_DIST_FROM_EMA200)
+        if not np.isnan(e200_d) and e200_d > 0:
+            dist_e200 = (cur_close - e200_d) / e200_d
+            if dist_e200 < -max_dist_e200:
+                return None
+
+    # ── ATR 過熱 ─────────────────────────────────────────────────
+    atr_window = atr_s.iloc[bar_idx_1h - lookback + 1:bar_idx_1h + 1]
+    atr_q = float(atr_window.quantile(0.80))
+    if atr_v >= atr_q:
+        return None
+
+    # ── SL / TP（SHORT）─────────────────────────────────────────
+    sl_atr_mult = float(Config.MASR_SHORT_SL_ATR_MULT)
+    sl = cur_close + sl_atr_mult * atr_v
+    if sl <= cur_close:
+        return None
+    sl_dist = sl - cur_close
+    tp1_rr = float(Config.MASR_SHORT_TP1_RR)
+    tp2_rr = float(Config.MASR_SHORT_TP2_RR)
+    tp1 = cur_close - tp1_rr * sl_dist
+    tp2 = cur_close - tp2_rr * sl_dist
+    if tp1 <= 0 or tp2 <= 0:
+        return None
+
+    # ── 評分（mirror backtest v2 score logic）────────────────────
+    score = 1
+    ema_gap_pct = (ema50_v - ema20_v) / ema20_v if ema20_v > 0 else 0
+    if ema_gap_pct >= 0.01:
+        score += 1
+    if vol_ratio >= 2.0:
+        score += 1
+    if 35 <= float(rsi_v) <= 55:
+        score += 1
+    score = min(score, 5)
+
+    min_score = int(Config.MASR_SHORT_MIN_SCORE)
+    if score < min_score:
+        return None
+
+    return {
+        "direction": "SHORT",
+        "entry": cur_close,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "score": score,
+        "atr": atr_v,
+        "ema20": ema20_v,
+        "ema50": ema50_v,
+        "support": support,
+        "vol_ratio": vol_ratio,
+        "rsi_4h": float(rsi_v),
+        "regime_mode": regime_mode,    # "strong" / "weak"
+    }
+
+
+class MaSrShortStrategy(BaseStrategy):
+    """MASR Short v2 — live-grade strategy (P12B 移植自 backtest)。
+
+    audit: reports/p12_masr_short_diagnosis_*.md
+      - v2_slow baseline: ROBUST (adj +24.15U)
+      - v2_fast baseline: ROBUST (adj +11.66U)
+    default variant = "slow"（adj 顯著高於 fast）。
+    """
+
+    def __init__(self, client: Client, market_ctx=None, db=None,
+                 variant: Optional[str] = None):
+        self._client = client
+        self._market_ctx = market_ctx
+        self._db = db
+        # variant from arg or env (default slow per P12 audit)
+        from config import Config
+        v = (variant
+              or getattr(Config, "MASR_SHORT_VARIANT", None)
+              or "slow").lower()
+        if v not in ("slow", "fast"):
+            log.warning(f"[MASR_SHORT] 未知 variant={v}，fallback slow")
+            v = "slow"
+        self.variant = v
+        log.info(f"[MASR_SHORT] init variant={self.variant}")
+
+    @property
+    def name(self) -> str:
+        return "ma_sr_short"
+
+    @property
+    def default_timeframe(self) -> str:
+        from config import Config
+        return Config.MASR_SHORT_TIMEFRAME
+
+    # ── K 線取得（同 v1）─────────────────────────────────────────
+    def _get_klines(self, symbol: str, interval: str,
+                    limit: int = 200) -> pd.DataFrame:
+        if self._market_ctx is not None and hasattr(
+                self._market_ctx, "get_klines"):
+            return self._market_ctx.get_klines(symbol, interval, limit)
+        from api_retry import weight_aware_call, klines_weight
+        raw = weight_aware_call(
+            self._client.futures_klines, weight=klines_weight(limit),
+            symbol=symbol, interval=interval, limit=limit,
+        )
+        df = pd.DataFrame(raw, columns=[
+            "time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbav", "tbqv", "ignore"
+        ])
+        for col in ["open", "high", "low", "close", "volume", "qav"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+        return df.reset_index(drop=True)
+
+    # ── 選幣（cfd filter + v2 放寬條件）─────────────────────────
+    def screen_coins(self, candidates: List[str]) -> List[str]:
+        from config import Config
+
+        # ── P10 phase 2 對稱：cfd asset_class filter（疊加）──
+        # 純名稱判定，無 cache 依賴；fail-open。
+        # P12 audit：cfd filter 對 short 影響微小，但保留對稱性。
+        try:
+            from feature_filter import classify_asset, load_feature_filter_config
+            ff_cfg = load_feature_filter_config()
+            excluded_classes = ff_cfg.get("MASR_EXCLUDE_ASSET_CLASSES", ["cfd"])
+        except Exception as e:
+            log.warning(f"[MASR_SHORT screen] feature_filter 讀取失敗: {e}")
+            excluded_classes = []
+
+        if excluded_classes:
+            pre_count = len(candidates)
+            after_cfd: list[str] = []
+            skipped: list[str] = []
+            for sym in candidates:
+                ac = classify_asset(sym)
+                if ac in excluded_classes:
+                    skipped.append(f"{sym}({ac})")
+                    continue
+                after_cfd.append(sym)
+            if skipped:
+                log.info(
+                    f"[MASR_SHORT screen] cfd filter: {pre_count} → {len(after_cfd)} "
+                    f"({len(skipped)} skipped: {skipped[:5]}"
+                    f"{'...' if len(skipped) > 5 else ''})"
+                )
+            candidates = after_cfd
+
+        # ── 上市/槓桿/穩定幣排除（同 v1）──
+        onboard_map: dict[str, int] = {}
+        try:
+            from api_retry import get_exchange_info_cached
+            info = get_exchange_info_cached(self._client)
+            for s in info.get("symbols", []):
+                onboard_map[s["symbol"]] = int(s.get("onboardDate", 0))
+        except Exception as e:
+            log.debug(f"[MASR_SHORT 篩選] onboardDate 取得失敗（略過）: {e}")
+
+        min_listing_days = int(Config.MASR_SHORT_MIN_LISTING_DAYS)
+        listing_cutoff_ms = int(
+            (pd.Timestamp.utcnow() - pd.Timedelta(days=min_listing_days)).timestamp() * 1000
+        )
+
+        # MASR_SHORT_V2_VOL_M（30M USDT，比 v1 50M 鬆）
+        vol_min = float(Config.MASR_SHORT_V2_VOL_M) * 1_000_000
+
+        scored: list[tuple[str, float]] = []
+        for sym in candidates:
+            try:
+                upper = sym.upper()
+                if any(tag in upper for tag in _LEVERAGE_TAGS):
+                    continue
+                base = upper.replace("USDT", "")
+                if any(base.startswith(p) for p in _STABLE_PREFIX):
+                    continue
+                if onboard_map and sym in onboard_map:
+                    if onboard_map[sym] > listing_cutoff_ms:
+                        continue
+                df_d = self._get_klines(sym, "1d", limit=35)
+                if len(df_d) < 30:
+                    continue
+                avg_qav = float(df_d["qav"].tail(30).mean())
+                if avg_qav < vol_min:
+                    continue
+                # 距 30d 高排序鍵
+                price_d = float(df_d["close"].iloc[-1])
+                high_30d = float(df_d["high"].tail(30).max())
+                if high_30d <= 0:
+                    continue
+                dist_high = (price_d - high_30d) / high_30d  # 負值
+                scored.append((sym, dist_high))
+            except Exception as e:
+                log.debug(f"[MASR_SHORT 篩選] {sym} 失敗: {e}")
+
+        # 距 30d 高跌幅由深到淺（最深前面）
+        scored.sort(key=lambda x: x[1])
+        top_n = int(Config.MASR_SHORT_V2_TOP_N)
+        selected = [s[0] for s in scored[:top_n]]
+        log.info(
+            f"[MASR_SHORT] 選幣完成：{len(selected)} 支入選 "
+            f"（{len(candidates)} 候選中通過 {len(scored)} 後取 top {top_n}）"
+        )
+        return selected
+
+    # ── 訊號偵測 ─────────────────────────────────────────────────
+    def check_signal(self, symbol: str) -> Optional[Signal]:
+        """逐行對應 backtest.run_backtest_masr_short_v2 的 per-bar 邏輯。
+        透過共用 _v2_check_at_bar helper 確保 live 與 backtest 等價。
+        """
+        from config import Config
+
+        try:
+            df_1h = self._get_klines(
+                symbol, self.default_timeframe,
+                limit=max(150, int(Config.MASR_SHORT_RES_LOOKBACK) + 30),
+            )
+            df_4h = self._get_klines(symbol, "4h", limit=250)
+            df_1d = self._get_klines(symbol, "1d", limit=210)
+            df_btc_1d = self._get_klines("BTCUSDT", "1d", limit=250)
+            df_btc_4h = self._get_klines("BTCUSDT", "4h", limit=100)
+        except Exception as e:
+            log.warning(f"[{symbol}] MASR_SHORT K 線取得失敗: {e}")
+            return None
+
+        if (len(df_1h) < int(Config.MASR_SHORT_RES_LOOKBACK) + 5
+                or len(df_4h) < 50 or len(df_1d) < 30
+                or len(df_btc_1d) < 200 or len(df_btc_4h) < 50):
+            return None
+
+        # 用倒數第二根作為「已收盤」當前 bar（live K 線最後一根可能還在 forming）
+        df_a = df_1h.iloc[:-1].reset_index(drop=True)
+        if len(df_a) < int(Config.MASR_SHORT_RES_LOOKBACK) + 3:
+            return None
+
+        # slow variant 在 df_a 上需要 i+1 → 用倒數第三根當「i」
+        # 但 _v2_check_at_bar 期望 bar_idx 本身是「目標 bar」，i+1 從 df 拿
+        # 所以給 df_1h（含 forming bar）+ bar_idx = len(df_a) - 1（即 closed bar）
+        # df_1h.iloc[bar_idx+1] = forming bar 的 close（live 還沒收盤）
+        # → slow variant 在 live 必須等 forming bar 也收盤才能 trigger
+        # 解：給 df_a（不含 forming），bar_idx = len(df_a) - 2（倒數第二的已收盤）
+        # 這樣 i+1 = len(df_a) - 1 = 上一根已收盤 bar
+        # 但這意味著 slow signal 在 live 比 fast 晚 1 根 1H 觸發
+        if self.variant == "slow":
+            bar_idx = len(df_a) - 2
+            if bar_idx < 60:
+                return None
+        else:
+            bar_idx = len(df_a) - 1
+
+        sig_dict = _v2_check_at_bar(
+            df_a, df_4h, df_1d, df_btc_1d, df_btc_4h,
+            bar_idx_1h=bar_idx, variant=self.variant,
+        )
+        if sig_dict is None:
+            return None
+
+        sig = Signal(
+            symbol        = symbol,
+            side          = "SHORT",
+            entry_price   = sig_dict["entry"],
+            stop_loss     = sig_dict["sl"],
+            take_profit_1 = sig_dict["tp1"],
+            take_profit_2 = sig_dict["tp2"],
+            score         = sig_dict["score"],
+            strategy_name = self.name,
+            timeframe     = self.default_timeframe,
+            pattern       = "MASR_BREAKDOWN_V2",
+            use_trailing  = True,
+            trailing_atr  = sig_dict["atr"],
+            metadata      = {
+                "support":    round(sig_dict["support"], 6),
+                "ema20":      round(sig_dict["ema20"], 6),
+                "ema50":      round(sig_dict["ema50"], 6),
+                "atr":        round(sig_dict["atr"], 6),
+                "vol_ratio":  round(sig_dict["vol_ratio"], 2),
+                "rsi_4h":     round(sig_dict["rsi_4h"], 2),
+                "regime":     sig_dict["regime_mode"],
+                "variant":    self.variant,
+            },
+        )
+
+        if not self.validate_signal(sig):
+            log.debug(f"[{symbol}] MASR_SHORT TP/SL 不合理，捨棄")
+            return None
+
+        log.info(
+            f"[{symbol}] MASR_SHORT v2:{self.variant} 訊號：SHORT "
+            f"S={sig_dict['support']:.4f} close={sig_dict['entry']:.4f} "
+            f"regime={sig_dict['regime_mode']} 強度={sig_dict['score']}"
+        )
+        return sig
