@@ -12,6 +12,31 @@
   python scripts/bot_main.py
   python scripts/bot_main.py --no-dashboard
   python scripts/bot_main.py --strategy mean_reversion
+
+────────────────────────────────────────────────────────────────────────
+ACTIVE_STRATEGIES collapsed to MASR long-only on 2026-04-30
+────────────────────────────────────────────────────────────────────────
+.env 的 ACTIVE_STRATEGY 預設從 "naked_k_fib,ma_sr_breakout,ma_sr_short" 收斂為
+"ma_sr_breakout"。原因：P3A cross-strategy stability audit
+（reports/p3a_cross_strategy_stability_*.md）確認:
+  - NKF: REJECTED — P2B-1.5 audit 全部 10 個 candidates 失敗 (wr_std > 10pp)
+         baseline seg1 -8.50U / seg3 +12.81U，分布極度後段集中
+  - BD:  REJECTED — baseline seg1 -5.20U / seg3 -12.18U 雙負段
+         P1 filter (adx>=28) 後 seg2 從 +16.71U 砍到 +10.77U，alpha 是雜訊
+  - SMC: REJECTED after filter — baseline OVERFIT_SUSPECT (seg2 64% 集中)
+         P1 filter (corr<=0.74) 後 min_n 從 66 砍到 7，樣本不可信
+  - MR:  下 active 已久 (P2B-1 後)，39m total -22.82U
+  - MASR_SHORT: 樣本不足（39m 只 2-3 trades/coin）無法驗證
+  - GRANVILLE: 樣本不足（39m 只 5-7 trades/coin）
+  - MASR: 唯一可上 active — REGIME_DEPENDENT 但 wr_std 4.7pp 最低、
+          min_n 222 樣本最大、total +124U 是其他三策合計數倍
+
+Strategies code (bot_main 註冊、strategies/<name>.py、coin_screener_<name>.py、
+backtest fns、Config 的 NKF_/MR_/SMC_/BD_/ML_/GRANVILLE_/MASR_SHORT_ 前綴)
+**全部保留**供未來 regime gate 實驗或重新驗證。
+
+下一步建議：P3B = regime detection 框架（不是 filter mining）。
+────────────────────────────────────────────────────────────────────────
 """
 import os
 import sys
