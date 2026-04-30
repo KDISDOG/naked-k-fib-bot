@@ -410,3 +410,185 @@ def _to_jsonable(v):
     if isinstance(v, pd.Timestamp):
         return str(v)
     return str(v)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# P12D: MASR Short shadow comparison
+# ═══════════════════════════════════════════════════════════════════════
+
+# P12B 等價驗證 6/6 PASS、P12C.5 fast.top3 + P12D cooldown 驗證 0 mismatch。
+# 本來不需要 KNOWN_ACCEPTABLE_DIFFS，但保留結構以備 paper 期間發現新 boundary
+# case（避免 logic drift）。
+SHORT_KNOWN_ACCEPTABLE_DIFFS = {
+    # 目前空：v2 helper 跟 backtest 完全等價（reports/p12b_..., p12d_...）
+    # 若未來 paper 期間發現新 diff，記錄在這裡並附證據連結
+}
+
+
+def shadow_compare_signal_short(
+    strategy_name: str,
+    symbol: str,
+    bar_time,
+    live_signal: Optional[dict],
+    df_klines_1h: pd.DataFrame,
+    df_klines_4h: pd.DataFrame,
+    df_klines_1d: pd.DataFrame,
+    df_btc_1d: pd.DataFrame,
+    df_btc_4h: pd.DataFrame,
+    in_cooldown: bool = False,
+    variant: str = "fast",
+) -> dict:
+    """MASR Short shadow comparison。
+    跟 long 同結構但加 cooldown 一致性驗證。
+
+    df_klines_1h: 至 bar_time 為止的 1H 序列；最後一根 = 觸發 live 訊號的
+    closed bar。caller 負責切（live 拿到 df 後做 df.iloc[:-1]）。
+
+    in_cooldown: live 是否認為當前 bar 在 cooldown。本檢查用來抓 cooldown drift：
+    若 live in_cooldown=True 但 backtest 該 bar 仍會 emit signal → real_mismatch
+    （cooldown 過於嚴格）。若 live in_cooldown=False 但 backtest 該 bar 在
+    cooldown → real_mismatch（cooldown 漏 trigger）。
+    """
+    if strategy_name.lower() != "masr_short":
+        return {
+            "match": True, "diffs": [], "real_mismatches": [],
+            "live_signal": live_signal, "backtest_signal": None,
+            "note": f"strategy={strategy_name} not supported by short shadow",
+        }
+
+    # 從 strategies.ma_sr_short 取共用 helper
+    from strategies.ma_sr_short import _v2_check_at_bar
+
+    bar_idx_1h = len(df_klines_1h) - 1
+    if variant == "slow" and bar_idx_1h + 1 >= len(df_klines_1h):
+        # df 太短不夠 slow variant
+        return {"match": True, "diffs": [], "real_mismatches": [],
+                "live_signal": live_signal, "backtest_signal": None,
+                "note": "df too short for slow variant"}
+
+    bt_sig = _v2_check_at_bar(
+        df_klines_1h, df_klines_4h, df_klines_1d, df_btc_1d, df_btc_4h,
+        bar_idx_1h=bar_idx_1h, variant=variant,
+    )
+
+    diffs: list[dict] = []
+    real_mismatches: list[dict] = []
+
+    # ── cooldown consistency check ───────────────────────────────
+    # if live in cooldown：live 不會發 signal（live_signal=None）；backtest
+    # helper 不知道 cooldown，仍可能算出 signal。此情況非 mismatch（live 端
+    # 由 cooldown gate 攔住，backtest 端由 cooldown_until 攔住，兩邊獨立）。
+    # 但若 live in_cooldown=False 且 live_signal=None 且 bt_sig 不為 None →
+    # real_mismatch（live 該發 signal 但沒發），這個 case 對應 cooldown
+    # 漏 trigger / live 邏輯 bug。
+    if in_cooldown:
+        # live 端被 cooldown 擋住，是預期行為。即使 backtest helper 算出 signal
+        # 也不算 real_mismatch（這在 P12D verifier 內計入 cooldown_rejected）。
+        if live_signal is not None:
+            # live 在 cooldown 內仍下單 → cooldown gate bug
+            rec = _diff_record("cooldown_violation",
+                                "live_signal_in_cooldown",
+                                "expected_None",
+                                "real_mismatch")
+            real_mismatches.append(rec)
+            diffs.append(rec)
+        # 不對 bt_sig 做評斷（cooldown 是 live-only 概念）
+        return {
+            "match": len(real_mismatches) == 0,
+            "diffs": diffs, "real_mismatches": real_mismatches,
+            "live_signal": live_signal, "backtest_signal": bt_sig,
+            "note": "in_cooldown",
+        }
+
+    # ── 不在 cooldown：標準 signal-existence + 數值比對 ───────────
+    if bt_sig is None and live_signal is not None:
+        rec = _diff_record("signal_existence", "live=signal", "backtest=None",
+                            "real_mismatch")
+        real_mismatches.append(rec)
+        diffs.append(rec)
+        _persist_diff(symbol, bar_time, live_signal, bt_sig, diffs)
+        return {
+            "match": False, "diffs": diffs, "real_mismatches": real_mismatches,
+            "live_signal": live_signal, "backtest_signal": bt_sig,
+        }
+    if bt_sig is not None and live_signal is None:
+        rec = _diff_record("signal_existence", "live=None", "backtest=signal",
+                            "real_mismatch")
+        real_mismatches.append(rec)
+        diffs.append(rec)
+        return {
+            "match": False, "diffs": diffs, "real_mismatches": real_mismatches,
+            "live_signal": live_signal, "backtest_signal": bt_sig,
+        }
+    if bt_sig is None and live_signal is None:
+        return {"match": True, "diffs": [], "real_mismatches": [],
+                "live_signal": None, "backtest_signal": None}
+
+    # 兩邊都有訊號 → 逐欄比
+    if str(live_signal.get("direction", "")).upper() != str(bt_sig["direction"]).upper():
+        rec = _diff_record("direction", live_signal.get("direction"),
+                            bt_sig["direction"], "real_mismatch")
+        diffs.append(rec)
+        real_mismatches.append(rec)
+
+    for f in ("entry", "sl", "tp1", "tp2"):
+        live_v = live_signal.get(f)
+        bt_v = bt_sig.get(f)
+        if live_v is None or bt_v is None:
+            continue
+        max_pct = TOLERANCE[f]["max_pct"]
+        if _is_within_tolerance_pct(float(live_v), float(bt_v), max_pct):
+            continue
+        if _is_acceptable_short(f, live_v, bt_v):
+            diffs.append(_diff_record(f, live_v, bt_v, "acceptable"))
+        else:
+            rec = _diff_record(f, live_v, bt_v, "real_mismatch")
+            diffs.append(rec)
+            real_mismatches.append(rec)
+
+    live_score = live_signal.get("score")
+    bt_score = bt_sig.get("score")
+    if live_score is not None and bt_score is not None:
+        delta = abs(int(live_score) - int(bt_score))
+        if delta == 0:
+            pass
+        elif _is_acceptable_short("score", live_score, bt_score):
+            diffs.append(_diff_record("score", live_score, bt_score,
+                                        "acceptable"))
+        else:
+            rec = _diff_record("score", live_score, bt_score, "real_mismatch")
+            diffs.append(rec)
+            real_mismatches.append(rec)
+
+    if real_mismatches:
+        _persist_diff(symbol, bar_time, live_signal, bt_sig, diffs)
+
+    return {
+        "match": len(real_mismatches) == 0,
+        "diffs": diffs, "real_mismatches": real_mismatches,
+        "live_signal": live_signal, "backtest_signal": bt_sig,
+    }
+
+
+def _is_acceptable_short(field: str, live_v, bt_v) -> bool:
+    """check SHORT_KNOWN_ACCEPTABLE_DIFFS for masr_short field。"""
+    for key, info in SHORT_KNOWN_ACCEPTABLE_DIFFS.items():
+        if "masr_short" not in info.get("applies_to_strategy", []):
+            continue
+        if field not in info.get("fields", []):
+            continue
+        if "max_delta" in info:
+            try:
+                if abs(float(live_v) - float(bt_v)) <= info["max_delta"]:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        if "max_delta_pct" in info:
+            try:
+                if _is_within_tolerance_pct(float(live_v), float(bt_v),
+                                              info["max_delta_pct"]):
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+

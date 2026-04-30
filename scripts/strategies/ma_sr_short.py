@@ -1135,6 +1135,65 @@ class MaSrShortStrategy(BaseStrategy):
             f"S={sig_dict['support']:.4f} close={sig_dict['entry']:.4f} "
             f"regime={sig_dict['regime_mode']} 強度={sig_dict['score']}"
         )
+
+        # ── P12D：Shadow comparison（live vs backtest 訊號等價性）──
+        # 訊號產生時觸發 backtest path 比對（呼叫同 _v2_check_at_bar helper）。
+        # 因為 live + backtest 共用同 helper，理論上應 100% match；shadow 主要
+        # 偵測 cooldown drift / 未來 logic divergence 的早期警報。
+        if getattr(Config, "ENABLE_SHADOW_COMPARE", False):
+            try:
+                from shadow_runner import shadow_compare_signal_short
+                bar_time_for_shadow = (df_a["time"].iloc[bar_idx]
+                                        if "time" in df_a.columns else None)
+                live_sig_dict = {
+                    "direction": sig.side,
+                    "entry": sig.entry_price,
+                    "sl": sig.stop_loss,
+                    "tp1": sig.take_profit_1,
+                    "tp2": sig.take_profit_2,
+                    "score": sig.score,
+                }
+                shadow_res = shadow_compare_signal_short(
+                    strategy_name="masr_short",
+                    symbol=symbol,
+                    bar_time=bar_time_for_shadow,
+                    live_signal=live_sig_dict,
+                    df_klines_1h=df_a,
+                    df_klines_4h=df_4h,
+                    df_klines_1d=df_1d,
+                    df_btc_1d=df_btc_1d,
+                    df_btc_4h=df_btc_4h,
+                    in_cooldown=False,  # check_signal 已經過 cooldown gate
+                    variant=self.variant,
+                )
+                real_mm = shadow_res.get("real_mismatches", [])
+                if real_mm:
+                    log.error(
+                        f"[{symbol}] SHADOW SHORT REAL_MISMATCH "
+                        f"@ {bar_time_for_shadow}: {[d['field'] for d in real_mm]}"
+                    )
+                    try:
+                        from notifier import notify
+                        notify.error(
+                            f"⚠️ SHADOW SHORT MISMATCH [{symbol}]",
+                            extra=(f"bar_time={bar_time_for_shadow}\n"
+                                    f"variant={self.variant}\n"
+                                    f"fields={[d['field'] for d in real_mm]}\n"
+                                    f"live={live_sig_dict}\n"
+                                    f"bt={shadow_res.get('backtest_signal')}"),
+                        )
+                    except Exception as e:
+                        log.error(f"[{symbol}] notifier failed: {e}")
+                elif shadow_res.get("diffs"):
+                    log.info(
+                        f"[{symbol}] shadow short accept_diff: "
+                        f"{[(d['field'], d.get('classification')) for d in shadow_res['diffs']]}"
+                    )
+                else:
+                    log.debug(f"[{symbol}] shadow short exact match")
+            except Exception as e:
+                log.error(f"[{symbol}] shadow_compare_signal_short failed: {e}")
+
         return sig
 
     # ── P12D：on_position_close hook（cooldown 設定）─────────────
