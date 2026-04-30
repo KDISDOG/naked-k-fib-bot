@@ -3610,6 +3610,188 @@ def print_stats(trades: list, timeframe: str, symbol: str,
 
 
 # ── 主回測邏輯 ───────────────────────────────────────────────────
+def _build_nkf_ctx(df_tf: pd.DataFrame, df_daily: pd.DataFrame,
+                    engine: "BacktestSignalEngine") -> dict:
+    """
+    Pre-compute daily-side 重複計算（swing 列表 / EMA20/50 / 對映表），
+    讓 _check_on_bar_vectorized 用 daily_idx 一次 O(1) 查到所需值。
+
+    取代原 run_backtest main loop 內三個 O(n²) 點：
+      1. df_slice = df_tf.iloc[:i+1].copy() → 完全移除（不需要切，pattern 等
+         method 本來就只看 tail(10/20)，可在 vectorized 函式內傳 view）
+      2. df_d_slice = df_daily[time<=bar_time].copy() → 用 np.searchsorted 算 idx
+      3. _get_latest_swing_pair(df_daily) 內部 _find_swing_fractal 全段 loop
+         → 整段 df_daily 上 fractal 一次掃完 + 預算 pair_at_j[j] 對映
+    """
+    lr = engine.fractal_lr
+
+    # daily fractal swings — 一次掃完全段
+    swings = engine._find_swing_fractal(df_daily, left=lr, right=lr)
+    swings_sorted = sorted(swings, key=lambda s: s["idx"])
+
+    # 對每個 daily 索引 j（=切片長度-1），找出最新有效 swing pair
+    # 原邏輯：slice 長度 J 內含 swing 條件為 idx + right < J；
+    # daily_idx=j 對應 slice 長度 J=j+1；故 swing idx <= j - right 才被算入。
+    n_daily = len(df_daily)
+    pair_at_j: list = [None] * n_daily
+    last_high = None
+    last_low = None
+    swing_ptr = 0
+    for j in range(n_daily):
+        while (swing_ptr < len(swings_sorted)
+                and swings_sorted[swing_ptr]["idx"] <= j - lr):
+            s = swings_sorted[swing_ptr]
+            if s["type"] == "high":
+                last_high = s
+            else:
+                last_low = s
+            swing_ptr += 1
+        if last_high and last_low:
+            trend = "up" if last_low["idx"] < last_high["idx"] else "down"
+            pair_at_j[j] = (last_high["price"], last_low["price"], trend)
+
+    # daily EMA — 全段一次
+    ema20_d = ta.ema(df_daily["close"], length=20)
+    ema50_d = ta.ema(df_daily["close"], length=50)
+
+    return {
+        "tf_time": df_tf["time"].values,
+        "tf_close": df_tf["close"].values,
+        "tf_volume": df_tf["volume"].values,
+        "daily_time": df_daily["time"].values,
+        "daily_close": df_daily["close"].values,
+        "daily_ema20": ema20_d.values if ema20_d is not None else None,
+        "daily_ema50": ema50_d.values if ema50_d is not None else None,
+        "pair_at_j": pair_at_j,
+    }
+
+
+def _check_on_bar_vectorized(
+    engine: "BacktestSignalEngine",
+    ctx: dict,
+    i: int,
+    df_tf: pd.DataFrame,
+    df_daily: pd.DataFrame,
+    timeframe: str,
+):
+    """
+    向量化版 BacktestSignalEngine.check_on_bar：用 ctx 預算的資料 + 不切 df。
+
+    輸出與原 check_on_bar 完全一致（同一 Signal 物件 / None），
+    主要差別：每根 K 棒只 O(1) 查表，迴圈內無 .copy()，無 df_daily filter。
+    """
+    from signal_engine import Signal as _Signal
+
+    if i + 1 < 50:   # 對應原版「len(df) < 50 return」
+        return None
+
+    # 對應原版 daily slice 長度（= daily_idx + 1） >= 20 才放行
+    tf_t = ctx["tf_time"][i]
+    daily_idx = int(np.searchsorted(ctx["daily_time"], tf_t, side="right") - 1)
+    if daily_idx + 1 < 20:
+        return None
+
+    # latest swing pair
+    pair = ctx["pair_at_j"][daily_idx]
+    if pair is None:
+        return None
+    swing_h, swing_l, swing_trend = pair
+    if swing_h <= swing_l:
+        return None
+
+    # fib levels
+    fib_levels = engine._calc_fib(swing_h, swing_l)
+    price = float(ctx["tf_close"][i])
+    fib_hit = engine._price_near_fib(price, fib_levels)
+    if not fib_hit:
+        return None
+    if engine._skip_bad_fib and fib_hit in engine._bad_fib_levels:
+        return None
+
+    # direction（仿 _determine_direction，全段預算 EMA + 查 daily_idx）
+    e20 = ctx["daily_ema20"]
+    e50 = ctx["daily_ema50"]
+    if e20 is None or e50 is None:
+        direction = "LONG" if swing_trend == "up" else "SHORT"
+    else:
+        ema20_v = e20[daily_idx]
+        ema50_v = e50[daily_idx]
+        d_close = float(ctx["daily_close"][daily_idx])
+        if pd.isna(ema20_v) or pd.isna(ema50_v):
+            direction = "LONG" if swing_trend == "up" else "SHORT"
+        else:
+            htf_bullish = (d_close > ema20_v) and (ema20_v > ema50_v)
+            htf_bearish = (d_close < ema20_v) and (ema20_v < ema50_v)
+            if swing_trend == "up" and htf_bullish:
+                direction = "LONG"
+            elif swing_trend == "down" and htf_bearish:
+                direction = "SHORT"
+            else:
+                return None
+
+    # 以下 method 都吃 df，但原本就是 tail(10/20/3) 等小尾段，
+    # 直接傳 view（df_tf.iloc[:i+1]）不 copy。
+    df_view = df_tf.iloc[:i + 1]
+
+    if engine._swing_structure_broken(df_view, direction, swing_h, swing_l):
+        return None
+
+    fib_price = fib_levels.get(fib_hit)
+    if fib_price and not engine._is_fib_fresh(df_view, fib_price):
+        return None
+
+    pattern_result = engine._detect_pattern(df_view, direction)
+    if not pattern_result:
+        return None
+    pattern_name, pattern_strength = pattern_result
+
+    if not engine._volume_confirmed(df_view, period=20, ratio=engine._vol_mult):
+        return None
+    if not engine._skip_vol_rise and not engine._volume_rising(df_view):
+        return None
+
+    tp_sl = engine._calc_fib_tp_sl(direction, fib_hit, swing_h, swing_l)
+    if direction == "LONG":
+        if tp_sl["sl"] >= price or tp_sl["tp1"] <= price:
+            return None
+    else:
+        if tp_sl["sl"] <= price or tp_sl["tp1"] >= price:
+            return None
+
+    vol_score = engine._volume_ratio_score(df_view, period=20)
+    exhaustion_bonus = 0
+    if direction == "LONG" and engine._volume_exhaustion_long(df_view):
+        exhaustion_bonus = 1
+    elif direction == "SHORT" and engine._volume_exhaustion_short(df_view):
+        exhaustion_bonus = 1
+
+    btc_weekly_penalty = 0
+    score = (
+        pattern_strength
+        + (1 if float(fib_hit) == 0.618 else 0)
+        + (1 if swing_trend == ("up" if direction == "LONG" else "down") else 0)
+        + vol_score
+        + exhaustion_bonus
+        + btc_weekly_penalty
+    )
+    score = max(0, min(5, score))
+
+    return _Signal(
+        symbol="BT",
+        direction=direction,
+        entry=price,
+        sl=tp_sl["sl"],
+        tp1=tp_sl["tp1"],
+        tp2=tp_sl["tp2"],
+        fib_level=fib_hit,
+        pattern=pattern_name,
+        score=score,
+        timeframe=timeframe,
+        swing_high=swing_h,
+        swing_low=swing_l,
+    )
+
+
 def run_backtest(client: Client, symbol: str, timeframe: str,
                  months: int, max_bars: int = 48) -> list:
 
@@ -3638,6 +3820,9 @@ def run_backtest(client: Client, symbol: str, timeframe: str,
         skip_bad_fib  = False,   # 同正式：不跳過任何 Fib 位
     )
 
+    print(f"  預計算 NKF context（vectorized）...", end="", flush=True)
+    ctx = _build_nkf_ctx(df_tf, df_daily, engine)
+    print(" 完成")
     print(f"  掃描 {len(df_tf) - warmup} 根 K 棒...", end="", flush=True)
 
     for i in range(warmup, len(df_tf) - 1):
@@ -3645,17 +3830,9 @@ def run_backtest(client: Client, symbol: str, timeframe: str,
         if i <= cooldown_until:
             continue
 
-        # 當根已收盤 → 用截至當根的資料檢查訊號
-        df_slice  = df_tf.iloc[:i + 1].copy().reset_index(drop=True)
-
-        # daily 同步截到當根時間
-        bar_time = df_tf["time"].iloc[i]
-        df_d_slice = df_daily[df_daily["time"] <= bar_time].copy().reset_index(drop=True)
-        if len(df_d_slice) < 20:
-            continue
-
         try:
-            sig = engine.check_on_bar(df_slice, df_d_slice, len(df_slice) - 1, timeframe)
+            sig = _check_on_bar_vectorized(engine, ctx, i, df_tf,
+                                            df_daily, timeframe)
         except Exception:
             continue
 
@@ -3668,6 +3845,7 @@ def run_backtest(client: Client, symbol: str, timeframe: str,
             continue
 
         # 建立模擬交易
+        bar_time = df_tf["time"].iloc[i]
         trade = BtTrade(
             symbol    = symbol,
             direction = sig.direction,
