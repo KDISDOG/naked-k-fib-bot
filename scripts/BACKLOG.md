@@ -80,7 +80,43 @@ all_symbols = [
 
 ---
 
-## 4. Score `ADX bonus` live vs backtest divergence
+## 4. MASR Short v2: cooldown drift between live and backtest
+
+**發現於**：P12B 等價驗證 (commit 710a550)；6/6 verifier runs PASS 但 live signal 量比 backtest 多 30-60%。
+
+**觀察**：相同 logic 下，live helper emit 的 signals 數比 backtest 多很多——全部差距由 `cooldown_acc` 解釋（backtest 主迴圈在 SL trade 後設 `cooldown_until = close_bar + COOLDOWN_BARS`，從下一根 bar 開始 skip；live 的 `_v2_check_at_bar` helper 沒有 cooldown 概念）。
+
+| Run | bt signals | live signals | Δ % | cooldown_acc |
+|-----|-----------:|-------------:|----:|-------------:|
+| slow BTC | 23 | 26 | +13% | 3 |
+| slow ETH | 34 | 48 | +41% | 14 |
+| slow SOL | 13 | 22 | +69% | 9 |
+| fast BTC | 40 | 58 | +45% | 18 |
+| fast ETH | 58 | 94 | +62% | 36 |
+| fast SOL | 20 | 33 | +65% | 13 |
+
+live 真實環境會由 `bot_main._try_open_for_symbol` + `db.in_cooldown(symbol, COOLDOWN_BARS, bar_minutes=...)` 攔住，所以**「live 多出的 signals 在 production 不會真下單」**——但這個攔截是基於 DB cooldown 表，跟 backtest 主迴圈內建的 `cooldown_until` 不完全一致（DB cooldown 用 `bar_minutes` 換算成秒；backtest cooldown 直接用 bar 數）。
+
+**含意**：
+- P12C sweep / audit 用 backtest path 算 PnL → **不含**多出的 30-60% trade。adj_pnl 反映的是「backtest cooldown 模型下的表現」，不是 live 真實表現。
+- 多出的 trade 是否賠錢未知 → live 實際 PnL 可能比 sweep 預期低（如果 live cooldown 比 backtest 短、額外 trade 賠錢）。
+- 也可能比預期高（如果 live cooldown 更積極、額外 trade 反而被擋掉）。
+
+**何時 revisit**：P12D shadow integration。
+
+**做法**：
+1. shadow runner 比對 live 訊號發生點 vs backtest 是否處於 cooldown 區間；
+2. 若 live 在 backtest cooldown 區間內仍下單 → log + warning（real_mismatch 變種）；
+3. 收集 1-2 週 testnet paper 數據，比對 live 實際 cooldown skip rate vs backtest 預期。
+
+**最終決定**（P12D 完成後）：
+- 把 backtest cooldown 同步到 live（推薦：以 backtest 為準，live 端在 strategy.check_signal 內加同樣的 cooldown 檢查）
+- 或者反向：把 backtest 改用 bot_main 的 db-based cooldown 模型——但這會讓 backtest 失去 stateless 性質
+- 或者接受 drift：把 live cooldown 作為「另一層 risk gate」，backtest 結果視為「上界」而非「準確」
+
+---
+
+## 5. Score `ADX bonus` live vs backtest divergence
 
 **發現於**：Phase 1 recon §1.3.E 第 3 點
 
