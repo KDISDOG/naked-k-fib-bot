@@ -824,22 +824,27 @@ def _v2_check_at_bar(
             if dist_e200 < -max_dist_e200:
                 return None
 
-    # ── ATR 過熱 ─────────────────────────────────────────────────
-    atr_window = atr_s.iloc[bar_idx_1h - lookback + 1:bar_idx_1h + 1]
-    atr_q = float(atr_window.quantile(0.80))
-    if atr_v >= atr_q:
-        return None
-
     # ── SL / TP（SHORT）─────────────────────────────────────────
+    # 注意：mirror backtest v2 (line 3072-3088) — fast 用 i 收盤、slow 用 i+1
+    # 收盤當 entry。entry_time 也跟著對齊。backtest v2 沒有 ATR 過熱前置 check
+    # （v1 才有），所以本 helper 也不加。
     sl_atr_mult = float(Config.MASR_SHORT_SL_ATR_MULT)
-    sl = cur_close + sl_atr_mult * atr_v
-    if sl <= cur_close:
+    if variant == "slow":
+        entry_idx = bar_idx_1h + 1
+        entry = float(df_1h["close"].iloc[entry_idx])
+        entry_time = df_1h["time"].iloc[entry_idx]
+    else:
+        entry_idx = bar_idx_1h
+        entry = cur_close
+        entry_time = bar_time
+    sl = entry + sl_atr_mult * atr_v
+    if sl <= entry:
         return None
-    sl_dist = sl - cur_close
+    sl_dist = sl - entry
     tp1_rr = float(Config.MASR_SHORT_TP1_RR)
     tp2_rr = float(Config.MASR_SHORT_TP2_RR)
-    tp1 = cur_close - tp1_rr * sl_dist
-    tp2 = cur_close - tp2_rr * sl_dist
+    tp1 = entry - tp1_rr * sl_dist
+    tp2 = entry - tp2_rr * sl_dist
     if tp1 <= 0 or tp2 <= 0:
         return None
 
@@ -860,7 +865,9 @@ def _v2_check_at_bar(
 
     return {
         "direction": "SHORT",
-        "entry": cur_close,
+        "entry": entry,                 # fast: closes[i]; slow: closes[i+1]
+        "entry_time": entry_time,       # match backtest open_time exactly
+        "entry_idx": entry_idx,         # for verifier alignment
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -1049,14 +1056,10 @@ class MaSrShortStrategy(BaseStrategy):
         if len(df_a) < int(Config.MASR_SHORT_RES_LOOKBACK) + 3:
             return None
 
-        # slow variant 在 df_a 上需要 i+1 → 用倒數第三根當「i」
-        # 但 _v2_check_at_bar 期望 bar_idx 本身是「目標 bar」，i+1 從 df 拿
-        # 所以給 df_1h（含 forming bar）+ bar_idx = len(df_a) - 1（即 closed bar）
-        # df_1h.iloc[bar_idx+1] = forming bar 的 close（live 還沒收盤）
-        # → slow variant 在 live 必須等 forming bar 也收盤才能 trigger
-        # 解：給 df_a（不含 forming），bar_idx = len(df_a) - 2（倒數第二的已收盤）
-        # 這樣 i+1 = len(df_a) - 1 = 上一根已收盤 bar
-        # 但這意味著 slow signal 在 live 比 fast 晚 1 根 1H 觸發
+        # slow variant 需要 bar_idx 跟 bar_idx+1 兩根已收盤 → 給 df_a（不含
+        # forming bar），bar_idx = len(df_a) - 2 即倒數第二根（i+1 為倒數第一根，
+        # 兩根都已收盤）。這意味著 slow live signal 比 fast 晚 1 根 1H 觸發。
+        # 對齊 backtest 的 range(warmup, len(df_tf) - 2)：實質範圍相同。
         if self.variant == "slow":
             bar_idx = len(df_a) - 2
             if bar_idx < 60:
