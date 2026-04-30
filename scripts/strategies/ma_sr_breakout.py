@@ -389,6 +389,58 @@ class MaSrBreakoutStrategy(BaseStrategy):
             f"[{symbol}] MASR 訊號：LONG R={resistance:.4f} "
             f"close={cur_close:.4f} EMA20={ema20_v:.4f} 強度={score}"
         )
+
+        # ── P10 phase 3：Shadow comparison（live vs backtest 訊號等價性）──
+        # 訊號產生時觸發 backtest path 跑同一根 K 線，比對 entry/SL/TP/score。
+        # real_mismatch (不在 KNOWN_ACCEPTABLE_DIFFS 內) → notifier 警報 +
+        # 寫 reports/shadow_diffs/<sym>_<bar_time>.json。
+        # 任何 exception 都吞掉，不阻塞 live 訊號。
+        if getattr(Config, "ENABLE_SHADOW_COMPARE", False):
+            try:
+                from shadow_runner import shadow_compare_signal
+                bar_time = df_a["time"].iloc[-1] if "time" in df_a.columns else None
+                live_sig_dict = {
+                    "direction": sig.side,
+                    "entry": sig.entry_price,
+                    "sl": sig.stop_loss,
+                    "tp1": sig.take_profit_1,
+                    "tp2": sig.take_profit_2,
+                    "score": sig.score,
+                }
+                shadow_res = shadow_compare_signal(
+                    strategy_name="masr",
+                    symbol=symbol,
+                    bar_time=bar_time,
+                    live_signal=live_sig_dict,
+                    df_klines_4h=df_a,
+                )
+                real_mm = shadow_res.get("real_mismatches", [])
+                if real_mm:
+                    log.error(
+                        f"[{symbol}] SHADOW REAL_MISMATCH @ {bar_time}: "
+                        f"{[d['field'] for d in real_mm]}"
+                    )
+                    try:
+                        from notifier import notify
+                        notify.error(
+                            f"⚠️ SHADOW MISMATCH [{symbol}]",
+                            extra=(f"bar_time={bar_time}\n"
+                                    f"fields={[d['field'] for d in real_mm]}\n"
+                                    f"live={live_sig_dict}\n"
+                                    f"bt={shadow_res.get('backtest_signal')}"),
+                        )
+                    except Exception as e:
+                        log.error(f"[{symbol}] notifier failed: {e}")
+                elif shadow_res.get("diffs"):
+                    log.info(
+                        f"[{symbol}] shadow accept_diff: "
+                        f"{[(d['field'], d.get('classification')) for d in shadow_res['diffs']]}"
+                    )
+                else:
+                    log.debug(f"[{symbol}] shadow exact match")
+            except Exception as e:
+                log.error(f"[{symbol}] shadow_compare_signal failed: {e}")
+
         return sig
 
     # ── 找關鍵阻力位 ──────────────────────────────────────────────
