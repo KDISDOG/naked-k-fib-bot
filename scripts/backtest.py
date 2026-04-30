@@ -1547,6 +1547,16 @@ def run_backtest_mr(client: Client, symbol: str, months: int,
     指標在完整 DataFrame 上一次性計算（矢量化，O(n) 代替原 O(n²)）。
     超時平倉：MR_TIMEOUT_BARS 根後強制平倉。
     """
+    # === Feature filter（backtest only）────────────────────────
+    from feature_filter import should_skip_for_strategy, load_feature_filter_config
+    _ff_cfg = load_feature_filter_config()
+    if _ff_cfg["BACKTEST_USE_FEATURE_FILTERS"]:
+        _features = _load_coin_features(symbol)
+        _skip, _reason = should_skip_for_strategy("mr", symbol, _features)
+        if _skip:
+            print(f"\n[{symbol} MR] FILTERED: {_reason}")
+            return []
+    # ──────────────────────────────────────────────────────────
     tf = Config.MR_TIMEFRAME
     print(f"\n[{symbol} MR {tf}] 回測開始")
 
@@ -3862,6 +3872,16 @@ def _check_on_bar_vectorized(
 
 def run_backtest(client: Client, symbol: str, timeframe: str,
                  months: int, max_bars: int = 48) -> list:
+    # === Feature filter（backtest only，NKF）────────────────────
+    from feature_filter import should_skip_for_strategy, load_feature_filter_config
+    _ff_cfg = load_feature_filter_config()
+    if _ff_cfg["BACKTEST_USE_FEATURE_FILTERS"]:
+        _features = _load_coin_features(symbol)
+        _skip, _reason = should_skip_for_strategy("nkf", symbol, _features)
+        if _skip:
+            print(f"\n[{symbol} NKF] FILTERED: {_reason}")
+            return []
+    # ──────────────────────────────────────────────────────────
 
     print(f"\n[{symbol} {timeframe}] 回測開始")
 
