@@ -60,6 +60,11 @@ class Config:
     # 可選：naked_k_fib / mean_reversion / all
     ACTIVE_STRATEGY  = os.getenv("ACTIVE_STRATEGY", "all")
 
+    # ── Shadow comparison（live vs backtest 訊號等價性監控）──────
+    # 訊號產生時觸發 shadow_runner.shadow_compare_signal 比對；real_mismatch
+    # 會發 notifier 警報。testnet 預設 ON，prod 穩定後可關。
+    ENABLE_SHADOW_COMPARE = os.getenv("ENABLE_SHADOW_COMPARE", "true").lower() == "true"
+
     # ── 資料庫 ───────────────────────────────────────────────────
     DB_PATH = os.getenv("DB_PATH", "bot_state.db")
 

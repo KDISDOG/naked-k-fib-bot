@@ -28,6 +28,38 @@ from typing import Optional, Iterable
 
 log = logging.getLogger("feature_filter")
 
+# ── 純名稱判定 asset_class（不依賴 cache，給 live 路徑用）──────────
+# P10 phase 2：live screen_coins 走 startswith prefix 判定，避免依賴
+# coin_features pickle（39m 歷史，新幣不在裡面 → 無法 lookup）
+# coin_features.classify_asset 也有類似函式，但用 base==exact 比對；
+# 這裡用 startswith 涵蓋變種（如 XAUTUSDT 也視為 cfd-related）。
+_CFD_PREFIXES = ("XAU", "XAG", "CL", "CO", "NG")
+_MEME_PREFIXES = ("DOGE", "1000PEPE", "1000SHIB", "FLOKI", "BONK", "PEPE", "SHIB")
+_MAJOR_PREFIXES = ("BTC", "ETH")
+
+
+def classify_asset(symbol: str) -> str:
+    """純名稱判定 asset_class，純函式（給 live screen_coins 用）。
+    回傳 ∈ {"cfd", "meme", "crypto_major", "crypto_alt", "unknown"}。
+    fail-open semantics：無法判定 → "unknown"，caller 用 `in [excluded]` 判斷，
+    "unknown" 不會在 list 內 → 自動 pass。
+    """
+    if not symbol:
+        return "unknown"
+    s = symbol.upper()
+    for p in _CFD_PREFIXES:
+        if s.startswith(p):
+            return "cfd"
+    for p in _MEME_PREFIXES:
+        if s.startswith(p):
+            return "meme"
+    for p in _MAJOR_PREFIXES:
+        if s.startswith(p):
+            return "crypto_major"
+    if s.endswith("USDT"):
+        return "crypto_alt"
+    return "unknown"
+
 # ── 預設值與 P1 hardcoded rules（向後相容）────────────────
 _DEFAULTS = {
     "BACKTEST_USE_FEATURE_FILTERS": True,
@@ -44,6 +76,7 @@ _DEFAULTS = {
         {"feature": "asset_class", "op": "not_in", "threshold": ["cfd"]},
     ],
     "MASR_REQUIRE_ALL": True,
+    "MASR_EXCLUDE_ASSET_CLASSES": ["cfd"],  # 衍生欄位 default
     # NKF/MR：預設不 filter
     "NKF_RULES": [],
     "NKF_REQUIRE_ALL": True,
@@ -162,6 +195,16 @@ def load_feature_filter_config() -> dict:
             cfg["MASR_RULES"] = list(_DEFAULTS["MASR_RULES"])
     cfg["MASR_REQUIRE_ALL"] = _parse_bool(
         os.getenv("MASR_REQUIRE_ALL"), _DEFAULTS["MASR_REQUIRE_ALL"])
+
+    # 衍生：MASR_EXCLUDE_ASSET_CLASSES（給 live screen_coins 用的便利欄位）
+    # 從 MASR_RULES 抽 op="not_in" 的 asset_class threshold；找不到回 ["cfd"]
+    cfg["MASR_EXCLUDE_ASSET_CLASSES"] = _DEFAULTS["MASR_EXCLUDE_ASSET_CLASSES"]
+    for r in cfg["MASR_RULES"]:
+        if r.get("feature") == "asset_class" and r.get("op") == "not_in":
+            thr = r.get("threshold", [])
+            if isinstance(thr, list):
+                cfg["MASR_EXCLUDE_ASSET_CLASSES"] = thr
+                break
 
     # NKF
     cfg["NKF_RULES"] = _parse_rules_json(

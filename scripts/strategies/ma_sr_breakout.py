@@ -1,6 +1,37 @@
 """
 ma_sr_breakout.py — MA + 水平支撐阻力突破策略
 
+────────────────────────────────────────────────────────────────────────
+P10 phase 2 變更（2026-04-30）
+────────────────────────────────────────────────────────────────────────
+1. .env.example 套 P4 sweep 後保守版 config（stability-adjusted #1）：
+     MASR_RES_LOOKBACK     100 → 50
+     MASR_RES_TOL_ATR_MULT 0.3 → 0.2
+     MASR_TP1_RR           2.0 → 1.5
+     MASR_SL_ATR_MULT      1.5 → 2.0
+   證據：reports/p4_masr_sweep_20260430_1740.md
+         reports/audit_masr_top3_*.md（三段全正 / wr_std 2.4pp / min_n 267 → ROBUST）
+   策略 code 邏輯本身不變；只是 .env 預設值改了。
+
+2. screen_coins() 加 cfd asset_class filter（hook 在最前，疊加不取代既有邏輯）：
+   原因：reports/p3a_cross_strategy_stability_*.md 確認 P1 cfd filter 對 MASR 有
+         「砍掉 XAU/XAG/CL」的預期效果，但 live 路徑沒接入 feature_filter。
+   實作：用 feature_filter.classify_asset(symbol) 做純名稱判定，asset_class
+         in MASR_EXCLUDE_ASSET_CLASSES 的幣直接從 candidates 移除。
+   fail-open：unknown asset_class（非 cfd/meme/major/alt）放行；cache 失敗放行。
+
+3. check_signal() 結尾接 shadow comparison hook（訊號產生時呼叫 backtest path
+   比對等價性，real_mismatch 發 notifier 警報）；ENABLE_SHADOW_COMPARE=true 預設。
+   詳見 scripts/shadow_runner.py + reports/p10_recon_*.md §1.3。
+
+backlog（不在這輪改）：scripts/BACKLOG.md
+  - TP1 後 SL 處理 live (ATR trailing) vs backtest (fixed BE) divergence
+  - Universe contract type whitelist
+  - MASR_MIN_BREAKOUT_PCT getattr fallback 寫法不一
+  - score ADX bonus live vs backtest divergence
+────────────────────────────────────────────────────────────────────────
+
+
 核心邏輯：
   在多頭趨勢中（日線 EMA50 > EMA200、價格 > EMA200），
   4h 級別找出近 100 根至少測試 2 次的水平阻力 R，
@@ -84,6 +115,36 @@ class MaSrBreakoutStrategy(BaseStrategy):
     # ── 選幣 ─────────────────────────────────────────────────────
     def screen_coins(self, candidates: List[str]) -> List[str]:
         from config import Config
+
+        # ── P10 phase 2：cfd asset_class filter（疊加在原 screen 之前）──
+        # 純名稱判定，無 cache 依賴；fail-open（unknown 視為 pass）。
+        # 證據：reports/p3a_cross_strategy_stability_*.md
+        try:
+            from feature_filter import classify_asset, load_feature_filter_config
+            ff_cfg = load_feature_filter_config()
+            excluded_classes = ff_cfg.get("MASR_EXCLUDE_ASSET_CLASSES", ["cfd"])
+        except Exception as e:
+            log.warning(f"[MASR screen] feature_filter 讀取失敗，cfd 過濾關閉: {e}")
+            excluded_classes = []
+
+        if excluded_classes:
+            pre_count = len(candidates)
+            after_cfd: list[str] = []
+            skipped: list[str] = []
+            for sym in candidates:
+                ac = classify_asset(sym)
+                if ac in excluded_classes:
+                    skipped.append(f"{sym}({ac})")
+                    continue
+                after_cfd.append(sym)
+            if skipped:
+                log.info(
+                    f"[MASR screen] cfd filter: {pre_count} → {len(after_cfd)} "
+                    f"({len(skipped)} skipped: {skipped[:5]}"
+                    f"{'...' if len(skipped) > 5 else ''})"
+                )
+            candidates = after_cfd
+
         scored: list[tuple[str, float]] = []
 
         # 嘗試從 client 取得交易對 onboardDate（過濾上市時間）
