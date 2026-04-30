@@ -20,10 +20,17 @@ HISTORY:
   本檔案的 MaSrShortV1Deprecated（純 archive，不註冊 bot_main / 不暴露為 live）。
   bot_main.py 透過 `from strategies.ma_sr_short import MaSrShortStrategy` 自動拿到 v2。
 
-  P12 audit 證據：
-    - v2_slow baseline: ROBUST, adj +24.15U
-    - v2_fast baseline: ROBUST, adj +11.66U
-    - default variant = "slow"（adj 高 ~2x）
+  Audit 證據:
+    - P12 audit (baseline config):
+      - v2_slow baseline: ROBUST, adj +24.15U
+      - v2_fast baseline: ROBUST, adj +11.66U
+    - P12C sweep 後 (LOOKBACK=150 / TOL=0.4 / TP1=1.5 / SL=2.5):
+      - v2_fast top3: ROBUST, adj +124.23U（wr_std 2.2pp 最低）
+      - v2_slow top1: ROBUST, adj +83.58U
+    - default variant = "fast"（P12C sweep 後參數下 fast 顯著領先）
+
+  Production config: P12C fast.top3 — 見 .env.example MASR_SHORT_* 區塊。
+  reports/p12c_masr_short_sweep_*.md / p12c5_config_apply_*.md
 
 ────────────────────────────────────────────────────────────────────────
 v2 規範摘要（active path）
@@ -888,7 +895,9 @@ class MaSrShortStrategy(BaseStrategy):
     audit: reports/p12_masr_short_diagnosis_*.md
       - v2_slow baseline: ROBUST (adj +24.15U)
       - v2_fast baseline: ROBUST (adj +11.66U)
-    default variant = "slow"（adj 顯著高於 fast）。
+      - P12C fast.top3 (LOOK=150/TOL=0.4/TP1=1.5/SL=2.5): ROBUST adj +124.23U
+    default variant = "fast"（P12C sweep 後 fast 顯著領先；
+    P12 baseline 階段 slow 較好但那是不同 config 的對比）。
     """
 
     def __init__(self, client: Client, market_ctx=None, db=None,
