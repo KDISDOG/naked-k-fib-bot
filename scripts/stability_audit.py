@@ -148,43 +148,63 @@ def audit_candidate_stability(
     candidate_id: str = "x",
     candidate_label: str = "",
     output_dir: Optional[Path] = None,
+    *,
+    mode: str = "filter",        # "filter" | "config_override"
+    config_overrides: Optional[dict] = None,   # mode="config_override" 時必填
 ) -> dict:
     """
-    對一條 candidate filter 跑 wf × symbols × months × n_segments，
-    回傳 metrics + status + 寫 markdown 報告。
+    對一條 candidate 做 wf × symbols × months × n_segments stability audit。
 
-    注意：filter 是透過 env vars + feature_filter 的「進場 fast skip」實作；
-    wf_runner 的 segment 切法是在 trades 上做 open_time 分段（fn 跑完一次後切），
-    所以兩者協作的方式是：fn 在 backtest 進場時被 filter 擋掉的 symbol → 0 trades；
-    沒被擋的 symbol → 全期 trades，再被 wf_runner 按時間切 3 段。
+    mode="filter" (預設，P2B-1.5/P3A 用法)：
+      candidate_rules 是 feature_filter 的 rule list；透過 env vars 注入，
+      backtest fn 進場時被 filter 擋掉的 symbol → 0 trades，沒被擋 →
+      全期 trades 再被 wf_runner 按 open_time 切段。
+
+    mode="config_override" (P4 用法)：
+      candidate_rules 不用，改傳 config_overrides dict（如 {"MASR_TP1_RR": 2.5}）；
+      透過 wf_runner 既有的 config_overrides 參數（內部用 ConfigPatch monkey-patch
+      Config class）改動策略行為再跑回測。filter 完全不啟用（避免雙重變因）。
+
+    回傳 metrics + status + 寫 markdown 報告。
     """
+    if mode not in ("filter", "config_override"):
+        raise ValueError(f"unknown mode: {mode}")
+
     output_dir = output_dir or (ROOT / "reports")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 注入 env
+    # 注入 env（filter mode）或保留 env（config_override mode 不動 filter）
     env_key_rules = f"{strategy.upper()}_RULES_JSON"
     env_key_req = f"{strategy.upper()}_REQUIRE_ALL"
-
     saved_env = {
         "BACKTEST_USE_FEATURE_FILTERS": os.environ.get("BACKTEST_USE_FEATURE_FILTERS"),
         env_key_rules: os.environ.get(env_key_rules),
         env_key_req: os.environ.get(env_key_req),
     }
     try:
-        if not candidate_rules:
-            # baseline：強制關 filter
+        if mode == "filter":
+            if not candidate_rules:
+                os.environ["BACKTEST_USE_FEATURE_FILTERS"] = "false"
+                os.environ.pop(env_key_rules, None)
+                os.environ.pop(env_key_req, None)
+            else:
+                os.environ["BACKTEST_USE_FEATURE_FILTERS"] = "true"
+                os.environ[env_key_rules] = json.dumps(candidate_rules)
+                os.environ[env_key_req] = "true" if rule_logic.upper() == "AND" else "false"
+            wf_kwargs = {}
+        else:  # config_override
+            # 強制關 filter，避免雙重變因
             os.environ["BACKTEST_USE_FEATURE_FILTERS"] = "false"
             os.environ.pop(env_key_rules, None)
             os.environ.pop(env_key_req, None)
-        else:
-            os.environ["BACKTEST_USE_FEATURE_FILTERS"] = "true"
-            os.environ[env_key_rules] = json.dumps(candidate_rules)
-            os.environ[env_key_req] = "true" if rule_logic.upper() == "AND" else "false"
+            if config_overrides is None:
+                raise ValueError("config_override mode requires config_overrides dict")
+            wf_kwargs = {"config_overrides": config_overrides}
 
-        # 對 strategy × all symbols 跑 wf
         wf = run_walk_forward(
             fn, client, symbols, months, n_segments=n_segments,
             config_label=f"audit_{strategy}_{candidate_id}_{int(time.time())}",
+            **wf_kwargs,
         )
     finally:
         # restore env
@@ -214,6 +234,8 @@ def audit_candidate_stability(
         "candidate_label": candidate_label,
         "candidate_rules": candidate_rules,
         "rule_logic": rule_logic,
+        "mode": mode,
+        "config_overrides": config_overrides,
         "metrics": metrics,
         "status": status,
         "status_reason": why,
