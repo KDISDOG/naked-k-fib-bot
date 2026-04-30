@@ -80,7 +80,71 @@ all_symbols = [
 
 ---
 
-## 4. MASR Short v2: cooldown drift between live and backtest
+## 4. ~~MASR Short v2: cooldown drift between live and backtest~~ ✅ RESOLVED (P12D)
+
+**狀態**：~~延後~~ → **2026-04-30 P12D 解決**
+
+**解決方式**：
+- backtest cooldown 邏輯（line 3151-3152）移植到 `strategies/ma_sr_short.py:on_position_close`
+- bot_main 加 strategy registry + dispatcher，`syncer/executor.set_post_close_callback()` 註冊
+- live `MaSrShortStrategy.check_signal` 加 cooldown gate（mirror backtest line 2972-2975）
+
+**驗證**：
+- `scripts/_verify_masr_short_cooldown.py` 3/3 PASS：BTC bt=42 live=42 / ETH bt=55 live=55 / SOL bt=17 live=17（cooldown 移植前 live 多 30-65%）
+- `scripts/_verify_shadow_initial_short.py` 7 syms × 365 days：260 signals 全部 exact match，1056 cooldown_rejected，0 real_mismatches
+
+**證據檔**：`reports/p12d_short_shadow_*.md` / `reports/p12d_cooldown_logic.md`
+
+---
+
+## 4-bis. MASR Long 也應加對稱 cooldown gate
+
+**發現於**：P12D 移植 short cooldown（2026-04-30）
+
+**現況**：
+- MASR Long (`strategies/ma_sr_breakout.py:MaSrBreakoutStrategy`) **沒有** `on_position_close` hook
+- bot_main 的 `_dispatch_position_close` 對 long 是 no-op（hasattr fallback）
+- backtest `run_backtest_masr` 的 cooldown 邏輯（line 2453）跟 short 結構相同，但 live 沒移植
+- 跟 short 有同樣的 cooldown drift（live 訊號可能多於 backtest）
+
+**為何延後**：
+- MASR Long 已上 testnet checklist（`docs/testnet_deploy.md`），動 long 會延後 testnet 進度
+- Long 的訊號量本來就少（4H timeframe），cooldown drift 影響相對小於 short（1H timeframe）
+- 等 short cooldown gate 經過 testnet paper 1-2 週證明穩定後，再對稱移植到 long
+
+**何時 revisit**：
+- short 上 testnet paper 1 週後（shadow_short_mismatch 持續 = 0）
+- 對稱方式：`MaSrBreakoutStrategy.__init__` 加 `_cooldown_until` dict，加 `on_position_close` 方法，docstring 標註「mirror MaSrShortStrategy.on_position_close 設計」
+
+---
+
+## 4-ter. .env.example 跟 config.py 雙處 default 對齊機制
+
+**發現於**：P12C.5 套 fast.top3 時觀察到（`MASR_SHORT_VARIANT` default 在
+config.py 跟 .env.example 兩處需手動同步），P12D 又觸發一次（`MASR_SHORT_COOLDOWN_BARS`）
+
+**現況**：
+- `scripts/config.py` 用 `os.getenv(NAME, default)` 設 fallback default
+- `.env.example` 是 user-facing 文件，列「建議值」
+- 兩處的 default value 需要手動同步——但這個契約沒有 enforcement
+
+**為何延後**：
+- 不是 bug，是 maintenance pain
+- 每加新 env 變數需要小心不要 drift
+- 檢查機制可以是單元測試或 commit hook
+
+**何時 revisit**：
+- 累積 3-5 個 drift 案例後再投資自動化檢查
+- 或加進 SKILL.md「加新 env 必須兩處同步」鐵律
+
+**做法**（未來）：
+1. 寫 `scripts/test_env_default_alignment.py` 用 regex parse 兩個檔案，比對 default 值
+2. 加進 pytest，CI 自動檢查
+3. 或 pre-commit hook
+
+---
+
+## 5. Score `ADX bonus` live vs backtest divergence
 
 **發現於**：P12B 等價驗證 (commit 710a550)；6/6 verifier runs PASS 但 live signal 量比 backtest 多 30-60%。
 
