@@ -27,6 +27,9 @@ _KLINE_TTL_MAP = {
     "1m": 20, "3m": 60, "5m": 90,
     "15m": 240, "30m": 480,
     "1h": 900, "2h": 1800, "4h": 3600,
+    # 日 K 線一天才更新一次，cache 6h；之前 fallback 60s 太短，每 scan 都 cache miss
+    # 對 long+short screener iterate 525 USDT 永續特別關鍵（避免 weight burst 2625+1050）
+    "1d": 21600,
 }
 
 

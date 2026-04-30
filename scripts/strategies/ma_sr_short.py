@@ -1014,7 +1014,10 @@ class MaSrShortStrategy(BaseStrategy):
                 if onboard_map and sym in onboard_map:
                     if onboard_map[sym] > listing_cutoff_ms:
                         continue
-                df_d = self._get_klines(sym, "1d", limit=35)
+                # 對齊 long screener limit=210 → MarketContext cache key 共用
+                # (sym, "1d", 210) 一個 fetch 兩支策略都拿；省 ~1050 weight/scan
+                # 短倉只用 .tail(30) 計算，多抓的 K 線在 wire 上免費
+                df_d = self._get_klines(sym, "1d", limit=210)
                 if len(df_d) < 30:
                     continue
                 avg_qav = float(df_d["qav"].tail(30).mean())
