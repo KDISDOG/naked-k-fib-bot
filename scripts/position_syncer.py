@@ -38,11 +38,35 @@ class PositionSyncer:
         self.db       = db
         self.executor = executor
         self._sync_count = 0
+        # P12D：post-close callback（bot_main 註冊；用於 strategy.on_position_close）
+        # signature: (strategy_name: str, symbol: str, close_reason: str, close_time)
+        self._post_close_callback = None
         # 啟動時立刻掃一次孤兒單（清掉重啟前累積的殘留）
         try:
             self._sweep_orphan_orders()
         except Exception as e:
             log.error(f"啟動時孤兒單掃蕩失敗: {e}")
+
+    def set_post_close_callback(self, callback) -> None:
+        """P12D：bot_main 註冊 strategy.on_position_close dispatcher。
+        callback signature: (strategy_name, symbol, close_reason, close_time) -> None
+        callback 失敗不阻塞 sync 主流程（caller 自己 try/except）。
+        """
+        self._post_close_callback = callback
+
+    def _fire_close_hook(self, strategy_name: str, symbol: str,
+                          close_reason: str, close_time=None) -> None:
+        """P12D：fire post-close callback if registered。"""
+        if self._post_close_callback is None:
+            return
+        if close_time is None:
+            from datetime import datetime
+            close_time = datetime.now()
+        try:
+            self._post_close_callback(strategy_name, symbol,
+                                       close_reason or "", close_time)
+        except Exception as e:
+            log.error(f"[post_close hook] {strategy_name}/{symbol} failed: {e}")
 
     def sync(self):
         """主同步邏輯：比對 DB 和幣安實際倉位"""
@@ -179,6 +203,9 @@ class PositionSyncer:
                         fee          = fee,
                         partial      = False,
                         close_reason = reason,
+                    )
+                    self._fire_close_hook(
+                        trade.get("strategy", ""), symbol, reason,
                     )
                     # 通知淨盈虧：取 DB 累加後的 net_pnl（涵蓋 TP1/TP2/殘餘
                     # 所有 legs）。舊版用 realized_hint 只反映「最後一腿」，

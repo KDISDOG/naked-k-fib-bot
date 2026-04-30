@@ -28,6 +28,29 @@ class OrderExecutor:
         self.db     = db
         self.market_ctx = market_ctx     # 可選，用於 save_trade 時寫入市場脈絡
         self._symbol_info_cache: dict = {}
+        # P12D：post-close callback (bot_main 註冊；用於 strategy.on_position_close)
+        # signature: (strategy_name, symbol, close_reason, close_time)
+        self._post_close_callback = None
+
+    def set_post_close_callback(self, callback) -> None:
+        """P12D：bot_main 註冊 strategy.on_position_close dispatcher。"""
+        self._post_close_callback = callback
+
+    def _fire_close_hook(self, strategy_name: str, symbol: str,
+                          close_reason: str, close_time=None) -> None:
+        if self._post_close_callback is None:
+            return
+        if close_time is None:
+            from datetime import datetime
+            close_time = datetime.now()
+        try:
+            self._post_close_callback(strategy_name, symbol,
+                                       close_reason or "", close_time)
+        except Exception as e:
+            import logging
+            logging.getLogger("executor").error(
+                f"[post_close hook] {strategy_name}/{symbol} failed: {e}"
+            )
 
     # ── 精度處理 ─────────────────────────────────────────────────
 
@@ -843,6 +866,13 @@ class OrderExecutor:
 
             self.db.close_trade(trade_id, exit_price=exit_price or 0,
                                 close_reason=close_reason)
+            # P12D：fire post-close hook（cooldown gate / on_position_close dispatcher）
+            try:
+                _tr = self.db.get_trade_by_id(trade_id)
+                _strat = (_tr or {}).get("strategy", "") if _tr else ""
+            except Exception:
+                _strat = ""
+            self._fire_close_hook(_strat, symbol, close_reason or "")
             log.warning(
                 f"[{symbol}] 市價平倉（{close_reason}）：qty={abs_qty} @ {exit_price}"
             )

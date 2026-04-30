@@ -342,6 +342,10 @@ class Config:
     # P12C：live MASR_SHORT v2 variant 預設（sweep 後 fast 顯著領先：
     # fast.top3 ROBUST adj +124.23U vs slow.top1 +83.58U；wr_std 2.2pp vs 4.7pp）
     MASR_SHORT_VARIANT                = os.getenv("MASR_SHORT_VARIANT", "fast")  # fast | slow (live default)
+    # P12D：cooldown bars after raw SL（live 移植自 backtest cooldown_until 邏輯）
+    # 留空 → 0 → fallback 至 COOLDOWN_BARS；strategies/ma_sr_short.py:on_position_close
+    # 用 `getattr(Config, "MASR_SHORT_COOLDOWN_BARS", 0) or COOLDOWN_BARS`
+    MASR_SHORT_COOLDOWN_BARS          = int(os.getenv("MASR_SHORT_COOLDOWN_BARS", 0) or 0)
     # 分級大盤閾值
     MASR_SHORT_V2_STRONG_TIMEFRAME    = os.getenv("MASR_SHORT_V2_STRONG_TIMEFRAME", "1d")
     MASR_SHORT_V2_STRONG_FAST_EMA     = int(os.getenv("MASR_SHORT_V2_STRONG_FAST_EMA", 50))

@@ -132,6 +132,44 @@ shutdown_event = threading.Event()
 # CLI 覆蓋策略（由 --strategy 參數設定）
 _active_strategy_override: str | None = None
 
+# P12D：strategy registry by name（給 post-close hook dispatcher 用）
+_strategy_by_name = {
+    "naked_k_fib":      _nkf_strategy,
+    "mean_reversion":   _mr_strategy,
+    "breakdown_short":  _bd_strategy,
+    "momentum_long":    _ml_strategy,
+    "smc_sweep":        _smc_strategy,
+    "ma_sr_breakout":   _masr_strategy,
+    "ma_sr_short":      _masr_short_strategy,
+    "granville":        _granville_strategy,
+}
+
+
+def _dispatch_position_close(strategy_name: str, symbol: str,
+                              close_reason: str, close_time) -> None:
+    """P12D：syncer/executor 的 post-close callback。dispatch 到對應 strategy
+    的 on_position_close 方法（如有）。沒有 hook 的策略（e.g. MASR Long）
+    自動 no-op。
+    """
+    s = _strategy_by_name.get(strategy_name)
+    if s is None:
+        return
+    fn = getattr(s, "on_position_close", None)
+    if fn is None:
+        return  # strategy 沒實作 hook（e.g. MASR Long），no-op
+    try:
+        fn(symbol, close_reason, close_time)
+    except Exception as e:
+        log.error(
+            f"[strategy.on_position_close] {strategy_name}/{symbol} "
+            f"reason={close_reason} 失敗: {e}"
+        )
+
+
+# 註冊 callback 到 syncer + executor
+syncer.set_post_close_callback(_dispatch_position_close)
+executor.set_post_close_callback(_dispatch_position_close)
+
 # Regime 變化追蹤（啟動時填入、每次 check_signals 比對）
 _last_regime_state: dict = {"value": ""}
 

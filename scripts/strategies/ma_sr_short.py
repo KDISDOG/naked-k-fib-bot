@@ -905,16 +905,21 @@ class MaSrShortStrategy(BaseStrategy):
         self._client = client
         self._market_ctx = market_ctx
         self._db = db
-        # variant from arg or env (default slow per P12 audit)
+        # variant from arg or env (default fast per P12C sweep)
         from config import Config
         v = (variant
               or getattr(Config, "MASR_SHORT_VARIANT", None)
-              or "slow").lower()
+              or "fast").lower()
         if v not in ("slow", "fast"):
-            log.warning(f"[MASR_SHORT] 未知 variant={v}，fallback slow")
-            v = "slow"
+            log.warning(f"[MASR_SHORT] 未知 variant={v}，fallback fast")
+            v = "fast"
         self.variant = v
-        log.info(f"[MASR_SHORT] init variant={self.variant}")
+        # === P12D：cooldown 狀態（per-symbol Timestamp）─────────
+        # 移植自 backtest.py:run_backtest_masr_short_v2 line 3151-3152
+        # 觸發條件：raw SL trade 結束（非 BE）；duration = COOLDOWN_BARS × timeframe
+        # 詳見 reports/p12d_cooldown_logic.md
+        self._cooldown_until: dict[str, "pd.Timestamp"] = {}
+        log.info(f"[MASR_SHORT] init variant={self.variant} (cooldown gate enabled)")
 
     @property
     def name(self) -> str:
@@ -1039,6 +1044,7 @@ class MaSrShortStrategy(BaseStrategy):
     def check_signal(self, symbol: str) -> Optional[Signal]:
         """逐行對應 backtest.run_backtest_masr_short_v2 的 per-bar 邏輯。
         透過共用 _v2_check_at_bar helper 確保 live 與 backtest 等價。
+        含 P12D cooldown gate：raw SL 後 COOLDOWN_BARS × timeframe 時間內不下單。
         """
         from config import Config
 
@@ -1054,6 +1060,18 @@ class MaSrShortStrategy(BaseStrategy):
         except Exception as e:
             log.warning(f"[{symbol}] MASR_SHORT K 線取得失敗: {e}")
             return None
+
+        # === P12D：cooldown gate（raw SL 後 COOLDOWN_BARS × timeframe）───
+        # mirror backtest.py:run_backtest_masr_short_v2 line 2972-2975 的
+        # `if i <= cooldown_until: continue`
+        if len(df_1h) >= 2:
+            bar_time = pd.Timestamp(df_1h["time"].iloc[-2])  # 倒數第二根 = 已收盤目標 bar
+            cooldown_end = self._cooldown_until.get(symbol)
+            if cooldown_end is not None and bar_time <= cooldown_end:
+                log.debug(
+                    f"[{symbol}] MASR_SHORT cooldown 中（直到 {cooldown_end}）"
+                )
+                return None
 
         if (len(df_1h) < int(Config.MASR_SHORT_RES_LOOKBACK) + 5
                 or len(df_4h) < 50 or len(df_1d) < 30
@@ -1118,3 +1136,48 @@ class MaSrShortStrategy(BaseStrategy):
             f"regime={sig_dict['regime_mode']} 強度={sig_dict['score']}"
         )
         return sig
+
+    # ── P12D：on_position_close hook（cooldown 設定）─────────────
+    def on_position_close(self, symbol: str, exit_reason: str,
+                           exit_time) -> None:
+        """部位關閉後 hook：mirror backtest.py:run_backtest_masr_short_v2
+        line 3151-3152 的 `if "SL" in result and "BE" not in result:
+        cooldown_until = trade.close_bar + COOLDOWN_BARS`。
+
+        只在 raw SL 觸發 cooldown；TP1+TP2 / TIMEOUT / BE / SL+BE 不觸發。
+        cooldown duration = COOLDOWN_BARS × timeframe minutes（fallback to
+        `Config.COOLDOWN_BARS=6` if MASR_SHORT_COOLDOWN_BARS unset, mirror
+        backtest 用同一 const）。
+
+        Args:
+            symbol: 部位幣種
+            exit_reason: 關閉原因 string，常見：'SL', 'TP1+TP2', 'TP1+SL',
+                         'TP1+BE', 'TIMEOUT', 'MANUAL'
+            exit_time: 部位關閉時刻（pd.Timestamp 或 datetime）
+        """
+        if not exit_reason:
+            return
+        # 只在 raw SL 觸發 cooldown（mirror backtest）
+        # "SL" 必須在 result 內，但 "BE" 不可在 result 內
+        if "SL" not in exit_reason or "BE" in exit_reason:
+            return
+        from config import Config
+        # 預設取 MASR_SHORT_COOLDOWN_BARS；fallback 至通用 COOLDOWN_BARS
+        cooldown_bars = int(getattr(Config, "MASR_SHORT_COOLDOWN_BARS", 0)) \
+                          or int(getattr(Config, "COOLDOWN_BARS", 6))
+        # 換算 timeframe 分鐘數
+        tf = (Config.MASR_SHORT_TIMEFRAME or "1h").lower()
+        tf_min_map = {"1m": 1, "3m": 3, "5m": 5, "15m": 15,
+                      "30m": 30, "1h": 60, "2h": 120, "4h": 240, "1d": 1440}
+        tf_min = tf_min_map.get(tf, 60)
+        try:
+            t = pd.Timestamp(exit_time)
+        except Exception as e:
+            log.warning(f"[{symbol}] on_position_close: 無法 parse exit_time={exit_time}: {e}")
+            return
+        cooldown_end = t + pd.Timedelta(minutes=cooldown_bars * tf_min)
+        self._cooldown_until[symbol] = cooldown_end
+        log.info(
+            f"[{symbol}] MASR_SHORT cooldown 設定 → 直到 {cooldown_end} "
+            f"(reason={exit_reason}, bars={cooldown_bars} × {tf})"
+        )
