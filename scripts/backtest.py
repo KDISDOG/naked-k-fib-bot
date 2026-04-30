@@ -262,6 +262,44 @@ def _regime_allows(regime: str, strategy: str) -> bool:
     return False
 
 
+# ── Coin features helper（給 feature_filter 用）──────────────────
+# 從 .cache/coin_features_<months>m.pkl 讀對應 row。
+# 輕量：每次呼叫都重讀 pickle（TTL 7 天 by coin_features.py）。
+# 找不到檔案或找不到 symbol → None（fail-open，feature_filter 會放行）
+_COIN_FEATURES_CACHE: dict[str, dict] = {}
+
+
+def _load_coin_features(symbol: str, months: int = 39) -> Optional[dict]:
+    """讀 .cache/coin_features_{months}m.pkl 對應 symbol 的 row。
+    in-process cache 一份，避免每次 backtest fn 都讀 disk。
+    無檔案 / 無該 symbol / 讀取失敗 → None。
+    """
+    cache_key = f"{months}m::{symbol}"
+    if cache_key in _COIN_FEATURES_CACHE:
+        return _COIN_FEATURES_CACHE[cache_key]
+
+    pkl = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", ".cache", f"coin_features_{months}m.pkl",
+    )
+    if not os.path.exists(pkl):
+        _COIN_FEATURES_CACHE[cache_key] = None
+        return None
+    try:
+        df = pd.read_pickle(pkl)
+        row = df[df["symbol"] == symbol]
+        if row.empty:
+            _COIN_FEATURES_CACHE[cache_key] = None
+            return None
+        feat = row.iloc[0].to_dict()
+        _COIN_FEATURES_CACHE[cache_key] = feat
+        return feat
+    except Exception as e:
+        logging.warning(f"[_load_coin_features] {symbol}: {e}")
+        _COIN_FEATURES_CACHE[cache_key] = None
+        return None
+
+
 # ── K 線下載（幣安期貨）+ 雙層 cache ────────────────────────────
 # Tier 1：in-process dict（同一 process 內 instant hit）
 # Tier 2：parquet 檔案（跨 session 持久化，避免被 IP-ban 後重跑要重抓）
@@ -1028,6 +1066,16 @@ def run_backtest_bd(client: Client, symbol: str, months: int, *,
     指標在完整 DataFrame 上一次性計算（向量化 O(n)）。
     只做空：跌破近 N 根最低點 + 放量 + 空頭結構。
     """
+    # === Feature filter（backtest only）────────────────────────
+    from feature_filter import should_skip_for_strategy, load_feature_filter_config
+    _ff_cfg = load_feature_filter_config()
+    if _ff_cfg["BACKTEST_USE_FEATURE_FILTERS"]:
+        _features = _load_coin_features(symbol)
+        _skip, _reason = should_skip_for_strategy("bd", symbol, _features)
+        if _skip:
+            print(f"\n[{symbol} BD] FILTERED: {_reason}")
+            return []
+    # ──────────────────────────────────────────────────────────
     tf = Config.BD_TIMEFRAME
     print(f"\n[{symbol} BD {tf}] 回測開始")
 
@@ -1790,6 +1838,16 @@ def run_backtest_smc(client: Client, symbol: str, months: int,
     SMC 不依賴 regime（與 NKF 一樣特權）；regime_series 參數保留為
     對齊其他策略的呼叫簽名，實際不擋。
     """
+    # === Feature filter（backtest only）────────────────────────
+    from feature_filter import should_skip_for_strategy, load_feature_filter_config
+    _ff_cfg = load_feature_filter_config()
+    if _ff_cfg["BACKTEST_USE_FEATURE_FILTERS"]:
+        _features = _load_coin_features(symbol)
+        _skip, _reason = should_skip_for_strategy("smc", symbol, _features)
+        if _skip:
+            print(f"\n[{symbol} SMC] FILTERED: {_reason}")
+            return []
+    # ──────────────────────────────────────────────────────────
     # v4：個別幣排除（gap risk / 結構性失敗無法靠技術過濾解）
     excluded = getattr(Config, "SMC_EXCLUDED_SYMBOLS", "")
     if excluded:
@@ -2191,6 +2249,16 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
     MA + S/R Breakout 策略回測。只做 LONG。
     regime_series 不適用（MASR 自有 EMA 趨勢判斷）。
     """
+    # === Feature filter（backtest only）────────────────────────
+    from feature_filter import should_skip_for_strategy, load_feature_filter_config
+    _ff_cfg = load_feature_filter_config()
+    if _ff_cfg["BACKTEST_USE_FEATURE_FILTERS"]:
+        _features = _load_coin_features(symbol)
+        _skip, _reason = should_skip_for_strategy("masr", symbol, _features)
+        if _skip:
+            print(f"\n[{symbol} MASR] FILTERED: {_reason}")
+            return []
+    # ──────────────────────────────────────────────────────────
     tf = Config.MASR_TIMEFRAME
     print(f"\n[{symbol} MASR {tf}] 回測開始")
 
