@@ -2539,6 +2539,17 @@ def run_backtest_masr_short(client: Client, symbol: str, months: int,
                              debug: bool = False, *,
                              regime_series=None) -> list:
     """
+    DEPRECATED 2026-04-30 (P12B onwards): use run_backtest_masr_short_v2 instead.
+
+    v1 has 5 mandatory filters that resulted in only 3 trades in 39m × 10 coins.
+    P12 audit (reports/p12_masr_short_diagnosis_*) classified this as 'dead'.
+    Function preserved for archeology only.
+
+    CLI `--strategy masrs` now routes to v2 since P12E (commit 修改 backtest.py
+    dispatcher line ~4177 + 4743). Direct callers of this v1 still get a
+    DeprecationWarning.
+
+    ──── 原 v1 規格 ────
     MA + S/R Breakdown SHORT 策略回測。只做 SHORT。
     規格絕對不對稱反向 MASR Long：
       - 1H timeframe（vs Long 4H）
@@ -2549,8 +2560,16 @@ def run_backtest_masr_short(client: Client, symbol: str, months: int,
       - SL = entry + 1.2×ATR、TP1 RR=2、TP2 RR=4、24h 強制平
     regime_series 不適用（自有 BTC regime gate）。
     """
+    import warnings
+    warnings.warn(
+        "run_backtest_masr_short is deprecated since P12B. "
+        "Use run_backtest_masr_short_v2 instead. "
+        "See reports/p12_masr_short_diagnosis_*.md for evidence.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     tf = Config.MASR_SHORT_TIMEFRAME
-    print(f"\n[{symbol} MASR_SHORT {tf}] 回測開始")
+    print(f"\n[{symbol} MASR_SHORT {tf}] 回測開始 ⚠️ DEPRECATED v1")
 
     # ── 抓資料 ─────────────────────────────────────────────────
     df_tf = fetch_klines(client, symbol, tf, months)
@@ -4173,13 +4192,20 @@ def _run_multi_coin_backtest(
             results[(sym, "MASR")] = tr
 
         if run_flags.get("masr_short"):
+            # P12E：'masrs' alias 從 v1 改路由到 v2（v1 dead, P12 audit 證據:
+            # reports/p12_masr_short_diagnosis_*.md / p12c_masr_short_sweep_*.md /
+            # p12d_short_shadow_*.md）。要呼叫 v1 archive 請直接 import 該函式。
+            _masrs_variant = (args.short_variant
+                              or os.getenv("MASR_SHORT_VARIANT", "fast"))
             try:
-                tr = run_backtest_masr_short(client, sym, args.months, debug=False,
-                                             regime_series=regime_series)
+                tr = run_backtest_masr_short_v2(
+                    client, sym, args.months,
+                    debug=False, variant=_masrs_variant,
+                )
             except Exception as e:
-                print(f"  [MASR_SHORT] 失敗：{e}")
+                print(f"  [MASR_SHORT v2:{_masrs_variant}] 失敗：{e}")
                 tr = []
-            results[(sym, "MASR_SHORT")] = tr
+            results[(sym, f"MASR_SHORT(v2:{_masrs_variant})")] = tr
 
         if run_flags.get("masr_short_v2"):
             v2_variants = run_flags.get("masr_short_v2_variants") or ["fast"]
@@ -4505,6 +4531,12 @@ def main():
                         help="同時跑 v1 + v2 並比對訊號量（含月度分布 + 模式拆分）")
     parser.add_argument("--masrs-pool",      action="store_true",
                         help="多幣模式：每日輸出做空池幣數變化")
+    # P12E：CLI `--strategy masrs` 已從 v1 重新路由到 v2；此 flag 控制 variant
+    # 預設讀 .env 的 MASR_SHORT_VARIANT（P12C.5 定為 "fast"）
+    parser.add_argument("--short-variant",  default=None,
+                        choices=["fast", "slow"],
+                        help="MASR_SHORT v2 variant override (預設讀 .env "
+                             "MASR_SHORT_VARIANT；P12 後 'masrs' alias 已切到 v2)")
     args = parser.parse_args()
 
     timeframes = args.tf or DEFAULT_TF
@@ -4739,11 +4771,16 @@ def main():
         all_masr.extend(trades_masr)
 
     # ── MASR_SHORT 回測 ──────────────────────────────────────────
+    # P12E：'masrs' 已從 v1 改路由到 v2（v1 dead, see reports/p12_*）
     if run_masr_short:
-        trades_masr_s = run_backtest_masr_short(client, args.symbol, args.months,
-                                                debug=args.debug_indicators)
+        _masrs_variant = (args.short_variant
+                          or os.getenv("MASR_SHORT_VARIANT", "fast"))
+        trades_masr_s = run_backtest_masr_short_v2(
+            client, args.symbol, args.months,
+            debug=args.debug_indicators, variant=_masrs_variant,
+        )
         print_stats(trades_masr_s, Config.MASR_SHORT_TIMEFRAME, args.symbol,
-                    args.balance, label="MASR_SHORT")
+                    args.balance, label=f"MASR_SHORT(v2:{_masrs_variant})")
         all_masr_short.extend(trades_masr_s)
 
     # ── GRANVILLE 回測 ─────────────────────────────────────────
