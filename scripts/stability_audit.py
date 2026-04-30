@@ -7,7 +7,7 @@ P2B-1 找到的 NKF / MR candidate filter 需要分段驗證：39m total PnL 看
 
 純驗證工具，不會改 .env、不會修改既有 filter rule，不會改策略 logic。
 
-呼叫慣例（見 _run_p2b15_audit.py）：
+呼叫慣例：
     audit_candidate_stability(
         strategy="nkf",
         candidate_rules=[{"feature":"whipsaw_idx","op":"<=","threshold":0.121},
