@@ -263,16 +263,24 @@ def _render_audit_report(result: dict, output_dir: Path) -> Path:
     lines.append(f"| stability_adjusted_pnl | {result['stability_adjusted_pnl']:+.2f}U |")
 
     if result.get("by_coin"):
-        lines.append("\n## Per-coin (only kept coins have non-zero rows)\n")
-        lines.append("| symbol | n_trades | win_rate | total_pnl |")
-        lines.append("| --- | --- | --- | --- |")
-        for sym, c in result["by_coin"].items():
-            cm = c.get("metrics", {})
-            n = cm.get("n_trades", 0)
-            if n == 0:
+        # by_coin[sym] = list[dict, dict, dict] — 每段 metrics
+        lines.append("\n## Per-coin × per-segment (kept coins only)\n")
+        lines.append("| symbol | seg1 (n/wr/pnl) | seg2 | seg3 | total |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for sym, segs in result["by_coin"].items():
+            n_total = sum(s.get("n_trades", 0) for s in segs)
+            if n_total == 0:
                 continue
-            lines.append(f"| {sym} | {n} | {cm.get('win_rate', 0)*100:.1f}% | "
-                         f"{cm.get('total_pnl', 0):+.2f}U |")
+            cells = []
+            pnl_total = 0.0
+            for s in segs:
+                n = s.get("n_trades", 0)
+                wr = s.get("win_rate", 0) or 0
+                pnl = s.get("total_pnl", 0) or 0
+                pnl_total += pnl
+                cells.append(f"{n}/{wr*100:.0f}%/{pnl:+.1f}")
+            lines.append(f"| {sym} | {cells[0]} | {cells[1]} | {cells[2]} | "
+                         f"n={n_total} pnl={pnl_total:+.2f}U |")
 
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
