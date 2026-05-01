@@ -17,6 +17,13 @@ Binance Futures K 線 WebSocket 管理器（multiplex 版）
   - WS 斷線由 ThreadedWebsocketManager 內建 reconnect 處理
   - handshake timeout 時整個 socket 會被 TWM 丟棄並重試；bot_main.py 另
     保留 schedule 每 15 分跑 check_signals 當兜底
+  - **2026-05-01 新增**：python-binance lib 內部偵測到 ReadLoopClosed 後
+    會在 `binance.ws.threaded_stream` logger 上 tight loop spam ERROR，
+    我們的 `_on_message` callback 收不到（lib 直接吃掉）。加 logging.Filter
+    抓 logger，1 秒 > 10 errors 就：
+      a) 設 _needs_reset=True 觸發外部 worker rebuild
+      b) suppress 5s log spam
+      c) 5s 後若 storm 還在，再次 trigger
 """
 import logging
 import threading
@@ -27,6 +34,74 @@ from typing import Iterable, Optional
 from binance import ThreadedWebsocketManager
 
 log = logging.getLogger("kline_ws")
+
+
+# ── lib WS error 風暴偵測 / 抑制（2026-05-01）────────────────────
+_BINANCE_WS_LOGGER_NAME = "binance.ws.threaded_stream"
+
+
+class _BinanceWSErrorRateLimiter(logging.Filter):
+    """掛在 `binance.ws.threaded_stream` logger 上：
+      - 滑動 1 秒窗口內收到 >= max_errors_per_sec 個 ERROR
+      - 觸發 KlineWSManager._needs_reset=True（讓外部 worker 重建連線）
+      - suppress 後續 N 秒的 log spam（避免畫面灌爆）
+      - N 秒後若 storm 持續，再次 trigger
+    """
+
+    def __init__(
+        self,
+        mgr: "KlineWSManager",
+        max_errors_per_sec: int = 10,
+        suppress_duration_sec: float = 5.0,
+    ):
+        super().__init__()
+        self._mgr = mgr
+        self._max_per_sec = max_errors_per_sec
+        self._suppress_dur = suppress_duration_sec
+        self._suppress_until = 0.0
+        self._error_times: list[float] = []
+        self._lock = threading.Lock()
+        self._suppressed_count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # 只看 ERROR 以上
+        if record.levelno < logging.ERROR:
+            return True
+
+        now = time.time()
+        with self._lock:
+            # 在 suppress 期間：drop 該 log，但 +counter
+            if now < self._suppress_until:
+                self._suppressed_count += 1
+                return False
+
+            # Suppress 剛結束 → 印一行 summary
+            if self._suppressed_count > 0:
+                log.warning(
+                    f"WS error storm: 過去 {self._suppress_dur:.0f}s 抑制了 "
+                    f"{self._suppressed_count} 筆 lib log；外部 worker 應已 reset"
+                )
+                self._suppressed_count = 0
+
+            # 滑動窗口
+            self._error_times.append(now)
+            cutoff = now - 1.0
+            self._error_times = [t for t in self._error_times if t >= cutoff]
+
+            if len(self._error_times) >= self._max_per_sec:
+                # 觸發風暴：set reset flag + 抑制後續 log
+                self._suppress_until = now + self._suppress_dur
+                with self._mgr._lock:
+                    self._mgr._needs_reset = True
+                log.warning(
+                    f"binance.ws error storm 偵測：{len(self._error_times)} 個 ERROR/秒 "
+                    f"(threshold={self._max_per_sec}) → 觸發 WS reset + suppress "
+                    f"{self._suppress_dur:.0f}s log spam"
+                )
+                self._error_times.clear()
+                return False  # 連這條觸發 ERROR 也吃掉，讓 log 安靜
+
+        return True
 
 
 class KlineWSManager:
@@ -56,6 +131,8 @@ class KlineWSManager:
         self._last_error_log_ts = 0.0
         # 最後一次收到有效事件的時間（含 non-closed K 線），用來偵測靜默死亡
         self._last_event_ts = time.time()
+        # 2026-05-01：lib WS error storm 偵測 filter（start() 才掛上）
+        self._error_filter: Optional[_BinanceWSErrorRateLimiter] = None
 
     # ── 生命週期 ────────────────────────────────────────────────
     def start(self):
@@ -68,11 +145,28 @@ class KlineWSManager:
         )
         self._twm.start()
         self._started = True
-        log.info("KlineWSManager 已啟動")
+
+        # 2026-05-01：lib WS error storm filter（python-binance bug 防護）
+        # binance.ws.threaded_stream logger 在 ReadLoopClosed 後可能 tight loop
+        # spam ERROR；filter 偵測 > 10 errors/秒 → trigger reset + suppress 5s log
+        if self._error_filter is None:
+            self._error_filter = _BinanceWSErrorRateLimiter(
+                self, max_errors_per_sec=10, suppress_duration_sec=5.0,
+            )
+            logging.getLogger(_BINANCE_WS_LOGGER_NAME).addFilter(self._error_filter)
+
+        log.info("KlineWSManager 已啟動 (含 error storm filter)")
 
     def stop(self):
         if not self._started or not self._twm:
             return
+        # 卸 error storm filter
+        if self._error_filter is not None:
+            try:
+                logging.getLogger(_BINANCE_WS_LOGGER_NAME).removeFilter(self._error_filter)
+            except Exception:
+                pass
+            self._error_filter = None
         try:
             with self._lock:
                 if self._conn_key:
