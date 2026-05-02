@@ -346,6 +346,13 @@ class Config:
     # 留空 → 0 → fallback 至 COOLDOWN_BARS；strategies/ma_sr_short.py:on_position_close
     # 用 `getattr(Config, "MASR_SHORT_COOLDOWN_BARS", 0) or COOLDOWN_BARS`
     MASR_SHORT_COOLDOWN_BARS          = int(os.getenv("MASR_SHORT_COOLDOWN_BARS", 0) or 0)
+
+    # 2026-05-02：universe pre-filter 上限（給 bot_main.scan_coins 用）
+    # 取 24h 成交量 top N 餵給 strategy.screen_coins，避免遍歷全 525 支
+    # 觸發 1d K 線 burst（每幣 weight 5 → 525×5=2625 超過 1800 限額）
+    # 200 是甜蜜點：比 525 省 ~60% weight，但保留主流幣 + 中等市值幣
+    # 設 0 或 < 1 = 關閉 pre-filter（回退到全 universe）
+    UNIVERSE_TOP_N                    = int(os.getenv("UNIVERSE_TOP_N", 200))
     # 分級大盤閾值
     MASR_SHORT_V2_STRONG_TIMEFRAME    = os.getenv("MASR_SHORT_V2_STRONG_TIMEFRAME", "1d")
     MASR_SHORT_V2_STRONG_FAST_EMA     = int(os.getenv("MASR_SHORT_V2_STRONG_FAST_EMA", 50))

@@ -321,6 +321,58 @@ def _dedupe_correlated_symbols(symbols: list[str],
     return kept
 
 
+# ── 24h 成交量 pre-filter（給 scan_coins 用）─────────────────
+# 全市場 USDT 永續 ~525 支，但實際有意義的通常 top 100-200。
+# 不 pre-filter → strategy.screen_coins 對每幣都抓 1d K 線（每支 weight 5）
+# → 525 × 5 = 2625 weight burst，超過 1800 限額。
+#
+# Pre-filter 用 client.futures_24hr_ticker() 一次拿全市場 24h 成交量
+# (weight=40 一次 call vs 525 次 _get_klines)，sort 後取 top N
+# (UNIVERSE_TOP_N，default 200)。
+#
+# Cache 1 小時：volume 變化不快、scan 每 15 min 重新看也可承受。
+_volume_universe_cache: dict = {"ts": 0.0, "ranked": []}
+_VOLUME_UNIVERSE_TTL_SEC = 3600  # 1 hour
+
+
+def _filter_by_volume(client, symbols: list[str], top_n: int) -> list[str]:
+    """24h quoteVolume 排序，取前 top_n。
+    fallback：API 失敗時直接回原 list（不 break scan）。
+    """
+    global _volume_universe_cache
+    now = time.time()
+    if now - _volume_universe_cache["ts"] < _VOLUME_UNIVERSE_TTL_SEC \
+            and _volume_universe_cache["ranked"]:
+        ranked = _volume_universe_cache["ranked"]
+    else:
+        try:
+            from api_retry import weight_aware_call
+            tickers = weight_aware_call(
+                client.futures_ticker, weight=40,
+            )  # 一次拿全市場
+            vol_map: dict[str, float] = {}
+            for t in tickers:
+                sym = t.get("symbol", "")
+                qv = float(t.get("quoteVolume", 0) or 0)
+                if sym and qv > 0:
+                    vol_map[sym] = qv
+            # 由高到低排序
+            ranked = sorted(vol_map.keys(), key=lambda s: vol_map[s], reverse=True)
+            _volume_universe_cache = {"ts": now, "ranked": ranked}
+            log.debug(
+                f"[universe pre-filter] 取得 24h 量排序：{len(ranked)} 支，"
+                f"top5: {ranked[:5]}"
+            )
+        except Exception as e:
+            log.warning(f"[universe pre-filter] 取 24h ticker 失敗: {e}，回退原 list")
+            return symbols
+
+    # 保留 ranked 中也在 symbols 內的，按 ranked 順序取前 top_n
+    sym_set = set(symbols)
+    out = [s for s in ranked if s in sym_set][:top_n]
+    return out
+
+
 # ── 選幣任務（每 RESCAN_MIN 分鐘）──────────────────────────────
 def scan_coins():
     global candidate_symbols
@@ -353,6 +405,18 @@ def scan_coins():
     except Exception as e:
         log.error(f"取得全市場 symbol 失敗: {e}")
         all_symbols = []
+
+    # 24h 成交量 pre-filter：top N 才進入 strategy.screen_coins
+    # 從 525+ 縮到 ~200，省 strategy 端的 fetch_klines × 525 burst
+    # UNIVERSE_TOP_N 預設 200，調 .env 即可
+    universe_top_n = int(getattr(Config, "UNIVERSE_TOP_N", 200))
+    if all_symbols and universe_top_n > 0 and universe_top_n < len(all_symbols):
+        before_count = len(all_symbols)
+        all_symbols = _filter_by_volume(client, all_symbols, universe_top_n)
+        log.info(
+            f"24h 成交量 pre-filter：{before_count} → {len(all_symbols)} "
+            f"(top {universe_top_n} by quoteVolume)"
+        )
 
     for strategy in load_strategies():
         try:
