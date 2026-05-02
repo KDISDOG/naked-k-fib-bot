@@ -30,8 +30,13 @@ log = logging.getLogger("syncer")
 
 
 class PositionSyncer:
-    # 孤兒單掃蕩頻率：每 N 次 sync 跑一次（預設 2 → 每分鐘，SYNC_SEC=30 的情況）
-    _ORPHAN_SWEEP_EVERY = 2
+    # 孤兒單掃蕩頻率：每 N 次 sync 跑一次。
+    # SYNC_SEC=30 → 每 N=10 次 = 5 分鐘一次
+    # 殘留掛單不會自動觸發（reduceOnly TP/SL 沒倉時 Binance 也不會吃），
+    # 5 分鐘清一次足夠，每分鐘可省 ~80 weight（list_open_orders 無 symbol = 40）。
+    _ORPHAN_SWEEP_EVERY = 10
+    # 0 倉時更稀疏掃蕩（每 N 次 = 30 分鐘一次）
+    _ORPHAN_SWEEP_EVERY_IDLE = 60
 
     def __init__(self, client: Client, db, executor):
         self.client   = client
@@ -74,15 +79,25 @@ class PositionSyncer:
 
         open_trades = self.db.get_open_trades()
 
-        # 孤兒單掃蕩（獨立路徑，即使無 open_trades 也要跑）
+        # ── A: 0 倉時 fast path ──────────────────────────────────
+        # DB 沒 open trade → 沒有持倉狀態要 sync，連幣安 API 都不必打。
+        # 只有「孤兒單掃蕩」需要跑（清除舊殘留），但頻率調得很低（30 min 一次）。
+        # 0 倉時每分鐘流量直接歸零，避免空跑在 limiter 上排隊。
+        if not open_trades:
+            sweep_every_idle = self._ORPHAN_SWEEP_EVERY_IDLE
+            if self._sync_count % sweep_every_idle == 0:
+                try:
+                    self._sweep_orphan_orders()
+                except Exception as e:
+                    log.error(f"孤兒單掃蕩失敗: {e}")
+            return
+
+        # ── B: 有倉時，正常頻率掃孤兒（5 min 一次）─────────────
         if self._sync_count % self._ORPHAN_SWEEP_EVERY == 0:
             try:
                 self._sweep_orphan_orders()
             except Exception as e:
                 log.error(f"孤兒單掃蕩失敗: {e}")
-
-        if not open_trades:
-            return
 
         # 取得幣安所有倉位（帶重試）
         try:

@@ -432,12 +432,15 @@ def scan_coins():
         except Exception as e:
             log.error(f"[{strategy.name}] 選幣失敗: {e}")
 
-    # 掃幣後清空 K 線 cache（避免記憶體累積；訊號檢查會重抓最新 K 線）
-    try:
-        if hasattr(market_ctx, "clear_kline_cache"):
-            market_ctx.clear_kline_cache()
-    except Exception:
-        pass
+    # ── C: 不再每次 scan 後清 cache ─────────────────────────────
+    # 原本掃幣後 clear_kline_cache() 是為了「訊號檢查重抓最新 K 線」+ 釋放記憶體。
+    # 但這讓「每 RESCAN_MIN(=15) 分鐘」=「每次都 cold-start」=「每次 burst 600+
+    # weight」，是 limiter 滿載的最大兇手之一。
+    #
+    # 改為靠 _KLINE_TTL_MAP 自然過期：
+    #   1m=20s / 5m=90s / 15m=240s / 1h=900s / 4h=3600s / 1d=21600s
+    # 訊號檢查需要新數據時會自動 cache miss → 重抓；不需要時走 cache，省 weight。
+    # 記憶體：300 syms × 6 TFs × 1KB ≈ 1.8MB，可接受。
 
     # 更新 WS 訂閱集合（新候選池 × 各策略 timeframe）
     try:

@@ -34,6 +34,14 @@ _KLINE_TTL_MAP = {
 
 
 class MarketContext:
+    # ── C: cold-start stagger ─────────────────────────────────────
+    # screener 冷啟動會對 300+ 幣連續 fetch 1d klines，30 秒內 burst ~600 weight，
+    # 雖然在 limiter 1800 額度內，但會把 budget 一次吃掉，後續 syncer/signal
+    # check 全卡住等 60s window 滑開。
+    # 解法：每次 cache miss 後 sleep 一個小常數，自然把 burst 攤成「均勻流」。
+    # 0.05s × 300 syms = 15s 總攤平時間，可接受；換來流量 < 50 weight/s。
+    _COLD_FETCH_STAGGER_SEC = 0.05
+
     def __init__(self, client):
         self.client = client
         self._cache: dict = {}
@@ -78,6 +86,9 @@ class MarketContext:
         df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
         df = df.reset_index(drop=True)
         self._kline_cache[key] = {"ts": time.time(), "df": df}
+        # cold-start stagger：cache miss 才 sleep（cache hit 不影響 latency）
+        if self._COLD_FETCH_STAGGER_SEC > 0:
+            time.sleep(self._COLD_FETCH_STAGGER_SEC)
         return df.copy()
 
     def clear_kline_cache(self):
