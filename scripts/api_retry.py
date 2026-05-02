@@ -47,6 +47,9 @@ class WeightLimiter:
     都共用這個 limiter，不會互相吃量）。
     """
 
+    # 真實 used header 多久沒回校就視為失效（>window，確保 Binance 端窗已滑開）
+    _REAL_USED_TTL = 70.0
+
     def __init__(self, max_weight: int = 1800, window: float = 60.0):
         self.max = int(max_weight)
         self.window = float(window)
@@ -55,6 +58,17 @@ class WeightLimiter:
         # 真實 used 由 X-MBX-USED-WEIGHT-1M header 回校（雙保險）
         self._real_used: int = 0
         self._real_used_ts: float = 0.0
+
+    def _effective_real_used(self, now: float) -> int:
+        """
+        真實 used 加 TTL：超過 _REAL_USED_TTL 沒被 header 回校就視為失效，
+        避免 acquire 死循環（被卡住 → 沒 API 出去 → 沒 header 回校 → 永遠卡住）。
+        """
+        if self._real_used_ts <= 0:
+            return 0
+        if (now - self._real_used_ts) >= self._REAL_USED_TTL:
+            return 0
+        return self._real_used
 
     def acquire(self, weight: int) -> None:
         """阻塞至少夠送 weight 個 unit 進視窗為止。"""
@@ -65,19 +79,28 @@ class WeightLimiter:
                 while self._log and self._log[0][0] < now - self.window:
                     self._log.popleft()
                 current = sum(w for _, w in self._log)
-                # 真實 used header 校正：以兩者較大為準
-                effective = max(current, self._real_used)
+                # 真實 used header 校正：以兩者較大為準（含 TTL，避免 stale 死鎖）
+                real_used_eff = self._effective_real_used(now)
+                effective = max(current, real_used_eff)
                 if effective + weight <= self.max:
                     self._log.append((now, weight))
                     return
                 # 視窗滿：算還要等多久
+                # ── 1. 內部 _log 有 entries：按最舊那筆滑出視窗的時間
+                # ── 2. 內部 _log 空但被 _real_used 卡住（cold-start / 上一輪 process
+                #      crash 殘留）：sleep 到 _REAL_USED_TTL 過期，讓 Binance 端窗滑開
                 if self._log:
                     sleep_for = self.window - (now - self._log[0][0]) + 0.5
+                elif real_used_eff > 0 and self._real_used_ts > 0:
+                    # 等 TTL 過期 + 0.5s buffer
+                    sleep_for = self._REAL_USED_TTL - (now - self._real_used_ts) + 0.5
                 else:
                     sleep_for = 1.0
                 sleep_for = max(sleep_for, 0.5)
+                # cap：避免某些 race condition 下 sleep 太久
+                sleep_for = min(sleep_for, self._REAL_USED_TTL + 1.0)
             log.info(
-                f"WeightLimiter 滿載（內部累積 {current} + 真實 used {self._real_used} "
+                f"WeightLimiter 滿載（內部累積 {current} + 真實 used {real_used_eff} "
                 f"+ 本次 {weight} > {self.max}），sleep {sleep_for:.1f}s"
             )
             time.sleep(sleep_for)
@@ -95,8 +118,7 @@ class WeightLimiter:
             while self._log and self._log[0][0] < now - self.window:
                 self._log.popleft()
             internal = sum(w for _, w in self._log)
-            # 真實 used 過 70 秒視為失效
-            real = self._real_used if (now - self._real_used_ts) < 70 else 0
+            real = self._effective_real_used(now)
             return internal, real
 
 
