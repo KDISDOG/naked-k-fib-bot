@@ -594,7 +594,12 @@ def _entry_still_valid(symbol: str, side: str,
 
     # 1. Funding rate 極端檢查（共用 CoinScreener 同門檻 0.15%/8h）
     try:
-        fr_data = client.futures_funding_rate(symbol=symbol, limit=1)
+        from api_retry import weight_aware_call as _wac
+        fr_data = _wac(
+            client.futures_funding_rate,
+            weight=1,
+            symbol=symbol, limit=1,
+        )
         if fr_data:
             fr = float(fr_data[-1]["fundingRate"])
             if abs(fr) > 0.0015:
@@ -640,7 +645,12 @@ def _entry_still_valid(symbol: str, side: str,
     )
     if signal_entry > 0 and max_dev > 0:
         try:
-            mark = client.futures_mark_price(symbol=symbol)
+            from api_retry import weight_aware_call as _wac
+            mark = _wac(
+                client.futures_mark_price,
+                weight=1,
+                symbol=symbol,
+            )
             mark_price = float(mark["markPrice"])
             dev = (mark_price - signal_entry) / signal_entry
             # 方向感知：LONG 若 mark 已拉高（dev > +max_dev）進場就追高；
@@ -1037,7 +1047,12 @@ def send_positions_report():
         # 一次抓全市場 mark price（單次 API call）
         price_map: dict[str, float] = {}
         try:
-            all_prices = client.futures_mark_price()
+            from api_retry import weight_aware_call as _wac
+            # futures_mark_price() 不帶 symbol weight=10
+            all_prices = _wac(
+                client.futures_mark_price,
+                weight=10,
+            )
             price_map = {
                 p["symbol"]: float(p["markPrice"]) for p in all_prices
             }

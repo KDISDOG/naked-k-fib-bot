@@ -17,6 +17,8 @@ futures_get_open_orders 或 futures_cancel_order/cancel_all_open_orders。
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 
+from api_retry import weight_aware_call
+
 log = logging.getLogger(__name__)
 
 
@@ -61,15 +63,35 @@ def list_open_orders(client, symbol: Optional[str] = None) -> List[Dict[str, Any
     任一端點失敗不會讓整體失敗 —— 返回拿到的部分。
     """
     result: List[Dict[str, Any]] = []
+    # weight: get_open_orders 帶 symbol=1，不帶 symbol=40
+    std_weight = 1 if symbol else 40
     try:
-        std = (client.futures_get_open_orders(symbol=symbol)
-               if symbol else client.futures_get_open_orders())
+        if symbol:
+            std = weight_aware_call(
+                client.futures_get_open_orders,
+                weight=std_weight,
+                symbol=symbol,
+            )
+        else:
+            std = weight_aware_call(
+                client.futures_get_open_orders,
+                weight=std_weight,
+            )
         result.extend(_normalize_standard(o) for o in (std or []))
     except Exception as e:
         log.warning(f"futures_get_open_orders({symbol}) 失敗: {e}")
     try:
-        algo = (client.futures_get_open_algo_orders(symbol=symbol)
-                if symbol else client.futures_get_open_algo_orders())
+        if symbol:
+            algo = weight_aware_call(
+                client.futures_get_open_algo_orders,
+                weight=1,
+                symbol=symbol,
+            )
+        else:
+            algo = weight_aware_call(
+                client.futures_get_open_algo_orders,
+                weight=1,
+            )
         result.extend(_normalize_algo(o) for o in (algo or []))
     except Exception as e:
         log.warning(f"futures_get_open_algo_orders({symbol}) 失敗: {e}")
@@ -82,12 +104,16 @@ def cancel_order(client, symbol: str, entry: Dict[str, Any]) -> bool:
     """
     try:
         if entry.get("is_algo"):
-            client.futures_cancel_algo_order(
-                symbol=symbol, algoId=int(entry["algoId"])
+            weight_aware_call(
+                client.futures_cancel_algo_order,
+                weight=1,
+                symbol=symbol, algoId=int(entry["algoId"]),
             )
         else:
-            client.futures_cancel_order(
-                symbol=symbol, orderId=int(entry["orderId"])
+            weight_aware_call(
+                client.futures_cancel_order,
+                weight=1,
+                symbol=symbol, orderId=int(entry["orderId"]),
             )
         return True
     except Exception as e:
@@ -109,11 +135,19 @@ def cancel_all_for_symbol(client, symbol: str) -> int:
         count = 0
 
     try:
-        client.futures_cancel_all_open_orders(symbol=symbol)
+        weight_aware_call(
+            client.futures_cancel_all_open_orders,
+            weight=1,
+            symbol=symbol,
+        )
     except Exception as e:
         log.warning(f"[{symbol}] cancel_all_open_orders 失敗: {e}")
     try:
-        client.futures_cancel_all_algo_open_orders(symbol=symbol)
+        weight_aware_call(
+            client.futures_cancel_all_algo_open_orders,
+            weight=1,
+            symbol=symbol,
+        )
     except Exception as e:
         log.warning(f"[{symbol}] cancel_all_algo_open_orders 失敗: {e}")
 

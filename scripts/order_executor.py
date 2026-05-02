@@ -12,7 +12,7 @@ import math
 from typing import Optional
 from binance.client import Client
 from binance.enums import *
-from api_retry import retry_api, create_order_safe
+from api_retry import retry_api, create_order_safe, weight_aware_call
 from binance_orders import (
     list_open_orders, cancel_order, cancel_all_for_symbol, extract_id
 )
@@ -184,14 +184,18 @@ class OrderExecutor:
         try:
             # 1. 設定槓桿
             retry_api(
+                weight_aware_call,
                 self.client.futures_change_leverage,
-                symbol=symbol, leverage=leverage
+                weight=1,
+                symbol=symbol, leverage=leverage,
             )
 
             # 2. 確保單向持倉模式
             try:
-                self.client.futures_change_position_mode(
-                    dualSidePosition=False
+                weight_aware_call(
+                    self.client.futures_change_position_mode,
+                    weight=1,
+                    dualSidePosition=False,
                 )
             except Exception:
                 pass
@@ -211,8 +215,10 @@ class OrderExecutor:
             fill_price = float(order.get("avgPrice") or 0)
             if fill_price <= 0 and order_id:
                 try:
-                    filled = self.client.futures_get_order(
-                        symbol=symbol, orderId=order_id
+                    filled = weight_aware_call(
+                        self.client.futures_get_order,
+                        weight=1,
+                        symbol=symbol, orderId=order_id,
                     )
                     fill_price = float(filled.get("avgPrice") or 0)
                 except Exception as e:
@@ -220,8 +226,10 @@ class OrderExecutor:
             # 第三層：從成交紀錄取實際成交均價
             if fill_price <= 0:
                 try:
-                    recent = self.client.futures_account_trades(
-                        symbol=symbol, limit=20
+                    recent = weight_aware_call(
+                        self.client.futures_account_trades,
+                        weight=5,
+                        symbol=symbol, limit=20,
                     )
                     # 篩出本次開倉方向的成交
                     my_side = "BUY" if direction == "LONG" else "SELL"
@@ -438,7 +446,11 @@ class OrderExecutor:
             # 若不滿足則跳過，避免 3 次 retry 浪費約 6 秒，也避免寫入不存在的 id
             try:
                 mark_now = float(
-                    self.client.futures_mark_price(symbol=symbol)["markPrice"]
+                    weight_aware_call(
+                        self.client.futures_mark_price,
+                        weight=1,
+                        symbol=symbol,
+                    )["markPrice"]
                 )
             except Exception:
                 mark_now = fill_price  # fallback
@@ -767,7 +779,10 @@ class OrderExecutor:
     def cancel_all(self):
         """緊急撤銷所有未成交掛單（含 Algo），逐幣種取消"""
         try:
-            positions = self.client.futures_position_information()
+            positions = weight_aware_call(
+                self.client.futures_position_information,
+                weight=5,
+            )
             cancelled_symbols = set()
             for pos in positions:
                 symbol = pos["symbol"]
@@ -784,7 +799,10 @@ class OrderExecutor:
     def close_all_positions(self):
         """緊急平倉所有倉位"""
         try:
-            positions = self.client.futures_position_information()
+            positions = weight_aware_call(
+                self.client.futures_position_information,
+                weight=5,
+            )
             closed = 0
             for pos in positions:
                 qty = float(pos["positionAmt"])
@@ -814,7 +832,11 @@ class OrderExecutor:
         close_reason: TIMEOUT / MANUAL / etc.
         """
         try:
-            pos_info = self.client.futures_position_information(symbol=symbol)
+            pos_info = weight_aware_call(
+                self.client.futures_position_information,
+                weight=5,
+                symbol=symbol,
+            )
             if not pos_info:
                 return
             qty = float(pos_info[0]["positionAmt"])
@@ -834,8 +856,10 @@ class OrderExecutor:
             exit_price = float(order.get("avgPrice") or 0)
             if exit_price <= 0:
                 try:
-                    filled = self.client.futures_get_order(
-                        symbol=symbol, orderId=order.get("orderId")
+                    filled = weight_aware_call(
+                        self.client.futures_get_order,
+                        weight=1,
+                        symbol=symbol, orderId=order.get("orderId"),
                     )
                     exit_price = float(filled.get("avgPrice") or 0)
                 except Exception:
@@ -844,8 +868,10 @@ class OrderExecutor:
             # 第三層 fallback：查最近成交紀錄
             if exit_price <= 0:
                 try:
-                    recent = self.client.futures_account_trades(
-                        symbol=symbol, limit=5
+                    recent = weight_aware_call(
+                        self.client.futures_account_trades,
+                        weight=5,
+                        symbol=symbol, limit=5,
                     )
                     if recent:
                         exit_price = float(recent[-1]["price"])
@@ -930,8 +956,10 @@ class OrderExecutor:
             exit_price = float(order.get("avgPrice") or 0)
             if exit_price <= 0:
                 try:
-                    filled = self.client.futures_get_order(
-                        symbol=symbol, orderId=order.get("orderId")
+                    filled = weight_aware_call(
+                        self.client.futures_get_order,
+                        weight=1,
+                        symbol=symbol, orderId=order.get("orderId"),
                     )
                     exit_price = float(filled.get("avgPrice") or 0)
                 except Exception:

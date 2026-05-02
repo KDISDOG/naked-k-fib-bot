@@ -22,7 +22,7 @@ import pandas_ta as ta
 from binance.client import Client
 from config import Config
 from risk_manager import RiskManager
-from api_retry import retry_api
+from api_retry import retry_api, weight_aware_call
 from binance_orders import list_open_orders, cancel_all_for_symbol
 from notifier import notify
 
@@ -86,7 +86,11 @@ class PositionSyncer:
 
         # 取得幣安所有倉位（帶重試）
         try:
-            positions = retry_api(self.client.futures_position_information)
+            positions = retry_api(
+                weight_aware_call,
+                self.client.futures_position_information,
+                weight=5,
+            )
         except Exception as e:
             log.error(f"取得幣安倉位失敗: {e}")
             notify.error("倉位同步失敗", f"無法取得幣安倉位: {e}")
@@ -148,7 +152,9 @@ class PositionSyncer:
                                 ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
                             )
                             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
-                            self.client.futures_create_order(
+                            weight_aware_call(
+                                self.client.futures_create_order,
+                                weight=1,
                                 symbol=symbol, side=close_side,
                                 type=ORDER_TYPE_MARKET,
                                 quantity=actual_qty, reduceOnly=True,
@@ -401,7 +407,9 @@ class PositionSyncer:
                                 ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
                             )
                             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
-                            self.client.futures_create_order(
+                            weight_aware_call(
+                                self.client.futures_create_order,
+                                weight=1,
                                 symbol     = symbol,
                                 side       = close_side,
                                 type       = ORDER_TYPE_MARKET,
@@ -497,7 +505,10 @@ class PositionSyncer:
                 # 這是策略成效分析的核心資料
                 try:
                     ticker = retry_api(
-                        self.client.futures_symbol_ticker, symbol=symbol
+                        weight_aware_call,
+                        self.client.futures_symbol_ticker,
+                        weight=1,
+                        symbol=symbol,
                     )
                     cur_price = float(ticker["price"])
                     self.db.update_excursion(trade_id, cur_price)
@@ -541,7 +552,11 @@ class PositionSyncer:
 
         # 幣安上有實際持倉的 symbols
         try:
-            positions = retry_api(self.client.futures_position_information)
+            positions = retry_api(
+                weight_aware_call,
+                self.client.futures_position_information,
+                weight=5,
+            )
             has_pos = {
                 p["symbol"] for p in positions
                 if abs(float(p.get("positionAmt", 0))) > 0
@@ -596,7 +611,10 @@ class PositionSyncer:
 
         try:
             ticker = retry_api(
-                self.client.futures_symbol_ticker, symbol=symbol
+                weight_aware_call,
+                self.client.futures_symbol_ticker,
+                weight=1,
+                symbol=symbol,
             )
             price = float(ticker["price"])
         except Exception:
@@ -670,8 +688,10 @@ class PositionSyncer:
         try:
             import pandas as pd
             raw = retry_api(
+                weight_aware_call,
                 self.client.futures_klines,
-                symbol=symbol, interval=interval, limit=30
+                weight=1,
+                symbol=symbol, interval=interval, limit=30,
             )
             df = pd.DataFrame(raw, columns=[
                 "time", "open", "high", "low", "close", "volume",
@@ -849,7 +869,10 @@ class PositionSyncer:
             if start_ms:
                 params["startTime"] = start_ms
             trades = retry_api(
-                self.client.futures_account_trades, **params
+                weight_aware_call,
+                self.client.futures_account_trades,
+                weight=5,
+                **params,
             )
         except Exception as e:
             log.warning(f"取得 {symbol} 平倉成交失敗: {e}")
@@ -902,8 +925,10 @@ class PositionSyncer:
         """取得最近一筆成交價格"""
         try:
             trades = retry_api(
+                weight_aware_call,
                 self.client.futures_account_trades,
-                symbol=symbol, limit=5
+                weight=5,
+                symbol=symbol, limit=5,
             )
             if trades:
                 return float(trades[-1]["price"])
@@ -915,8 +940,10 @@ class PositionSyncer:
         """取得最近交易的實際手續費"""
         try:
             trades = retry_api(
+                weight_aware_call,
                 self.client.futures_account_trades,
-                symbol=symbol, limit=10
+                weight=5,
+                symbol=symbol, limit=10,
             )
             total_fee = 0.0
             for t in trades:

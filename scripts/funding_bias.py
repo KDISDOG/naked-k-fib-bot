@@ -36,7 +36,12 @@ _STRONG_BAND  = 0.05     # |fr| >= 0.05% 啟動加分/扣分
 def _fetch_funding_pct(client, symbol: str) -> float | None:
     """回傳 funding rate，單位 % / 8h；失敗則 None。"""
     try:
-        data = client.futures_funding_rate(symbol=symbol, limit=1)
+        from api_retry import weight_aware_call as _wac
+        data = _wac(
+            client.futures_funding_rate,
+            weight=1,
+            symbol=symbol, limit=1,
+        )
         if not data:
             return None
         return float(data[-1]["fundingRate"]) * 100.0
