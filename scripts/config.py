@@ -271,6 +271,18 @@ class Config:
     MASR_MIN_BREAKOUT_PCT     = float(os.getenv("MASR_MIN_BREAKOUT_PCT", 0.0))
     MASR_ATR_PERCENTILE_MAX   = float(os.getenv("MASR_ATR_PERCENTILE_MAX", 0.80))  # ATR 不在前 20%
     MASR_MAX_DIST_FROM_EMA50  = float(os.getenv("MASR_MAX_DIST_FROM_EMA50", 0.08))  # 距 EMA50 < 8%
+    # v4 (2026-05): screener 排序模式 + dist filter
+    # 背景：原 screener 按 30 日漲幅排序，強趨勢市況下選出的全是已飆到 EMA50 上方
+    #       12-20% 的追高幣，check_signal 全部以「追高」拒絕。新模式讓 screener
+    #       直接偏好「在上升趨勢中且已回踩接近 EMA50」的幣，與 check_signal 對齊。
+    # 模式：
+    #   "momentum"（預設）：按 30 日漲幅由高到低（原行為）
+    #   "pullback"        ：按距 EMA50 由近到遠（偏好已回踩）
+    #   "hybrid"          ：合成分數 = pct_30d - dist% × 5（強趨勢加分、追高扣分）
+    MASR_SCREEN_SORT_MODE     = os.getenv("MASR_SCREEN_SORT_MODE", "momentum").lower()
+    # 是否在 screener 直接擋掉 dist > MAX_DIST_FROM_EMA50 的幣
+    # （省去進到 check_signal 才被退的浪費；建議開啟與 SORT_MODE 搭配）
+    MASR_SCREEN_FILTER_DIST   = os.getenv("MASR_SCREEN_FILTER_DIST", "false").lower() == "true"
     # 出場
     # SL 距離倍數。試過 1.0（v3）但 SL% 反升、PnL 僅微正 +2.83。
     # 1.5 是 baseline 最佳值，revert。code 留 env 給未來嘗試。

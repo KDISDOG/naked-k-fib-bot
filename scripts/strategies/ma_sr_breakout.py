@@ -232,17 +232,68 @@ class MaSrBreakoutStrategy(BaseStrategy):
                 if pct_30d < min_30d_pct:
                     continue
 
-                scored.append((sym, pct_30d))
+                # ── v4：距 EMA50 距離（pullback / hybrid 模式 + dist filter 用）─
+                # check_signal 內部會擋 dist_ema50 > MASR_MAX_DIST_FROM_EMA50 (8%)，
+                # 但 screener 預設只看 30 日漲幅 → 強勢幣常已飆到 EMA50 上方
+                # 12-20%，screener 給的全部會被 check_signal 擋下（log 觀察證實）。
+                # 這個 dist 計算讓 screener 有機會：
+                #   1. 過濾追高幣（FILTER_DIST=true）
+                #   2. 偏好已回踩的幣（SORT_MODE=pullback / hybrid）
+                if ema50_v > 0:
+                    dist_ema50 = (price_d - ema50_v) / ema50_v  # 正值=高於EMA50
+                else:
+                    dist_ema50 = 0.0
+
+                scored.append((sym, pct_30d, dist_ema50))
             except Exception as e:
                 log.debug(f"[MASR 篩選] {sym} 失敗: {e}")
 
-        # 按 30 日漲幅排序由高到低
-        scored.sort(key=lambda x: x[1], reverse=True)
+        # ── v4：選幣排序模式 ─────────────────────────────────
+        # MASR_SCREEN_FILTER_DIST：mirror check_signal 8% 規則，先在 screener
+        #   把追高幣擋掉（避免 screener 給 5 支但 5 支全因追高被 check_signal
+        #   退掉的尷尬狀況；2026-05 live 觀察觸發）
+        # MASR_SCREEN_SORT_MODE：
+        #   - "momentum"：按 30 日漲幅由高到低（預設，原行為）
+        #   - "pullback"：按距 EMA50 由近到遠（偏好已回踩的多頭幣）
+        #   - "hybrid"  ：合成分數 = pct_30d - dist_ema50% × 5
+        #                 強趨勢加分、追高扣分；兼顧 momentum/pullback
+        max_dist = float(getattr(Config, "MASR_MAX_DIST_FROM_EMA50", 0.08))
+        do_filter_dist = bool(
+            getattr(Config, "MASR_SCREEN_FILTER_DIST", False)
+        )
+        sort_mode = str(
+            getattr(Config, "MASR_SCREEN_SORT_MODE", "momentum")
+        ).lower()
+
+        if do_filter_dist:
+            pre_filter_count = len(scored)
+            scored = [s for s in scored if s[2] <= max_dist]
+            if pre_filter_count > len(scored):
+                log.info(
+                    f"[MASR screen] dist filter: {pre_filter_count} → "
+                    f"{len(scored)}（剔除距 EMA50 > {max_dist*100:.1f}% 的追高幣）"
+                )
+
+        if sort_mode == "pullback":
+            # 距 EMA50 由近到遠（小到大，正值代表在上方），但確保仍在上方
+            scored.sort(key=lambda x: x[2])
+        elif sort_mode == "hybrid":
+            # 合成分數：30 日漲幅減去「距 EMA50 過遠」懲罰
+            # dist_ema50 是 ratio（0.05 = 5%），乘 100 變百分比，再乘 5 加重懲罰
+            scored.sort(
+                key=lambda x: x[1] - x[2] * 100 * 5,
+                reverse=True,
+            )
+        else:
+            # 預設 momentum：原行為，按 30 日漲幅由高到低
+            scored.sort(key=lambda x: x[1], reverse=True)
+
         top_n = int(getattr(Config, "MASR_TOP_N", 5))
         selected = [s[0] for s in scored[:top_n]]
         log.info(
             f"[MASR] 選幣完成：{len(selected)} 支入選 "
-            f"（{len(candidates)} 候選中通過 {len(scored)} 後取 top {top_n}）"
+            f"（{len(candidates)} 候選中通過 {len(scored)} 後取 top {top_n}, "
+            f"sort={sort_mode}, filter_dist={do_filter_dist}）"
         )
         return selected
 
