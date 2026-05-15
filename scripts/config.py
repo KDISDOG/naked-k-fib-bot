@@ -272,8 +272,20 @@ class Config:
     # 「動量強度」。不像 ADX 會因「回踩短期動量下滑」誤殺正期望訊號。
     # 值 = 過去 N 天 gap > 0 的比例門檻：0.85 = 至少 85% 的日數 EMA50>EMA200
     # 預設 0 = 關閉
+    # 12m sweep（0.50/0.70/0.85）結果幾乎一樣（trades 223-243 / PnL +147-174U / MDD 1.8-2.3%）
+    # → persistence 分布是二元的（強趨勢 >90% 或 chop <50%，中間區極少）
+    # → +174U 是 persistence 路線天花板；vs baseline +382U 損失 -55% 訊號量價值
+    # 結論：改用 MASR_EXCLUDED_SYMBOLS 黑名單路線（更直接、不影響 ★ 幣）
     MASR_TREND_PERSISTENCE_PCT  = float(os.getenv("MASR_TREND_PERSISTENCE_PCT", 0.0))
     MASR_TREND_PERSISTENCE_DAYS = int(os.getenv("MASR_TREND_PERSISTENCE_DAYS", 30))
+    # 2026-05-15 MASR Long 專屬黑名單（screener + backtest 共用）
+    # 12m backtest 顯示 7 支 ⚠ 幣（1000PEPE/MLN/FIL/NEAR/AAVE/ESPORTS/TON）
+    # MASR Long 共虧 -145U；用 EXCLUDED_SYMBOLS 直接擋掉，保留訊號量 +145U。
+    # 注意：這個只擋 MASR Long，不擋 MASR Short / 其他策略（AAVE/TON 對 Short 仍正期望）
+    MASR_EXCLUDED_SYMBOLS = os.getenv(
+        "MASR_EXCLUDED_SYMBOLS",
+        "1000PEPEUSDT,MLNUSDT,FILUSDT,NEARUSDT,AAVEUSDT,ESPORTSUSDT,TONUSDT",
+    )
     # 進場條件
     MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
     MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))

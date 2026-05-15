@@ -2269,6 +2269,15 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
             print(f"\n[{symbol} MASR] FILTERED: {_reason}")
             return []
     # ──────────────────────────────────────────────────────────
+    # 2026-05-15 MASR Long 專屬黑名單（screener + backtest 等價）
+    _masr_blacklist_raw = str(getattr(Config, "MASR_EXCLUDED_SYMBOLS", "") or "")
+    if _masr_blacklist_raw.strip():
+        _masr_blacklist = {
+            s.strip().upper() for s in _masr_blacklist_raw.split(",") if s.strip()
+        }
+        if symbol.upper() in _masr_blacklist:
+            print(f"\n[{symbol} MASR] BLACKLISTED (MASR_EXCLUDED_SYMBOLS)")
+            return []
     tf = Config.MASR_TIMEFRAME
     print(f"\n[{symbol} MASR {tf}] 回測開始")
 

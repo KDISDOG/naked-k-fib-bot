@@ -145,6 +145,22 @@ class MaSrBreakoutStrategy(BaseStrategy):
                 )
             candidates = after_cfd
 
+        # ── 2026-05-15 MASR Long 專屬黑名單 ──
+        # 12m backtest 證實的 chop / 弱勢幣（共虧 -145U），直接擋掉省 weight
+        excluded_raw = str(getattr(Config, "MASR_EXCLUDED_SYMBOLS", "") or "")
+        if excluded_raw.strip():
+            excluded_set = {
+                s.strip().upper() for s in excluded_raw.split(",") if s.strip()
+            }
+            pre_count = len(candidates)
+            candidates = [c for c in candidates if c.upper() not in excluded_set]
+            skipped_n = pre_count - len(candidates)
+            if skipped_n > 0:
+                log.info(
+                    f"[MASR screen] blacklist: {pre_count} → {len(candidates)} "
+                    f"({skipped_n} skipped: {sorted(excluded_set)})"
+                )
+
         scored: list[tuple[str, float]] = []
 
         # 嘗試從 client 取得交易對 onboardDate（過濾上市時間）
