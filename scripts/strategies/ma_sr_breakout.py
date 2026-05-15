@@ -217,11 +217,8 @@ class MaSrBreakoutStrategy(BaseStrategy):
                 if not (atr_min <= atr_pct <= atr_max):
                     continue
 
-                # 3b. 2026-05-15: ADX 趨勢強度過濾
-                # 證據：12m backtest 顯示 chop 幣（無 trend persistence）= MASR Long
-                # 的主要虧損來源。日線 ADX < MASR_SCREEN_ADX_MIN（預設 20）的幣，
-                # MASR Long 進去就被假突破擊穿。
-                # 設 0 = 關閉此 filter（回退原行為）。
+                # 3b. 2026-05-15: ADX 趨勢強度過濾（預設關閉，code path 保留）
+                # 12m backtest 證實 ADX 是落後指標、誤殺正期望訊號（ZEC -59U）。
                 min_adx = float(getattr(Config, "MASR_SCREEN_ADX_MIN", 0.0))
                 if min_adx > 0:
                     try:
@@ -243,6 +240,28 @@ class MaSrBreakoutStrategy(BaseStrategy):
                     except Exception as e:
                         # ADX 算不出來時 fail-open（不擋）
                         log.debug(f"[MASR 篩選] {sym} ADX 計算失敗（略過 filter）: {e}")
+
+                # 3c. 2026-05-15: 趨勢持續性過濾（取代 ADX 的新嘗試）
+                # 邏輯：過去 N 天 EMA50 > EMA200 的比例 < threshold → chop 幣，剔除。
+                # 跟 ADX 的差異：ADX 看「動量強度」（落後指標、回踩會掉），這條看
+                # 「結構穩定性」（gap 為正 = 多頭趨勢結構保持中）── 不受回踩影響。
+                min_persist = float(getattr(Config, "MASR_TREND_PERSISTENCE_PCT", 0.0))
+                if min_persist > 0:
+                    try:
+                        persist_days = int(
+                            getattr(Config, "MASR_TREND_PERSISTENCE_DAYS", 30)
+                        )
+                        gap_series = ema50_d - ema200_d
+                        recent_gap = gap_series.tail(persist_days).dropna()
+                        if len(recent_gap) >= persist_days * 0.5:
+                            persist_actual = float((recent_gap > 0).mean())
+                            if persist_actual < min_persist:
+                                continue
+                    except Exception as e:
+                        log.debug(
+                            f"[MASR 篩選] {sym} trend persistence 計算失敗"
+                            f"（略過 filter）: {e}"
+                        )
 
                 # 4. 30 日累積漲幅（排序用 + 最低門檻）
                 if len(close_d) < 31:

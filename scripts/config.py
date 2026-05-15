@@ -260,14 +260,20 @@ class Config:
     MASR_MIN_LISTING_DAYS     = int(os.getenv("MASR_MIN_LISTING_DAYS", 180))
     # 試過 0.05（v3 C），filter 砍正期望訊號 → 0 = 關閉
     MASR_MIN_30D_RETURN_PCT   = float(os.getenv("MASR_MIN_30D_RETURN_PCT", 0.0))
-    # 2026-05-15 ADX 趨勢強度過濾（screener + check_signal 共用）
-    # 證據：12m backtest 中 7 支 ⚠ 拖油瓶幣（1000PEPE/MLN/FIL/NEAR/AAVE/ESPORTS/TON）
-    # 共虧 -145U；分析顯示這些幣的共通點是「沒有 trend persistence」=> 日線 ADX 普
-    # 遍 < 20。MASR Long 進去就被假突破打死。
-    # ADX < threshold 視為「無趨勢」直接剔除（screener 端剔除候選，check_signal
-    # 端再保險擋一次，確保 backtest 與 live 等價）。設 0 = 關閉 filter。
-    MASR_SCREEN_ADX_MIN       = float(os.getenv("MASR_SCREEN_ADX_MIN", 20.0))
+    # 2026-05-15 ADX 趨勢強度過濾（已關閉，留 code path）
+    # 嘗試過 ADX_MIN=20，12m backtest 顯示 ADX 是落後指標：ZEC -59U / HYPE -36U
+    # 等正期望幣的「早期回踩」訊號全被擋。總 PnL +382 → +67。
+    # 預設 0 = 關閉。code path 保留供未來嘗試其他 threshold（10-15）。
+    MASR_SCREEN_ADX_MIN       = float(os.getenv("MASR_SCREEN_ADX_MIN", 0.0))
     MASR_ADX_PERIOD           = int(os.getenv("MASR_ADX_PERIOD", 14))
+    # 2026-05-15 EMA50/EMA200 趨勢持續性過濾（取代失敗的 ADX filter）
+    # 邏輯：真趨勢幣日線 EMA50 持續在 EMA200 上方（gap 為正）；chop 幣 EMA50/
+    # EMA200 反覆穿越，gap 正負交替。比 ADX 更直接量化「結構穩定」而非
+    # 「動量強度」。不像 ADX 會因「回踩短期動量下滑」誤殺正期望訊號。
+    # 值 = 過去 N 天 gap > 0 的比例門檻：0.85 = 至少 85% 的日數 EMA50>EMA200
+    # 預設 0 = 關閉
+    MASR_TREND_PERSISTENCE_PCT  = float(os.getenv("MASR_TREND_PERSISTENCE_PCT", 0.0))
+    MASR_TREND_PERSISTENCE_DAYS = int(os.getenv("MASR_TREND_PERSISTENCE_DAYS", 30))
     # 進場條件
     MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
     MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))
