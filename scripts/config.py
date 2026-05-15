@@ -260,6 +260,14 @@ class Config:
     MASR_MIN_LISTING_DAYS     = int(os.getenv("MASR_MIN_LISTING_DAYS", 180))
     # 試過 0.05（v3 C），filter 砍正期望訊號 → 0 = 關閉
     MASR_MIN_30D_RETURN_PCT   = float(os.getenv("MASR_MIN_30D_RETURN_PCT", 0.0))
+    # 2026-05-15 ADX 趨勢強度過濾（screener + check_signal 共用）
+    # 證據：12m backtest 中 7 支 ⚠ 拖油瓶幣（1000PEPE/MLN/FIL/NEAR/AAVE/ESPORTS/TON）
+    # 共虧 -145U；分析顯示這些幣的共通點是「沒有 trend persistence」=> 日線 ADX 普
+    # 遍 < 20。MASR Long 進去就被假突破打死。
+    # ADX < threshold 視為「無趨勢」直接剔除（screener 端剔除候選，check_signal
+    # 端再保險擋一次，確保 backtest 與 live 等價）。設 0 = 關閉 filter。
+    MASR_SCREEN_ADX_MIN       = float(os.getenv("MASR_SCREEN_ADX_MIN", 20.0))
+    MASR_ADX_PERIOD           = int(os.getenv("MASR_ADX_PERIOD", 14))
     # 進場條件
     MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
     MASR_RES_TOL_ATR_MULT     = float(os.getenv("MASR_RES_TOL_ATR_MULT", 0.3))

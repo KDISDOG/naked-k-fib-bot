@@ -2283,6 +2283,37 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
     ema50_s = ta.ema(df_tf["close"], length=50)
     atr_s   = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=14)
     avg_vol_s = df_tf["volume"].rolling(21).mean().shift(1)
+
+    # 2026-05-15 ADX 趨勢強度過濾（live screener 用日線 ADX；backtest 等價）
+    # 拉日線 K 線、算 ADX(14)，每個 tf bar 對齊到當天的 ADX 值。
+    # ADX < MASR_SCREEN_ADX_MIN 視為「無趨勢」（chop / fake breakout 高發區），略過。
+    min_adx_screen = float(getattr(Config, "MASR_SCREEN_ADX_MIN", 0.0))
+    adx_period = int(getattr(Config, "MASR_ADX_PERIOD", 14))
+    adx_by_bar = None
+    if min_adx_screen > 0:
+        try:
+            df_d_for_adx = fetch_klines(client, symbol, "1d", months + 1)
+            if len(df_d_for_adx) >= adx_period + 5:
+                _adx_df = ta.adx(
+                    df_d_for_adx["high"], df_d_for_adx["low"],
+                    df_d_for_adx["close"], length=adx_period,
+                )
+                _col = f"ADX_{adx_period}"
+                if _adx_df is not None and _col in _adx_df.columns:
+                    _adx_series = _adx_df[_col].fillna(0.0)
+                    # 對齊到 4h bar：每個 4h bar 取「不晚於該 bar 時間」的最新日 ADX
+                    _daily_times = df_d_for_adx["time"].values
+                    _tf_times = df_tf["time"].values
+                    import numpy as _np
+                    # searchsorted：left → 對應 idx-1 是「最新且 ≤ tf_time」的日 bar
+                    idx_in_daily = _np.searchsorted(
+                        _daily_times, _tf_times, side="right"
+                    ) - 1
+                    idx_in_daily = _np.clip(idx_in_daily, 0, len(_adx_series) - 1)
+                    adx_by_bar = _adx_series.values[idx_in_daily]
+        except Exception as e:
+            print(f"\n[{symbol}] ADX 預計算失敗（略過 filter）: {e}")
+            adx_by_bar = None
     print(" 完成")
 
     highs_arr = df_tf["high"].values
@@ -2304,7 +2335,7 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
     dbg = {"cooldown": 0, "no_ema": 0, "no_resistance": 0,
            "no_breakout": 0, "weak_breakout": 0, "no_volume": 0, "atr_hot": 0,
            "dist_ema50": 0, "low_score": 0, "bad_pos": 0,
-           "weak_30d": 0, "signals": 0}
+           "weak_30d": 0, "low_adx": 0, "signals": 0}
     min_break = float(Config.MASR_MIN_BREAKOUT_PCT)
     # v3 C：30 日漲幅最低門檻（過濾橫盤幣的 4h 突破訊號）
     min_30d = float(getattr(Config, "MASR_MIN_30D_RETURN_PCT", 0.0))
@@ -2317,6 +2348,12 @@ def run_backtest_masr(client: Client, symbol: str, months: int,
         if i <= cooldown_until:
             dbg["cooldown"] += 1
             continue
+
+        # ADX gate：日線 ADX < 門檻 → 視為無趨勢，略過此 bar 的訊號評估
+        if adx_by_bar is not None and i < len(adx_by_bar):
+            if float(adx_by_bar[i]) < min_adx_screen:
+                dbg["low_adx"] += 1
+                continue
 
         ema20_v = ema20_s.iloc[i] if ema20_s is not None else float("nan")
         ema50_v = ema50_s.iloc[i] if ema50_s is not None else float("nan")

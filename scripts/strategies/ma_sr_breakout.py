@@ -217,6 +217,33 @@ class MaSrBreakoutStrategy(BaseStrategy):
                 if not (atr_min <= atr_pct <= atr_max):
                     continue
 
+                # 3b. 2026-05-15: ADX 趨勢強度過濾
+                # 證據：12m backtest 顯示 chop 幣（無 trend persistence）= MASR Long
+                # 的主要虧損來源。日線 ADX < MASR_SCREEN_ADX_MIN（預設 20）的幣，
+                # MASR Long 進去就被假突破擊穿。
+                # 設 0 = 關閉此 filter（回退原行為）。
+                min_adx = float(getattr(Config, "MASR_SCREEN_ADX_MIN", 0.0))
+                if min_adx > 0:
+                    try:
+                        adx_period = int(
+                            getattr(Config, "MASR_ADX_PERIOD", 14)
+                        )
+                        adx_df = ta.adx(
+                            df_d["high"], df_d["low"], df_d["close"],
+                            length=adx_period,
+                        )
+                        col = f"ADX_{adx_period}"
+                        adx_now = (
+                            float(adx_df[col].iloc[-1])
+                            if adx_df is not None and not adx_df.empty
+                            else 0.0
+                        )
+                        if pd.isna(adx_now) or adx_now < min_adx:
+                            continue
+                    except Exception as e:
+                        # ADX 算不出來時 fail-open（不擋）
+                        log.debug(f"[MASR 篩選] {sym} ADX 計算失敗（略過 filter）: {e}")
+
                 # 4. 30 日累積漲幅（排序用 + 最低門檻）
                 if len(close_d) < 31:
                     continue
