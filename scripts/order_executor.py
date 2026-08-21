@@ -745,6 +745,34 @@ class OrderExecutor:
                 if direction == "SHORT" and new_sl >= current_sl:
                     return False
 
+            # ── 預檢：新 SL 相對當前 mark price 是否可下 ──────────────
+            # 同 move_to_breakeven 的邏輯：
+            #   LONG  STOP_MARKET SELL：必須 mark > stopPrice，否則 -2021
+            #   SHORT STOP_MARKET BUY ：必須 mark < stopPrice，否則 -2021
+            # cancel 舊 SL 之前先查，避免「cancel → -2021 → 裸倉」。
+            try:
+                ticker = retry_api(
+                    self.client.futures_mark_price, symbol=symbol
+                )
+                mark_price = float(ticker["markPrice"])
+                sl_viable = (
+                    (direction == "LONG"  and mark_price > new_sl) or
+                    (direction == "SHORT" and mark_price < new_sl)
+                )
+                if not sl_viable:
+                    log.warning(
+                        f"[{symbol}] #{trade_id} trailing SL 目標 {new_sl} "
+                        f"已越過 mark {mark_price}（{direction}），"
+                        f"略過本次推進，保留現有 SL"
+                    )
+                    return False
+            except Exception as pe:
+                log.warning(
+                    f"[{symbol}] 取得 mark price 失敗: {pe}，"
+                    f"略過 trailing SL 推進（保守不動）"
+                )
+                return False
+
             close_side = SIDE_SELL if direction == "LONG" else SIDE_BUY
             new_sl = self._round_price(symbol, new_sl)
 

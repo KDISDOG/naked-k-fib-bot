@@ -278,13 +278,21 @@ class Config:
     # 結論：改用 MASR_EXCLUDED_SYMBOLS 黑名單路線（更直接、不影響 ★ 幣）
     MASR_TREND_PERSISTENCE_PCT  = float(os.getenv("MASR_TREND_PERSISTENCE_PCT", 0.0))
     MASR_TREND_PERSISTENCE_DAYS = int(os.getenv("MASR_TREND_PERSISTENCE_DAYS", 30))
-    # 2026-05-15 MASR Long 專屬黑名單（screener + backtest 共用）
-    # 12m backtest 顯示 7 支 ⚠ 幣（1000PEPE/MLN/FIL/NEAR/AAVE/ESPORTS/TON）
-    # MASR Long 共虧 -145U；用 EXCLUDED_SYMBOLS 直接擋掉，保留訊號量 +145U。
-    # 注意：這個只擋 MASR Long，不擋 MASR Short / 其他策略（AAVE/TON 對 Short 仍正期望）
+    # MASR Long 專屬黑名單（screener + backtest 共用）
+    # 注意：只擋 MASR Long，不擋 MASR Short / 其他策略
+    # ── 2026-05-15：12m backtest 顯示 7 支 ⚠ 幣（1000PEPE/MLN/FIL/NEAR/AAVE/ESPORTS/TON）
+    #               MASR Long 共虧 -145U；黑名單直接擋掉，保留訊號量。
+    # ── 2026-08-21：per_coin_report 識別 6 支新增候選（backtest ⚠ 幣）
+    #               SOXLUSDT：0% WR / -22.85U（9 筆，槓桿 ETF，直接排除）
+    #               ENAUSDT ：28.6% WR / -12.43U（14 筆）
+    #               ETHUSDT ：31.2% WR / -10.05U（16 筆）
+    #               ZECUSDT ：27.3% WR /  -5.14U（11 筆，樣本 <30，監控中）
+    #               BTCUSDT ：12.5% WR /  -4.82U（8 筆，樣本 <30，監控中）
+    #               BNBUSDT ：23.1% WR /  -2.50U（13 筆，樣本 <30，監控中）
     MASR_EXCLUDED_SYMBOLS = os.getenv(
         "MASR_EXCLUDED_SYMBOLS",
-        "1000PEPEUSDT,MLNUSDT,FILUSDT,NEARUSDT,AAVEUSDT,ESPORTSUSDT,TONUSDT",
+        "1000PEPEUSDT,MLNUSDT,FILUSDT,NEARUSDT,AAVEUSDT,ESPORTSUSDT,TONUSDT"
+        ",SOXLUSDT,ENAUSDT,ETHUSDT,ZECUSDT,BTCUSDT,BNBUSDT",
     )
     # 進場條件
     MASR_RES_LOOKBACK         = int(os.getenv("MASR_RES_LOOKBACK", 100))      # 找阻力位回看根數
